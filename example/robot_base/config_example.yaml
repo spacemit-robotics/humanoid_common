@@ -1,0 +1,28 @@
+# ============================================================
+# robot_base 配置示例（基于 G1 实际配置）
+# ============================================================
+# robot_base 节点是所有模块共用的机器人基础信息，
+# 每个模块通过 YamlFile::Read<T> 读取此节点，无需重复配置。
+
+robot_base:
+  name: "g1"                # 机器人名称（用于日志标识）
+  num_dof: 29               # 控制自由度数量（腿12 + 腰3 + 臂14）
+  robot_dir: "../robot/g1"  # 机器人资源根目录（相对于本 YAML 文件所在目录）
+                            # 各模块的模型路径、URDF 等均相对于此目录解析
+
+  # 线程调度配置（按线程名独立配置，各模块按名读取对应条目）
+  # sched: other（CFS 默认）| fifo | rr（fifo/rr 需 root 权限）
+  # cpu_id: -1 不绑定；实机建议为每个实时线程分配独立核心
+  threads:
+    rl_infer:       # RL 推理线程（behavior_manager 使用）
+      cpu_id: -1
+      sched: other
+      priority: 0
+    control_main:   # control_demo 主控制循环线程
+      cpu_id: -1
+      sched: other
+      priority: 0
+    driver_main:    # driver_demo / hardware 主线程
+      cpu_id: -1
+      sched: other
+      priority: 0

@@ -5,6 +5,7 @@
   <version>0.1.0</version>
   <description>Humanoid robot shared layer: robot_base, behavior_manager, transport, and runtime processes</description>
   <depend>rl</depend>
+  <depend>mujoco</depend>
   <system_depend check="pkg-config --exists eigen3">libeigen3-dev</system_depend>
   <system_depend check="pkg-config --exists yaml-cpp">libyaml-cpp-dev</system_depend>
 

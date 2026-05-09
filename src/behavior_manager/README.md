@@ -40,7 +40,7 @@
 |------|------|------|
 | `target_pos` | `vector<double>` | 目标关节位置 (rad) |
 | `target_vel` | `vector<double>` | 目标关节速度 (rad/s) |
-| `kp`, `kd` | `vector<double>` | PD 参数 |
+| `kp`, `kd` | `vector<double>` | PD 参数（每帧由当前 RL 策略提供）|
 | `enable` | `bool` | 使能标志 |
 
 ### `BehaviorManagerClass` — 行为管理器
@@ -101,9 +101,9 @@ cd ~/spacemit_robot
 模块读取 YAML 的 `behavior_manager` 和 `rl_policy` 节点。参考 `example/config_example.yaml` 了解配置结构和参数含义。
 
 **关键参数：**
-- `behavior_manager.kp/kd`：PD 控制增益
-- `behavior_manager.damp_kd`：阻尼状态 kd（≈ RL kd / 5）
-- `behavior_manager.zero_pos`：回零位置
+- `rl_policy.policies.<name>.kp/kd`：各策略训练时的 PD 增益（每帧随控制命令下发）
+- `behavior_manager.damp_kd`：阻尼状态 kd（≈ policy kd / 5）
+- `behavior_manager.zero_pos`：回零位置（无 rl_policy 时的 fallback；完整 FSM 用 `rl_policy.policies.<name>.rl_default_pos`）
 - `behavior_manager.zero_duration`：回零时间（秒）
 
 **路径解析：** `robot_base.robot_dir` 相对于 YAML 文件；`model_path` 相对于 `robot_dir`。
@@ -122,6 +122,6 @@ POWER_OFF ──key=1──→ DAMP ──key=2──→ ZERO ──key=3(插值
 
 - **异步推理：** StateRL 在独立线程执行 ONNX 推理，不阻塞主循环
 - **自动模型检测：** 支持 MLP 和 LSTM（自动检测）
-- **动态策略切换：** 运行时可切换 RL 策略（via `Command.switch_policy`）
+- **动态策略切换：** 仅在 `POWER_OFF` / `DAMP` 状态接受 `Command.switch_policy`；进入 `ZERO` 后策略锁定（ZERO 的目标位置/kp/kd 取自当前策略，切换会同步重建 ZERO 状态）
 - **安全保护：** IMU 倾角/关节限位自动触发安全状态
-- **参数隔离：** damp_kd ≠ RL kd（不同阶段刚度需求不同）
+- **参数隔离：** damp_kd ≈ policy kd / 5（不同阶段刚度需求不同）

@@ -59,8 +59,13 @@ int main(int argc, char *argv[]) {
         yaml_file.ToAbsPath(yaml_file.Read<std::string>("robot_base.robot_dir").value());
     const std::string xml_path = robot_dir + "/resources/xml/scene.xml";
 
-    // 初始化仿真
-    Simulator sim(yaml_path, robot_name, num_dof, xml_path, true);
+    // 从 robot_base 节点读取机器人固有属性传给 mujoco
+    const auto default_joint_pos =
+        yaml_file.Read<std::vector<double>>("robot_base.default_joint_pos").value();
+    const auto kp = yaml_file.Read<std::vector<double>>("robot_base.kp").value_or(std::vector<double>{});
+    const auto kd = yaml_file.Read<std::vector<double>>("robot_base.kd").value_or(std::vector<double>{});
+
+    Simulator sim(yaml_path, robot_name, num_dof, xml_path, default_joint_pos, kp, kd, true);
 
     // 初始化传输（Driver 角色）
     auto transport = transport::Create(yaml_path);

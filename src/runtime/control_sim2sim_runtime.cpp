@@ -48,17 +48,9 @@ int main(int argc, char *argv[]) {
     }
     const std::string yaml_path = argv[1];
 
-    // 从 YAML 读取 RL 推理周期和控制参数
+    // 从 YAML 读取 RL 推理周期
     robot_base::YamlFile yaml_file = robot_base::YamlFile::Load(yaml_path);
     float rl_dt = static_cast<float>(yaml_file.Read<double>("rl_policy.rl_dt").value_or(0.02));
-
-    // 读取 kp/kd 配置（用于发送到 driver）
-    std::vector<double> default_kp =
-        yaml_file.Read<std::vector<double>>("simulation.mujoco.controller.kp")
-            .value_or(std::vector<double>{});
-    std::vector<double> default_kd =
-        yaml_file.Read<std::vector<double>>("simulation.mujoco.controller.kd")
-            .value_or(std::vector<double>{});
 
     // 解析 robot_dir
     const std::string robot_dir =
@@ -132,8 +124,8 @@ int main(int argc, char *argv[]) {
             ctrl.enable = true;
             ctrl.target_pos = target_pos;
             ctrl.target_vel.assign(policy.ActionDim(), 0.0);  // 位置控制，目标速度为 0
-            ctrl.kp = default_kp;
-            ctrl.kd = default_kd;
+            ctrl.kp = loaded_cfg.kp;
+            ctrl.kd = loaded_cfg.kd;
             transport->SendControl(ctrl);
         }
 

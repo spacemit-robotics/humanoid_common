@@ -86,6 +86,14 @@ run_sim2sim_g1.sh   # 终端2（K3 板卡）
                                                               └──────────────┘
 ```
 
+### PD 增益数据流
+
+kp/kd 在不同阶段由不同来源提供，配置上分散在两个 yaml 节点：
+
+- **driver 启动期**：`driver_runtime` 读取 `robot_base.kp/kd/default_joint_pos`，作为 MuJoCo 仿真的初始 PD 增益与默认站立姿态。
+- **RL 控制期**：进入 RL 状态后，control 端每帧通过 `ControlCmd.kp/kd` 下发当前策略训练时的真实增益（来自 `rl_policy.policies.<name>.kp/kd`），driver 端原样转发给 MuJoCo，不再使用启动期的默认值。
+- **ZERO/DAMP 阶段**：ZERO 用当前策略的 `rl_default_pos` + `kp/kd`（无策略时回退到 `behavior_manager.zero_pos`，kp/kd 由 robot_base 兜底）；DAMP 用 `behavior_manager.damp_kd`（≈ policy kd / 5）。
+
 ### hmi_runtime 键盘操作
 
 | 按键 | 动作 |

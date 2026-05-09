@@ -11,7 +11,11 @@
  * - 状态机驱动（Step）
  * - 状态查询（CurrentState / CurrentPolicyName / GetRlFreq / IsRunning）
  * - 控制输出获取（GetOutput）
- * - FSM 完整状态切换流程：POWER_OFF → DAMP → ZERO → POWER_OFF
+ * - FSM 状态切换流程（不含 RL）：POWER_OFF → DAMP → ZERO → POWER_OFF
+ *
+ * 本 demo 使用的 yaml 不含 rl_policy 节点，ZERO 状态用 behavior_manager.zero_pos
+ * 作目标位置，kp/kd 为空（由下游 robot_base/MuJoCo 的默认增益兜底）。完整 FSM
+ * （含 RL）的端到端测试在机型仓库 humanoid_unitree_g1 等的启动脚本中验证。
  */
 
 #include <chrono>
@@ -128,6 +132,9 @@ int main(int argc, char *argv[]) {
         if (out3.target_pos.size() > 6)
             std::cout << ", ...";
         std::cout << "]" << std::endl;
+        // 无 rl_policy 时 kp/kd 为空，由下游 robot_base/MuJoCo 默认增益兜底
+        std::cout << "kp.size()=" << out3.kp.size() << ", kd.size()=" << out3.kd.size()
+            << "（无 RL 策略，由下游兜底）" << std::endl;
 
         // ========== 阶段4: 回到 POWER_OFF ==========
         std::cout << "\n--- 阶段4: key=-1 → POWER_OFF ---" << std::endl;

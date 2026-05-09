@@ -67,6 +67,8 @@ RLConfig ToRLConfig(const rl_policy::LoadedPolicyConfig &loaded_cfg) {
     rc.motion_length = loaded_cfg.exec_cfg.motion_length;
     rc.strict_obs_dim_check = loaded_cfg.exec_cfg.strict_obs_dim_check;
     rc.custom_scalar_defaults = loaded_cfg.exec_cfg.custom_scalar_defaults;
+    rc.kp = loaded_cfg.kp;
+    rc.kd = loaded_cfg.kd;
     return rc;
 }
 
@@ -80,8 +82,7 @@ public:
     ControlOutput output;
     std::string config_path;
     std::string robot_dir;  // 机器人资源根目录（绝对路径）
-    std::vector<double> init_kp;
-    std::vector<double> init_kd;
+    double zero_duration = 2.0;               // 回零时长（秒），策略切换时重建 ZERO 需要
     bool initialized = false;
     std::string pending_policy;               // 待生效的策略名
     std::string active_policy;                // 当前已加载的策略名
@@ -116,29 +117,14 @@ public:
             std::cout << "[BehaviorManager] 警告: 未配置 zero_pos，使用零位" << std::endl;
         }
 
-        // 加载 PD 参数
+        // 加载 PD 参数（仅 damp_kd，RL 策略 kp/kd 由各策略配置独立提供）
         auto load_array = [&](const std::string &key) {
             return yaml_file.Read<std::vector<double>>("behavior_manager." + key)
                 .value_or(std::vector<double>{});
         };
 
-        output.kp = load_array("kp");
-        if (output.kp.empty()) {
-            output.kp.assign(num_dof, 100.0);
-            std::cout << "[BehaviorManager] 警告: 未配置 kp，使用默认值 100.0" << std::endl;
-        }
-        output.kd = load_array("kd");
-        if (output.kd.empty()) {
-            output.kd.assign(num_dof, 2.0);
-            std::cout << "[BehaviorManager] 警告: 未配置 kd，使用默认值 2.0" << std::endl;
-        }
-
-        init_kp = output.kp;
-        init_kd = output.kd;
-
-        // 加载回零时间
-        double zero_duration =
-            yaml_file.Read<double>("behavior_manager.zero_duration").value_or(2.0);
+        // 加载回零时间（缓存供策略切换时重建 ZERO 使用）
+        zero_duration = yaml_file.Read<double>("behavior_manager.zero_duration").value_or(2.0);
 
         // 初始化输出维度
         output.target_pos.assign(num_dof, 0.0);
@@ -150,12 +136,12 @@ public:
             throw std::runtime_error("[BehaviorManager] 缺少配置项 behavior_manager.damp_kd");
         }
 
-        // 注册状态
+        // 注册固定状态
         fsm.AddState(StateName::POWER_OFF, CreateStatePowerOff());
         fsm.AddState(StateName::DAMP, CreateStateDamp(damp_kd));
-        fsm.AddState(StateName::ZERO, CreateStateZero(zero_pos, zero_duration, init_kp, init_kd));
 
         // RL 状态配置：调用 policy_executor 提供的统一解析接口
+        // ZERO 状态在 RL 策略加载后注册，使用策略的 rl_default_pos 和 kp/kd
         auto rl_type_opt = yaml_file.Read<std::string>("rl_policy.type");
         if (rl_type_opt) {
             const std::string rl_type = rl_type_opt.value();
@@ -174,15 +160,20 @@ public:
                 rl_policy::LoadPolicyConfigFromYaml(path, active_policy, robot_dir);
             RLConfig rc = ToRLConfig(loaded_cfg);
             rc.infer_thread_cfg = infer_thread_cfg;
-            rc.kp = init_kp;
-            rc.kd = init_kd;
             rc.rl_freq_hz = &rl_freq_hz;
+
+            // ZERO 状态使用当前策略的目标位置和 kp/kd
+            fsm.AddState(StateName::ZERO,
+                CreateStateZero(loaded_cfg.exec_cfg.rl_default_pos, zero_duration,
+                                loaded_cfg.kp, loaded_cfg.kd));
 
             fsm.AddState(StateName::RL, CreateStateRl(rc));
             has_rl = true;
 
             std::cout << "[BehaviorManager] RL 状态: 已加载 (" << rc.model_path << ")" << std::endl;
         } else {
+            // 无 RL 策略时 ZERO 回退到 yaml 配置的 zero_pos（空 kp/kd 由 mujoco robot_base 兜底）
+            fsm.AddState(StateName::ZERO, CreateStateZero(zero_pos, zero_duration, {}, {}));
             std::cout << "[BehaviorManager] RL 状态: 未配置" << std::endl;
         }
 
@@ -210,18 +201,21 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
     if (!impl_->initialized)
         return;
 
-    // 若 pending_policy 与 active_policy 不同，且当前不在 RL 状态，重新加载 RL 状态
-    if (impl_->has_rl && impl_->pending_policy != impl_->active_policy &&
-        impl_->fsm.CurrentState() != StateName::RL) {
+    // 策略切换：仅在 POWER_OFF / DAMP 时允许（进入 ZERO 后策略已锁定）
+    if (impl_->has_rl && impl_->pending_policy != impl_->active_policy) {
         try {
             const rl_policy::LoadedPolicyConfig loaded_cfg = rl_policy::LoadPolicyConfigFromYaml(
                 impl_->config_path, impl_->pending_policy, impl_->robot_dir);
             RLConfig rc = ToRLConfig(loaded_cfg);
             rc.infer_thread_cfg = impl_->infer_thread_cfg;
-            rc.kp = impl_->init_kp;
-            rc.kd = impl_->init_kd;
             rc.rl_freq_hz = &impl_->rl_freq_hz;
+
+            // 同步重建 ZERO 状态，使用新策略的 rl_default_pos 和 kp/kd
+            impl_->fsm.AddState(StateName::ZERO,
+                CreateStateZero(loaded_cfg.exec_cfg.rl_default_pos, impl_->zero_duration,
+                                loaded_cfg.kp, loaded_cfg.kd));
             impl_->fsm.AddState(StateName::RL, CreateStateRl(rc));
+
             // 重新注入数据指针（动态添加的状态需要手动注入）
             impl_->fsm.SetDataPointers(&impl_->sensor, &impl_->command, &impl_->output);
             impl_->active_policy = impl_->pending_policy;
@@ -242,10 +236,10 @@ void BehaviorManagerClass::SetSensorData(const robot_base::RobotData &data) {
 
 void BehaviorManagerClass::SetCommand(const robot_base::Command &cmd) {
     impl_->command = cmd;
-    // 只有非 RL 状态才允许切换策略，RL 运行中直接丢弃
+    // 仅在 POWER_OFF / DAMP 状态允许切换策略；进入 ZERO 后策略已锁定，不再接受切换
     if (!cmd.switch_policy.empty()) {
         StateName cur = impl_->fsm.CurrentState();
-        if (cur != StateName::RL) {
+        if (cur == StateName::POWER_OFF || cur == StateName::DAMP) {
             impl_->pending_policy = cmd.switch_policy;
         }
     }

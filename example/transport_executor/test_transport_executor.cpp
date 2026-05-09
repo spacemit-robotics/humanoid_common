@@ -87,9 +87,14 @@ int main(int argc, char *argv[]) {
 
     std::cout << "\n--- 测试控制通道 (Control → Driver) ---\n";
 
+    // 真实 RL 控制下发包含完整四个字段：target_pos / target_vel / kp / kd
+    // 每帧 kp/kd 也会随控制命令下发（per-policy 训练增益），demo 这里给出示例值
     robot_base::ControlCmd cmd;
     cmd.enable = true;
     cmd.target_pos.resize(state.num_dof);
+    cmd.target_vel.assign(state.num_dof, 0.0);
+    cmd.kp.assign(state.num_dof, 100.0);
+    cmd.kd.assign(state.num_dof, 2.0);
     for (int i = 0; i < state.num_dof; ++i) {
         cmd.target_pos[i] = 0.5 * i;
     }
@@ -100,8 +105,13 @@ int main(int argc, char *argv[]) {
     robot_base::ControlCmd recv_cmd;
     if (driver->RecvControl(recv_cmd)) {
         std::cout << "[test] 控制命令接收成功: enable=" << recv_cmd.enable
-                << ", num_dof=" << recv_cmd.target_pos.size() << "\n";
-        bool ok = recv_cmd.enable && (recv_cmd.target_pos.size() == cmd.target_pos.size());
+                << ", num_dof=" << recv_cmd.target_pos.size()
+                << ", kp[0]=" << recv_cmd.kp[0] << ", kd[0]=" << recv_cmd.kd[0] << "\n";
+        bool ok = recv_cmd.enable
+                && (recv_cmd.target_pos.size() == cmd.target_pos.size())
+                && (recv_cmd.target_vel.size() == cmd.target_vel.size())
+                && (recv_cmd.kp.size() == cmd.kp.size())
+                && (recv_cmd.kd.size() == cmd.kd.size());
         std::cout << "[test] 控制数据验证: " << (ok ? "通过" : "失败") << "\n";
     } else {
         std::cerr << "[test] 控制命令接收失败\n";

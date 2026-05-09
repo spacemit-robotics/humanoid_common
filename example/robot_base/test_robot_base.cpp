@@ -64,6 +64,26 @@ int main(int argc, char *argv[]) {
                 << (missing.has_value() ? std::to_string(*missing) : "nullopt（符合预期）")
                 << std::endl;
 
+            // robot_base 节点的固有物理属性：MuJoCo 启动初始增益与默认站立姿态
+            auto kp = yaml.Read<std::vector<double>>("robot_base.kp");
+            auto kd = yaml.Read<std::vector<double>>("robot_base.kd");
+            auto default_joint_pos =
+                yaml.Read<std::vector<double>>("robot_base.default_joint_pos");
+            if (!kp || !kd || !default_joint_pos) {
+                std::cerr << "[错误] 读取 robot_base.kp/kd/default_joint_pos 失败\n";
+                return 1;
+            }
+            const int n = *num_dof;
+            if (static_cast<int>(kp->size()) != n || static_cast<int>(kd->size()) != n
+                || static_cast<int>(default_joint_pos->size()) != n) {
+                std::cerr << "[错误] kp/kd/default_joint_pos 维度与 num_dof 不一致\n";
+                return 1;
+            }
+            std::cout << "robot_base.kp.size()               = " << kp->size() << std::endl;
+            std::cout << "robot_base.kd.size()               = " << kd->size() << std::endl;
+            std::cout << "robot_base.default_joint_pos.size()= " << default_joint_pos->size()
+                << std::endl;
+
             // ========== RobotData::FromYaml ==========
             std::cout << "\n--- RobotData::FromYaml ---" << std::endl;
             RobotData from_yaml = RobotData::FromYaml(yaml_path);

@@ -85,6 +85,7 @@ struct ControlCmdPacket {
     PacketHeader header{};
     int32_t num_dof = 0;
     uint8_t enable = 0;
+    int8_t control_mode = 0;  // robot_base::ControlMode（POWER_OFF=0/DAMP=1/ZERO=2/RL=3/SAFETY=4）
     double target_pos[kMaxDof] = {0.0};
     double target_vel[kMaxDof] = {0.0};
     double kp[kMaxDof] = {0.0};

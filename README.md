@@ -86,6 +86,43 @@ run_sim2sim_g1.sh   # 终端2（K3 板卡）
                                                               └──────────────┘
 ```
 
+### PD 增益数据流
+
+kp/kd 在不同阶段由不同来源提供，配置上分散在两个 yaml 节点：
+
+- **driver 启动期**：`driver_runtime` 读取 `robot_base.kp/kd/default_joint_pos`，作为 MuJoCo 仿真的初始 PD 增益与默认站立姿态。
+- **RL 控制期**：进入 RL 状态后，control 端每帧通过 `ControlCmd.kp/kd` 下发当前策略训练时的真实增益（来自 `rl_policy.policies.<name>.kp/kd`），driver 端原样转发给 MuJoCo，不再使用启动期的默认值。
+- **ZERO/DAMP 阶段**：ZERO 用当前策略的 `rl_default_pos` + `kp/kd`（无策略时回退到 `behavior_manager.zero_pos`，kp/kd 由 robot_base 兜底）；DAMP 用 `behavior_manager.damp_kd`（≈ policy kd / 5）。
+
+### 策略链调度（prerequisite chain）
+
+某些 RL 策略需要先经过另一策略热身才能稳定运行（典型：`dance` / `kungfu` 必须先用 LocoMode `stand` 站稳并预热 LSTM，否则从 PD 锁位的 ZERO 直接切动态动作会摔）。在 yaml 中给目标策略加可选 `prerequisite` 子节点即可：
+
+```yaml
+rl_policy:
+  onnx_infer:
+    policies:
+      stand:  { ... }                          # 前置策略，正常配置
+      dance:
+        ...                                    # 已有字段保留
+        prerequisite:
+          policy: stand                        # 前置策略名
+          duration: 2.0                        # 前置运行时长（秒）
+```
+
+调度流程：HMI 切 `dance` → behavior_manager 命中 map → 内部先把 active 切到 `stand`，进 RL 跑满 2s 后自动切到 `dance`（StateRL 会重新 OnEnter 重置 LSTM）。HMI 单次按键，用户无感。详见 [`src/behavior_manager/README.md`](src/behavior_manager/README.md)。
+
+### ControlMode 数据流（control → driver）
+
+`ControlCmd.mode` 是 control 端发给 driver 的通用控制语义字段（`enum class ControlMode { POWER_OFF, DAMP, ZERO, RL, SAFETY }`），driver 据此自主决定后端行为：
+
+- **三进程 FSM 模式**：`control_runtime` 把 `bm.CurrentState()` 透传到 `ctrl.mode`
+- **sim2sim 模式**：`control_sim2sim_runtime` 始终发 `ControlMode::RL`
+- **mujoco driver**：边沿检测 mode 变化—— `RL` → 自动取消悬挂保护，`POWER_OFF` → 自动启用悬挂；其余 mode 不主动覆盖（保留 mujoco 界面 F 键的手动权限）
+- **实机 driver**：可忽略此字段，或用于状态阈值/恢复策略/遥测打点
+
+设计原则：跨层接口字段必须用通用语义，禁止携带某一具体后端（mujoco 悬挂等）的私有概念。
+
 ### hmi_runtime 键盘操作
 
 | 按键 | 动作 |

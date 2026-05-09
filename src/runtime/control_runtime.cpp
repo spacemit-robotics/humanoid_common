@@ -117,6 +117,8 @@ int main(int argc, char *argv[]) {
             ctrl.target_vel = out.target_vel;
             ctrl.kp = out.kp;
             ctrl.kd = out.kd;
+            // 透传 FSM 状态作为通用控制模式（driver 侧自主解释；mujoco 据此调整悬挂、实机据此判定阈值/恢复）
+            ctrl.mode = static_cast<robot_base::ControlMode>(bm.CurrentState());
             transport->SendControl(ctrl);
 
             step_count++;

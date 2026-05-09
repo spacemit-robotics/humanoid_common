@@ -180,6 +180,7 @@ void TransportUdpImpl::SendControl(const robot_base::ControlCmd& cmd) {
     p.header.seq = ++control_seq_;
     p.num_dof = std::clamp(static_cast<int>(cmd.target_pos.size()), 0, kMaxDof);
     p.enable = cmd.enable ? 1 : 0;
+    p.control_mode = static_cast<int8_t>(cmd.mode);
 
     for (int i = 0; i < p.num_dof; ++i) {
         p.target_pos[i] = cmd.target_pos[i];
@@ -202,6 +203,7 @@ bool TransportUdpImpl::RecvControl(robot_base::ControlCmd& cmd) {
 
     int ndof = std::clamp(p.num_dof, 0, kMaxDof);
     cmd.enable = (p.enable != 0);
+    cmd.mode = static_cast<robot_base::ControlMode>(p.control_mode);
     cmd.target_pos.resize(ndof);
     cmd.target_vel.resize(ndof);
     cmd.kp.resize(ndof);

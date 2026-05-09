@@ -59,8 +59,13 @@ int main(int argc, char *argv[]) {
         yaml_file.ToAbsPath(yaml_file.Read<std::string>("robot_base.robot_dir").value());
     const std::string xml_path = robot_dir + "/resources/xml/scene.xml";
 
-    // 初始化仿真
-    Simulator sim(yaml_path, robot_name, num_dof, xml_path, true);
+    // 从 robot_base 节点读取机器人固有属性传给 mujoco
+    const auto default_joint_pos =
+        yaml_file.Read<std::vector<double>>("robot_base.default_joint_pos").value();
+    const auto kp = yaml_file.Read<std::vector<double>>("robot_base.kp").value_or(std::vector<double>{});
+    const auto kd = yaml_file.Read<std::vector<double>>("robot_base.kd").value_or(std::vector<double>{});
+
+    Simulator sim(yaml_path, robot_name, num_dof, xml_path, default_joint_pos, kp, kd, true);
 
     // 初始化传输（Driver 角色）
     auto transport = transport::Create(yaml_path);
@@ -71,6 +76,10 @@ int main(int argc, char *argv[]) {
 
     std::cout << "[driver_demo] 启动（使用 transport_executor）\n";
 
+    // 按 control 端发来的 ControlMode 自主决定 mujoco 悬挂行为：
+    // RL → 取消悬挂（避免影响动作）；POWER_OFF → 启用悬挂（防摔）；
+    // 其余状态不主动覆盖（保留 mujoco 界面 F 键的手动权限）
+    auto last_mode = robot_base::ControlMode::POWER_OFF;
     sim.Run(
         [&](const SimState &sim_state) -> std::optional<SimControl> {
             // SimState → RobotData（transport 层使用 robot_base 类型）
@@ -96,6 +105,18 @@ int main(int argc, char *argv[]) {
             }
             if (!has_cmd) {
                 return std::nullopt;
+            }
+
+            // 按 control 端 mode 自主决定 mujoco 悬挂行为（仅在模式变化时触发，保留 mujoco 界面 F 键的手动权限）
+            if (cmd.mode != last_mode) {
+                if (cmd.mode == robot_base::ControlMode::RL) {
+                    sim.SetAssistEnabled(false);
+                    std::cout << "[driver_demo] mode=RL → 自动取消悬挂" << std::endl;
+                } else if (cmd.mode == robot_base::ControlMode::POWER_OFF) {
+                    sim.SetAssistEnabled(true);
+                    std::cout << "[driver_demo] mode=POWER_OFF → 自动启用悬挂" << std::endl;
+                }
+                last_mode = cmd.mode;
             }
 
             // ControlCmd → SimControl

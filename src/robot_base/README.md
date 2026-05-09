@@ -90,6 +90,7 @@ robot_base:
 | 字段 | 类型 | 说明 |
 | :--- | :--- | :--- |
 | `enable` | `bool` | 使能标志，`false` 时驱动器失力 |
+| `mode` | `ControlMode` | 通用控制模式（`POWER_OFF/DAMP/ZERO/RL/SAFETY`），driver 自主解释（mujoco 据此调悬挂、实机据此调阈值/恢复） |
 | `target_pos` | `std::vector<double>` | 目标关节位置 (rad)，大小 = num_dof |
 | `target_vel` | `std::vector<double>` | 目标关节速度 (rad/s)，大小 = num_dof |
 | `kp` | `std::vector<double>` | PD 控制比例增益，大小 = num_dof |

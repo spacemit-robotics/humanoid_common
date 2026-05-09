@@ -27,6 +27,21 @@ void FSM::AddState(StateName name, std::unique_ptr<State> state) {
     states_[name] = std::move(state);
 }
 
+void FSM::ReplaceState(StateName name, std::unique_ptr<State> state) {
+    state->name = name;
+    state->sensor_ = sensor_;
+    state->command_ = command_;
+    state->output_ = output_;
+    if (name == current_name_ && current_) {
+        current_->OnExit();
+        states_[name] = std::move(state);
+        current_ = states_[name].get();
+        current_->OnEnter();
+    } else {
+        states_[name] = std::move(state);
+    }
+}
+
 void FSM::SetDataPointers(robot_base::RobotData *sensor,
                         robot_base::Command *cmd,
                         ControlOutput *output) {

@@ -186,8 +186,23 @@ struct Command {
  *
  * 用于控制器输出的目标关节状态和 PD 参数。
  */
+/**
+ * @brief 控制模式（通用语义，独立于 behavior_manager FSM）
+ *
+ * 由 control 端在每帧 ControlCmd 中告知 driver 当前的整体控制语义，便于 driver
+ * 据此调整自身行为（mujoco 悬挂、实机故障阈值/恢复策略、日志/遥测打点等）。
+ */
+enum class ControlMode : int8_t {
+    POWER_OFF = 0,  ///< 完全失力
+    DAMP = 1,       ///< 阻尼保持
+    ZERO = 2,       ///< PD 锁位（回零或保持训练初始位）
+    RL = 3,         ///< RL 策略动态控制
+    SAFETY = 4      ///< 安全保护
+};
+
 struct ControlCmd {
     bool enable = false;             ///< 使能标志
+    ControlMode mode = ControlMode::POWER_OFF;  ///< 控制模式（通用）
     std::vector<double> target_pos;  ///< 目标关节位置 (rad)
     std::vector<double> target_vel;  ///< 目标关节速度 (rad/s)
     std::vector<double> kp;          ///< 比例增益

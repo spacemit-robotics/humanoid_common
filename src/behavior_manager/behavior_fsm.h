@@ -39,6 +39,15 @@ public:
     void AddState(StateName name, std::unique_ptr<State> state);
 
     /**
+     * @brief 替换状态（安全版本：处理"替换正在运行的当前状态"场景）
+     *
+     * 与 AddState 区别：若 name == 当前状态，会调用旧状态 OnExit、
+     * 替换 unique_ptr、调用新状态 OnEnter，并更新 current_ 指针避免悬挂。
+     * 同时直接注入数据指针（无需追加 SetDataPointers）。
+     */
+    void ReplaceState(StateName name, std::unique_ptr<State> state);
+
+    /**
      * @brief 初始化 FSM，设置初始状态为 POWER_OFF
      */
     void Init();

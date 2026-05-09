@@ -122,6 +122,7 @@ int main(int argc, char *argv[]) {
 
             robot_base::ControlCmd ctrl;
             ctrl.enable = true;
+            ctrl.mode = robot_base::ControlMode::RL;  // sim2sim 始终是 RL 推理控制
             ctrl.target_pos = target_pos;
             ctrl.target_vel.assign(policy.ActionDim(), 0.0);  // 位置控制，目标速度为 0
             ctrl.kp = loaded_cfg.kp;

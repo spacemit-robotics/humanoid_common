@@ -16,6 +16,8 @@
 #include <atomic>
 #include <iostream>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "behavior_fsm.h"      // 内部实现，位于 src/
@@ -89,6 +91,20 @@ public:
     bool has_rl = false;                      // 是否配置了 RL 状态
     std::atomic<double> rl_freq_hz{0.0};      // RL 实时推理频率（Hz）
     robot_base::ThreadLoop infer_thread_cfg;  // 推理线程配置（robot_base.threads.rl_infer）
+
+    // 策略链调度（prerequisite）
+    struct PrerequisiteEntry {
+        std::string policy;
+        double duration;
+    };
+    std::unordered_map<std::string, PrerequisiteEntry> prerequisite_map;
+    std::string final_target_policy;  // 用户最终目标策略；空 = 当前无前置链
+    double prerequisite_timer = 0.0;  // 前置策略已运行时长（仅 RL 状态累计）
+    bool waiting_prerequisite = false;
+
+    // 边沿检测（control_runtime 每帧重发缓存 cmd，需要识别真实的"用户新请求"）
+    std::string prev_switch_policy;          // 上一帧 cmd.switch_policy
+    StateName prev_fsm_state = StateName::POWER_OFF;  // 上一帧 FSM 状态
 
     void LoadConfig(const std::string &path) {
         config_path = path;
@@ -171,6 +187,20 @@ public:
             has_rl = true;
 
             std::cout << "[BehaviorManager] RL 状态: 已加载 (" << rc.model_path << ")" << std::endl;
+
+            // 解析所有策略的可选 prerequisite 子节点，构建策略链 map
+            auto policy_names = yaml_file.Read<std::vector<std::string>>(
+                "rl_policy.onnx_infer.policy_names").value_or(std::vector<std::string>{});
+            for (const auto &pname : policy_names) {
+                const std::string base = "rl_policy.onnx_infer.policies." + pname + ".prerequisite";
+                auto pre_pol = yaml_file.Read<std::string>(base + ".policy");
+                auto pre_dur = yaml_file.Read<double>(base + ".duration");
+                if (pre_pol && pre_dur && !pre_pol->empty() && *pre_pol != pname) {
+                    prerequisite_map[pname] = {*pre_pol, *pre_dur};
+                    std::cout << "[BehaviorManager] 策略链: " << pname << " ← " << *pre_pol
+                            << " (" << *pre_dur << "s)" << std::endl;
+                }
+            }
         } else {
             // 无 RL 策略时 ZERO 回退到 yaml 配置的 zero_pos（空 kp/kd 由 mujoco robot_base 兜底）
             fsm.AddState(StateName::ZERO, CreateStateZero(zero_pos, zero_duration, {}, {}));
@@ -201,7 +231,7 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
     if (!impl_->initialized)
         return;
 
-    // 策略切换：仅在 POWER_OFF / DAMP 时允许（进入 ZERO 后策略已锁定）
+    // 策略切换：pending_policy 由 SetCommand（POWER_OFF/DAMP 直切）或前置链调度（RL 中到期自动切）触发
     if (impl_->has_rl && impl_->pending_policy != impl_->active_policy) {
         try {
             const rl_policy::LoadedPolicyConfig loaded_cfg = rl_policy::LoadPolicyConfigFromYaml(
@@ -210,24 +240,51 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
             rc.infer_thread_cfg = impl_->infer_thread_cfg;
             rc.rl_freq_hz = &impl_->rl_freq_hz;
 
-            // 同步重建 ZERO 状态，使用新策略的 rl_default_pos 和 kp/kd
-            impl_->fsm.AddState(StateName::ZERO,
+            // 用 ReplaceState 替换 ZERO + RL，安全处理"替换正在运行的当前状态"场景
+            // （前置链到期后会在 RL 状态触发 RL→RL 重建，需走 OnExit/OnEnter 重置 LSTM 隐状态）
+            impl_->fsm.ReplaceState(StateName::ZERO,
                 CreateStateZero(loaded_cfg.exec_cfg.rl_default_pos, impl_->zero_duration,
                                 loaded_cfg.kp, loaded_cfg.kd));
-            impl_->fsm.AddState(StateName::RL, CreateStateRl(rc));
+            impl_->fsm.ReplaceState(StateName::RL, CreateStateRl(rc));
 
-            // 重新注入数据指针（动态添加的状态需要手动注入）
-            impl_->fsm.SetDataPointers(&impl_->sensor, &impl_->command, &impl_->output);
             impl_->active_policy = impl_->pending_policy;
+            impl_->prerequisite_timer = 0.0;  // 切换后重置计时（仅前置策略生效时再启用）
             std::cout << "[BehaviorManager] 策略已切换: " << impl_->active_policy << " ("
                     << rc.model_path << ")" << std::endl;
         } catch (const std::exception &e) {
             std::cerr << "[BehaviorManager] 策略切换失败: " << e.what() << std::endl;
             impl_->pending_policy = impl_->active_policy;  // 回滚
+            impl_->final_target_policy.clear();
+            impl_->waiting_prerequisite = false;
         }
     }
 
     impl_->fsm.Step(control_dt, rl_dt);
+
+    // 前置策略链调度：仅在 RL 状态累计时长，到期后设置 pending_policy = final_target
+    StateName cur = impl_->fsm.CurrentState();
+    if (impl_->waiting_prerequisite && cur == StateName::RL) {
+        impl_->prerequisite_timer += control_dt;
+        auto it = impl_->prerequisite_map.find(impl_->final_target_policy);
+        if (it != impl_->prerequisite_map.end() &&
+            impl_->prerequisite_timer >= it->second.duration) {
+            std::cout << "[BehaviorManager] 前置策略 " << impl_->active_policy << " 运行 "
+                    << impl_->prerequisite_timer << "s 完成，自动切换至目标策略 "
+                    << impl_->final_target_policy << std::endl;
+            impl_->pending_policy = impl_->final_target_policy;
+            impl_->final_target_policy.clear();
+            impl_->waiting_prerequisite = false;
+        }
+    }
+    // RL → POWER_OFF 边沿：用户中途按 ESC 退回 POWER_OFF，取消前置链调度
+    if (impl_->waiting_prerequisite &&
+        impl_->prev_fsm_state == StateName::RL && cur == StateName::POWER_OFF) {
+        std::cout << "[BehaviorManager] RL → POWER_OFF，取消前置链调度" << std::endl;
+        impl_->final_target_policy.clear();
+        impl_->waiting_prerequisite = false;
+        impl_->prerequisite_timer = 0.0;
+    }
+    impl_->prev_fsm_state = cur;
 }
 
 void BehaviorManagerClass::SetSensorData(const robot_base::RobotData &data) {
@@ -236,12 +293,33 @@ void BehaviorManagerClass::SetSensorData(const robot_base::RobotData &data) {
 
 void BehaviorManagerClass::SetCommand(const robot_base::Command &cmd) {
     impl_->command = cmd;
+    // switch_policy 边沿检测：control_runtime 每帧把缓存 cmd 重复喂入，必须只在变化时响应
+    const bool edge = (cmd.switch_policy != impl_->prev_switch_policy);
+    impl_->prev_switch_policy = cmd.switch_policy;
+    if (!edge || cmd.switch_policy.empty()) {
+        return;
+    }
     // 仅在 POWER_OFF / DAMP 状态允许切换策略；进入 ZERO 后策略已锁定，不再接受切换
-    if (!cmd.switch_policy.empty()) {
-        StateName cur = impl_->fsm.CurrentState();
-        if (cur == StateName::POWER_OFF || cur == StateName::DAMP) {
-            impl_->pending_policy = cmd.switch_policy;
-        }
+    StateName cur = impl_->fsm.CurrentState();
+    if (cur != StateName::POWER_OFF && cur != StateName::DAMP) {
+        return;
+    }
+    const std::string &target = cmd.switch_policy;
+    auto it = impl_->prerequisite_map.find(target);
+    if (it != impl_->prerequisite_map.end()) {
+        // 命中前置链：先切前置策略，记录最终目标，等 RL 跑满 duration 后自动切换
+        impl_->final_target_policy = target;
+        impl_->pending_policy = it->second.policy;
+        impl_->prerequisite_timer = 0.0;
+        impl_->waiting_prerequisite = true;
+        std::cout << "[BehaviorManager] 策略链调度: " << it->second.policy << " ("
+                << it->second.duration << "s) → " << target << std::endl;
+    } else {
+        // 无前置链：直接切目标策略，并清除可能残留的前置链状态
+        impl_->pending_policy = target;
+        impl_->final_target_policy.clear();
+        impl_->waiting_prerequisite = false;
+        impl_->prerequisite_timer = 0.0;
     }
 }
 

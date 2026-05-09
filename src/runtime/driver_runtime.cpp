@@ -76,6 +76,10 @@ int main(int argc, char *argv[]) {
 
     std::cout << "[driver_demo] 启动（使用 transport_executor）\n";
 
+    // 按 control 端发来的 ControlMode 自主决定 mujoco 悬挂行为：
+    // RL → 取消悬挂（避免影响动作）；POWER_OFF → 启用悬挂（防摔）；
+    // 其余状态不主动覆盖（保留 mujoco 界面 F 键的手动权限）
+    auto last_mode = robot_base::ControlMode::POWER_OFF;
     sim.Run(
         [&](const SimState &sim_state) -> std::optional<SimControl> {
             // SimState → RobotData（transport 层使用 robot_base 类型）
@@ -101,6 +105,18 @@ int main(int argc, char *argv[]) {
             }
             if (!has_cmd) {
                 return std::nullopt;
+            }
+
+            // 按 control 端 mode 自主决定 mujoco 悬挂行为（仅在模式变化时触发，保留 mujoco 界面 F 键的手动权限）
+            if (cmd.mode != last_mode) {
+                if (cmd.mode == robot_base::ControlMode::RL) {
+                    sim.SetAssistEnabled(false);
+                    std::cout << "[driver_demo] mode=RL → 自动取消悬挂" << std::endl;
+                } else if (cmd.mode == robot_base::ControlMode::POWER_OFF) {
+                    sim.SetAssistEnabled(true);
+                    std::cout << "[driver_demo] mode=POWER_OFF → 自动启用悬挂" << std::endl;
+                }
+                last_mode = cmd.mode;
             }
 
             // ControlCmd → SimControl

@@ -8,6 +8,9 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_INSTALL_RPATH "\$ORIGIN/../lib:\$ORIGIN")
 set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
 
+# 自定义 Find/Fetch 模块路径（FetchThirdParty / FindCnpy 等）
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+
 # ============================================================================
 # 平台检测
 # ============================================================================
@@ -109,9 +112,13 @@ target_link_libraries(transport_executor
 # ============================================================================
 
 if(BUILD_RL)
+    # cnpy：用于 motion_tracking_helper 读取 .npz 参考动作（仅 tracking 策略启用时使用）
+    find_package(Cnpy REQUIRED)
+
     add_library(behavior_manager SHARED
         src/behavior_manager/behavior_fsm.cpp
         src/behavior_manager/behavior_manager.cpp
+        src/behavior_manager/motion_tracking_helper.cpp
         src/behavior_manager/states/state_power_off.cpp
         src/behavior_manager/states/state_damp.cpp
         src/behavior_manager/states/state_zero.cpp
@@ -131,7 +138,7 @@ if(BUILD_RL)
 
     target_link_libraries(behavior_manager
         PUBLIC  robot_base
-        PRIVATE ${RL_LIB}
+        PRIVATE ${RL_LIB} cnpy
     )
 endif()
 

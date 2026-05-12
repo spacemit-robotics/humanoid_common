@@ -57,11 +57,20 @@ struct RLConfig {
     // ---- ref_motion_phase 参数 ----
     double motion_length = 0.0;
 
+    // ---- BeyondMimic 风格 tracking 参数（可选；motion_file 为空表示该策略不启用 tracking）----
+    std::string motion_file;                    // npz 路径（绝对或相对 robot_dir）
+    double motion_fps = 50.0;                   // mjlab 训练默认 50 Hz
+    std::string anchor_body_name = "torso_link";  // 当前仅 G1 torso_link 支持
+    bool anchor_yaw_align = true;
+
     // ---- 维度校验 ----
     bool strict_obs_dim_check = false;
 
     // ---- 自定义标量默认值（如 "z": 0.42, "stand_flag": 0.5）----
     std::unordered_map<std::string, float> custom_scalar_defaults;
+
+    // ---- 自定义数组维度声明（N 维 obs term，由 yaml custom_array_dims 透传）----
+    std::unordered_map<std::string, int> custom_array_dims;
 
     // ---- PD 控制增益（从 behavior_manager 传入，OnEnter 时恢复）----
     std::vector<double> kp;

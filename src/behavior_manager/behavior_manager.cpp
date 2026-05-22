@@ -76,7 +76,7 @@ RLConfig ToRLConfig(const rl_policy::LoadedPolicyConfig &loaded_cfg) {
     return rc;
 }
 
-// 解析 BeyondMimic 风格 tracking 字段（policy 段下可选），写入 RLConfig
+// 解析 motion tracking 字段（policy 段下可选），写入 RLConfig
 // rl 层 LoadedPolicyConfig 不含这些字段（保持 rl 层 tracking-agnostic），由 behavior 层独立读取
 void LoadTrackingFields(const std::string &yaml_path,
                         const std::string &policy_name,

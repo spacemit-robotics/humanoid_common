@@ -78,7 +78,7 @@ public:
         new_data_ready_ = false;
         running_ = true;
 
-        // BeyondMimic 风格 tracking 支持：若策略配置了 motion_file，加载 npz + reset yaw 对齐
+        // motion tracking 支持：若策略配置了 motion_file，加载 npz + reset yaw 对齐
         tracking_helper_.reset();
         if (!config_.motion_file.empty() && sensor_) {
             try {
@@ -217,7 +217,7 @@ private:
             rl_dt = sample_rl_dt_;
         }
 
-        // BeyondMimic 风格 tracking：每帧把 motion + anchor 数据推给 policy（在 AssembleObs 前）
+        // motion tracking：每帧把 motion + anchor 数据推给 policy（在 AssembleObs 前）
         if (tracking_helper_) {
             const auto elapsed = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t_enter_).count();
@@ -279,7 +279,7 @@ private:
     // 安全标志
     bool safety_triggered_ = false;
 
-    // BeyondMimic 风格 tracking 辅助（motion_file 为空则不启用）
+    // motion tracking 辅助（motion_file 为空则不启用）
     std::unique_ptr<MotionTrackingHelper> tracking_helper_;
     std::chrono::steady_clock::time_point t_enter_;
 

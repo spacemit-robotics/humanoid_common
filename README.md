@@ -112,13 +112,13 @@ rl_policy:
 
 调度流程：HMI 切 `dance` → behavior_manager 命中 map → 内部先把 active 切到 `stand`，进 RL 跑满 2s 后自动切到 `dance`（StateRL 会重新 OnEnter 重置 LSTM）。HMI 单次按键，用户无感。详见 [`src/behavior_manager/README.md`](src/behavior_manager/README.md)。
 
-### BeyondMimic 风格 tracking 策略
+### Motion tracking 策略
 
 `tracking` 策略与 `dance` / `kungfu` 是不同的 motion mimic 范式：
 
-| | dance/kungfu | tracking (BeyondMimic) |
+| | dance/kungfu | tracking (unitree_rl_mjlab) |
 |---|---|---|
-| 训练来源 | RoboMimic_Deploy（1D phase 范式） | unitree_rl_mjlab（BeyondMimic 复刻） |
+| 训练来源 | RoboMimic_Deploy（1D phase 范式） | unitree_rl_mjlab（多维参考量范式） |
 | obs 维度 | 380（1D phase + history × 4） | 160（多维参考 + 单帧） |
 | motion 数据 | 烘进 actor 权重 | 外挂 npz 文件（cnpy 运行时加载） |
 | anchor 计算 | 不需要 | 需要（torso 相对位姿） |
@@ -143,6 +143,8 @@ motion 播完自动回 ZERO（沿用 `motion_length` 超时风格）。第一次
 设计原则：跨层接口字段必须用通用语义，禁止携带某一具体后端（mujoco 悬挂等）的私有概念。
 
 ### hmi_runtime 键盘操作
+
+hmi_runtime 使用 ANSI 备用屏幕缓冲区实现全屏 TUI，策略列表自动分行显示。
 
 | 按键 | 动作 |
 | --- | --- |

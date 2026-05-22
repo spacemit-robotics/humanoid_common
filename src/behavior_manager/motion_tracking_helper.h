@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file motion_tracking_helper.h
- * @brief BeyondMimic 风格 tracking 策略的 motion 参考数据 + anchor 坐标系计算辅助类
+ * @brief Motion tracking 策略的参考数据加载 + anchor 坐标系计算辅助类
  *
  * 职责：
  *   1. 从 .npz 加载 motion 参考数据（joint_pos / joint_vel / body_pos_w / body_quat_w）

@@ -73,6 +73,17 @@ run_driver_g1.sh    # 终端1（PC）
 run_sim2sim_g1.sh   # 终端2（K3 板卡）
 ```
 
+### CI 测试
+
+模块自带 `test.yaml`（CI 用例清单）+ `tests/`，经 SDK 根目录的 `robot-test` 运行：
+
+```bash
+scripts/test/robot-test list application/native/humanoid_common
+scripts/test/robot-test run  application/native/humanoid_common --scope pr
+```
+
+PR 档含 `humanoid-common-functional`（robot_base / behavior_manager / transport_executor 从 example 配置跑通核心流程 + 维度断言）与 `humanoid-common-error-path`（坏/缺配置快速失败），均不依赖硬件。
+
 ## 详细使用
 
 ### 三进程架构

@@ -4,7 +4,7 @@
 #   - target: cnpy  (STATIC，跟随主项目交叉编译，自动 link zlib)
 #   - 变量:   CNPY_FOUND
 #
-# 实现方式：通过 FetchThirdParty.cmake 的 GIT_REPO 模式拉源码到 cache，
+# 实现方式：通过 FetchThirdParty.cmake 拉固定 commit 的源码到 cache，
 # 然后把 cnpy.cpp 加进本项目构建。
 #
 # cnpy 仓库：https://github.com/rogersce/cnpy
@@ -22,6 +22,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/FetchThirdParty.cmake")
 fetch_thirdparty(
     NAME cnpy
     GIT_REPO https://github.com/rogersce/cnpy.git
+    GIT_COMMIT 4e8810b1a8637695171ed346ce68f6984e585ef4
     OUT_SOURCE_DIR _cnpy_src_dir
 )
 

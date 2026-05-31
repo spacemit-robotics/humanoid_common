@@ -129,7 +129,7 @@ rl_policy:
 2. **common 层**：新增 `MotionTrackingHelper`（[src/behavior_manager/motion_tracking_helper.h](src/behavior_manager/motion_tracking_helper.h)）封装 cnpy npz 加载、yaw 对齐、anchor 计算，state_rl 在 OnEnter / InferStep 各插桩调用，把 `motion_command(58) / motion_anchor_pos_b(3) / motion_anchor_ori_b(6)` 通过 `policy.SetCustomArray(...)` 推给 rl。
 3. **应用层**：g1.yaml 中 tracking 策略段加 `motion_file / motion_fps / anchor_body_name / anchor_yaw_align` 四个 tracking-specific 字段 + `custom_array_dims` 声明。
 
-motion 播完自动回 ZERO（沿用 `motion_length` 超时风格）。第一次进 tracking 时会按机器人当前 yaw vs npz 第 0 帧 yaw 做一次性对齐。
+motion 播完后冻结在末帧（帧索引 clamp 到最后一帧）保持，不自动回 ZERO；需切换状态由 HMI/control 手动触发（POWER_OFF / DAMP 等）。第一次进 tracking 时会按机器人当前 yaw vs npz 第 0 帧 yaw 做一次性对齐。
 
 ### ControlMode 数据流（control → driver）
 

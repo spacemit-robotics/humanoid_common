@@ -42,9 +42,10 @@ else()
     message(STATUS "rl not found in ${CMAKE_INSTALL_PREFIX}, skipping RL-dependent targets (behavior_manager, control_runtime, control_sim2sim_runtime)")
 endif()
 
-# mujoco_sim 可选（仅 x86_64 上查找；找到则启用 driver_runtime，否则跳过）
+# mujoco_sim 可选（x86_64 + riscv64/K3 上查找；找到则启用 driver_runtime，否则跳过）
+# riscv64 上 mujoco_sim 经 gl4es 走 PowerVR 硬件 GLES 渲染（见 components/simulation/mujoco）
 set(BUILD_DRIVER_SIM OFF)
-if(_x86)
+if(_x86 OR CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64|riscv")
     find_library(MUJOCO_SIM_LIB NAMES mujoco_sim
         PATHS ${CMAKE_INSTALL_PREFIX}/lib NO_DEFAULT_PATH)
     find_path(MUJOCO_SIM_INCLUDE_DIR NAMES mujoco_sim.h
@@ -193,7 +194,7 @@ target_include_directories(hmi_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inclu
 target_link_libraries(hmi_runtime PRIVATE transport_executor robot_base)
 install(TARGETS hmi_runtime RUNTIME DESTINATION bin)
 
-# driver_runtime（仿真驱动：x86_64 only，链接 mujoco_sim）
+# driver_runtime（仿真驱动，链接 mujoco_sim；x86_64 + riscv64/K3）
 if(BUILD_DRIVER_SIM)
     add_executable(driver_runtime src/runtime/driver_runtime.cpp)
     target_include_directories(driver_runtime PRIVATE

@@ -83,18 +83,31 @@ public:
         if (!config_.motion_file.empty() && sensor_) {
             try {
                 tracking_helper_ = std::make_unique<MotionTrackingHelper>();
-                tracking_helper_->Load(config_.motion_file, config_.motion_fps);
-                // 当前仅 G1 torso_link 支持，腰关节固定取 [12,13,14]
-                const double yaw_q = (sensor_->joint_pos.size() > 14) ? sensor_->joint_pos[12] : 0.0;
-                const double roll_q = (sensor_->joint_pos.size() > 14) ? sensor_->joint_pos[13] : 0.0;
-                const double pitch_q = (sensor_->joint_pos.size() > 14) ? sensor_->joint_pos[14] : 0.0;
+                tracking_helper_->Load(config_.motion_file, config_.motion_fps,
+                    config_.anchor_body_index);
+                // pelvis→anchor 的腰关节 [yaw, roll, pitch] 角度，索引由机型 yaml 配置；
+                // 未配置或越界则取 0（anchor quat 退化为仅用 root_quat）。
+                auto joint_at = [&](int idx) -> double {
+                    if (idx < 0 || static_cast<size_t>(idx) >= sensor_->joint_pos.size()) {
+                        return 0.0;
+                    }
+                    return sensor_->joint_pos[idx];
+                };
+                const auto &wj = config_.anchor_waist_joint_indices;
+                const double yaw_q = (wj.size() == 3) ? joint_at(wj[0]) : 0.0;
+                const double roll_q = (wj.size() == 3) ? joint_at(wj[1]) : 0.0;
+                const double pitch_q = (wj.size() == 3) ? joint_at(wj[2]) : 0.0;
                 tracking_helper_->Reset(*sensor_, yaw_q, roll_q, pitch_q, config_.anchor_yaw_align);
                 t_enter_ = std::chrono::steady_clock::now();
                 std::cout << "[StateRL] tracking 启用: motion=" << config_.motion_file
+                        << ", anchor_idx=" << config_.anchor_body_index
                         << ", duration=" << tracking_helper_->Duration() << "s" << std::endl;
             } catch (const std::exception &e) {
-                std::cerr << "[StateRL] tracking 加载失败，回退到普通 RL: " << e.what() << std::endl;
+                // 加载失败：置安全触发、跳过推理线程启动，由 CheckTransition 切 SAFETY。
+                std::cerr << "[StateRL] tracking 加载失败，切安全态: " << e.what() << std::endl;
                 tracking_helper_.reset();
+                safety_triggered_ = true;
+                return;
             }
         }
 
@@ -221,9 +234,16 @@ private:
         if (tracking_helper_) {
             const auto elapsed = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t_enter_).count();
-            const double yaw_q = (joint_pos.size() > 14) ? joint_pos[12] : 0.0;
-            const double roll_q = (joint_pos.size() > 14) ? joint_pos[13] : 0.0;
-            const double pitch_q = (joint_pos.size() > 14) ? joint_pos[14] : 0.0;
+            auto joint_at = [&](int idx) -> double {
+                if (idx < 0 || static_cast<size_t>(idx) >= joint_pos.size()) {
+                    return 0.0;
+                }
+                return joint_pos[idx];
+            };
+            const auto &wj = config_.anchor_waist_joint_indices;  // [yaw, roll, pitch]
+            const double yaw_q = (wj.size() == 3) ? joint_at(wj[0]) : 0.0;
+            const double roll_q = (wj.size() == 3) ? joint_at(wj[1]) : 0.0;
+            const double pitch_q = (wj.size() == 3) ? joint_at(wj[2]) : 0.0;
             robot_base::RobotData snapshot;
             snapshot.base_pos = base_pos;
             snapshot.base_quat = base_quat;

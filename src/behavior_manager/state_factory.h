@@ -60,7 +60,8 @@ struct RLConfig {
     // ---- motion tracking 参数（可选；motion_file 为空表示该策略不启用 tracking）----
     std::string motion_file;                    // npz 路径（绝对或相对 robot_dir）
     double motion_fps = 50.0;                   // mjlab 训练默认 50 Hz
-    std::string anchor_body_name = "torso_link";  // 当前仅 G1 torso_link 支持
+    int anchor_body_index = -1;  // anchor body 在 npz body 顺序中的索引（由机型 yaml 提供；<0 表示未配置）
+    std::vector<int> anchor_waist_joint_indices;  // pelvis→anchor 的关节索引 [yaw, roll, pitch]（机型 yaml 提供，用于 yaw 对齐）
     bool anchor_yaw_align = true;
 
     // ---- 维度校验 ----

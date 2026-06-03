@@ -93,8 +93,9 @@ void LoadTrackingFields(const std::string &yaml_path,
         rc.motion_file = p.string();
     }
     rc.motion_fps = yaml.Read<double>(base + ".motion_fps").value_or(50.0);
-    rc.anchor_body_name =
-        yaml.Read<std::string>(base + ".anchor_body_name").value_or("torso_link");
+    rc.anchor_body_index = yaml.Read<int>(base + ".anchor_body_index").value_or(-1);
+    rc.anchor_waist_joint_indices =
+        yaml.Read<std::vector<int>>(base + ".anchor_waist_joint_indices").value_or(std::vector<int>{});
     rc.anchor_yaw_align = yaml.Read<bool>(base + ".anchor_yaw_align").value_or(true);
 }
 

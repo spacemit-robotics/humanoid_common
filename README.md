@@ -132,13 +132,13 @@ rl_policy:
 | 训练来源 | RoboMimic_Deploy（1D phase 范式） | unitree_rl_mjlab（多维参考量范式） |
 | obs 维度 | 380（1D phase + history × 4） | 160（多维参考 + 单帧） |
 | motion 数据 | 烘进 actor 权重 | 外挂 npz 文件（cnpy 运行时加载） |
-| anchor 计算 | 不需要 | 需要（torso 相对位姿） |
+| anchor 计算 | 不需要 | 需要（anchor body 相对位姿） |
 
-实现路径（**rl 层泛型扩展，零业务字眼**）：
+实现路径（rl 层做泛型扩展，tracking 业务逻辑在 common 层）：
 
 1. **rl 层**：`ObsTermCalculator` 把 1D `SetCustomScalar` 扩到 N D `SetCustomArray`，未识别 term 名走 `custom_arrays_` 查表 memcpy（[components/model_zoo/rl/src/obs_term.h](../../components/model_zoo/rl/src/obs_term.h)）。yaml 通过 `custom_array_dims: {name: dim}` 声明 N 维 term 维度。
 2. **common 层**：新增 `MotionTrackingHelper`（[src/behavior_manager/motion_tracking_helper.h](src/behavior_manager/motion_tracking_helper.h)）封装 cnpy npz 加载、yaw 对齐、anchor 计算，state_rl 在 OnEnter / InferStep 各插桩调用，把 `motion_command(58) / motion_anchor_pos_b(3) / motion_anchor_ori_b(6)` 通过 `policy.SetCustomArray(...)` 推给 rl。
-3. **应用层**：g1.yaml 中 tracking 策略段加 `motion_file / motion_fps / anchor_body_name / anchor_yaw_align` 四个 tracking-specific 字段 + `custom_array_dims` 声明。
+3. **应用层**：机型 yaml 中 tracking 策略段加 `motion_file / motion_fps / anchor_body_index / anchor_waist_joint_indices / anchor_yaw_align` 五个 tracking-specific 字段 + `custom_array_dims` 声明。`anchor_body_index` 是 anchor body 在 npz body 顺序中的索引、`anchor_waist_joint_indices` 是 pelvis→anchor 腰关节 [yaw, roll, pitch] 的关节索引（均机型相关，由各机型 yaml 提供）。
 
 motion 播完后冻结在末帧（帧索引 clamp 到最后一帧）保持，不自动回 ZERO；需切换状态由 HMI/control 手动触发（POWER_OFF / DAMP 等）。第一次进 tracking 时会按机器人当前 yaw vs npz 第 0 帧 yaw 做一次性对齐。
 

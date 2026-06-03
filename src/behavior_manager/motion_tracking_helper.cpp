@@ -22,29 +22,15 @@ namespace behavior_manager {
 
 namespace {
 
-// G1 默认腰关节索引（waist yaw / roll / pitch），与 mjlab State_Mimic.cpp 一致
-// 未来支持其他机型时可扩为配置项
-constexpr int kWaistYawJoint = 12;
-constexpr int kWaistRollJoint = 13;
-constexpr int kWaistPitchJoint = 14;
-
-// npz body_pos_w / body_quat_w 中 anchor body 的索引
-// 来源：unitree_rl_mjlab/src/assets/robots/unitree_g1/xmls/g1.xml MJCF body 声明顺序
-// （IsaacLab csv_to_npz.py 调用 robot.data.body_pos_w[0, :]，即 articulation 的全部 30 个 body）：
-//   0=pelvis, 1-6=左腿(hip_pitch/roll/yaw, knee, ankle_pitch/roll),
-//   7-12=右腿(同左), 13=waist_yaw_link, 14=waist_roll_link,
-//   15=torso_link,  ← anchor_body_name="torso_link" 对应索引 15
-//   16-22=左臂(shoulder_pitch/roll/yaw, elbow, wrist_roll/pitch/yaw),
-//   23-29=右臂(同左)
-constexpr int kAnchorBodyIndex = 15;
+// anchor body 在 npz body_pos_w / body_quat_w 中的索引由调用方经 anchor_body_index 传入（机型相关，在机型 yaml 配置）。
 
 }  // namespace
 
 // ============================================================
-// torso_quat / yaw 提取（工具函数）
+// anchor quat / yaw 提取（工具函数）
 // ============================================================
 
-Eigen::Quaternionf MotionTrackingHelper::ComputeTorsoQuat(
+Eigen::Quaternionf MotionTrackingHelper::ComputeAnchorQuat(
     const Eigen::Quaternionf &root_quat,
     double waist_yaw_q,
     double waist_roll_q,
@@ -71,7 +57,7 @@ Eigen::Quaternionf MotionTrackingHelper::YawQuaternion(const Eigen::Quaternionf 
 // Load: cnpy 加载 npz
 // ============================================================
 
-void MotionTrackingHelper::Load(const std::string &npz_path, double motion_fps) {
+void MotionTrackingHelper::Load(const std::string &npz_path, double motion_fps, int anchor_body_index) {
     std::cout << "[MotionTrackingHelper] 加载 npz: " << npz_path << std::endl;
 
     cnpy::npz_t npz = cnpy::npz_load(npz_path);
@@ -90,6 +76,24 @@ void MotionTrackingHelper::Load(const std::string &npz_path, double motion_fps) 
     auto &joint_vel = npz["joint_vel"];    // [T, N_joints]
     auto &body_pos_w = npz["body_pos_w"];  // [T, N_body, 3]
     auto &body_quat_w = npz["body_quat_w"];  // [T, N_body, 4]
+
+    // 维度校验：各数组 ndim 及彼此维度一致性，不满足即 throw。
+    auto require = [](bool ok, const std::string &msg) {
+        if (!ok) {
+            throw std::runtime_error("[MotionTrackingHelper] npz 维度非法: " + msg);
+        }
+    };
+    require(joint_pos.shape.size() == 2, "joint_pos 应为 2 维 [T, N_joints]");
+    require(joint_vel.shape.size() == 2, "joint_vel 应为 2 维 [T, N_joints]");
+    require(body_pos_w.shape.size() == 3, "body_pos_w 应为 3 维 [T, N_body, 3]");
+    require(body_quat_w.shape.size() == 3, "body_quat_w 应为 3 维 [T, N_body, 4]");
+    require(joint_pos.shape[0] > 0 && joint_pos.shape[1] > 0, "joint_pos 帧数/关节数不能为 0");
+    require(joint_vel.shape[0] == joint_pos.shape[0] && joint_vel.shape[1] == joint_pos.shape[1],
+            "joint_vel 与 joint_pos 维度不一致");
+    require(body_pos_w.shape[0] == joint_pos.shape[0], "body_pos_w 帧数与 joint_pos 不一致");
+    require(body_quat_w.shape[0] == joint_pos.shape[0], "body_quat_w 帧数与 joint_pos 不一致");
+    require(body_pos_w.shape[2] == 3, "body_pos_w 末维应为 3");
+    require(body_quat_w.shape[2] == 4, "body_quat_w 末维应为 4");
 
     num_frames_ = static_cast<int>(joint_pos.shape[0]);
     joint_dim_ = static_cast<int>(joint_pos.shape[1]);
@@ -114,11 +118,11 @@ void MotionTrackingHelper::Load(const std::string &npz_path, double motion_fps) 
     const size_t body_stride_pos = body_pos_w.shape[1] * body_pos_w.shape[2];   // N_body * 3
     const size_t body_stride_quat = body_quat_w.shape[1] * body_quat_w.shape[2];  // N_body * 4
 
-    if (kAnchorBodyIndex >= num_bodies_pos || kAnchorBodyIndex >= num_bodies_quat) {
+    if (anchor_body_index < 0 || anchor_body_index >= num_bodies_pos ||
+        anchor_body_index >= num_bodies_quat) {
         throw std::runtime_error(
-            "[MotionTrackingHelper] npz body 维度不足，无法定位 anchor (torso_link, idx=" +
-            std::to_string(kAnchorBodyIndex) + ")，body_pos_w shape[1]=" +
-            std::to_string(num_bodies_pos));
+            "[MotionTrackingHelper] anchor_body_index=" + std::to_string(anchor_body_index) +
+            " 超出 npz body 数（body_pos_w shape[1]=" + std::to_string(num_bodies_pos) + "）");
     }
 
     for (int i = 0; i < num_frames_; ++i) {
@@ -131,14 +135,13 @@ void MotionTrackingHelper::Load(const std::string &npz_path, double motion_fps) 
         ref_joint_pos_.push_back(std::move(jp));
         ref_joint_vel_.push_back(std::move(jv));
 
-        // anchor body 在 body_names 中位于索引 kAnchorBodyIndex (torso_link for G1)
-        // 训练侧 anchor_body_name="torso_link"，需取对应 body 的世界系 pose（不是 body[0] pelvis）
+        // 取 anchor body 的世界系 pose（npz body 顺序中索引 anchor_body_index）
         Eigen::Vector3f anchor_p = Eigen::Vector3f::Map(
-            body_pos_w.data<float>() + i * body_stride_pos + kAnchorBodyIndex * 3);
+            body_pos_w.data<float>() + i * body_stride_pos + anchor_body_index * 3);
         ref_root_pos_.push_back(anchor_p);
 
         const float *qd =
-            body_quat_w.data<float>() + i * body_stride_quat + kAnchorBodyIndex * 4;
+            body_quat_w.data<float>() + i * body_stride_quat + anchor_body_index * 4;
         // npz 存储顺序：[w, x, y, z]
         Eigen::Quaternionf rq(qd[0], qd[1], qd[2], qd[3]);
         ref_root_quat_.push_back(rq.normalized());
@@ -177,15 +180,15 @@ void MotionTrackingHelper::Reset(const robot_base::RobotData &robot,
                                         static_cast<float>(robot.base_quat[3]));
     robot_root_quat.normalize();
 
-    Eigen::Quaternionf robot_torso = ComputeTorsoQuat(
+    Eigen::Quaternionf robot_anchor = ComputeAnchorQuat(
         robot_root_quat, waist_yaw_q, waist_roll_q, waist_pitch_q);
 
-    // 参考第 0 帧的 torso quat：直接用 ref_root_quat_[0]（即 npz body[kAnchorBodyIndex]=torso 的 quat）
-    Eigen::Quaternionf ref_torso = ref_root_quat_[0];
+    // 参考第 0 帧的 anchor quat：直接用 ref_root_quat_[0]（即 npz body[anchor_body_index] 的 quat）
+    Eigen::Quaternionf ref_anchor = ref_root_quat_[0];
 
     // init_quat = robot_yaw × ref_yaw^(-1)
     // 后续每帧把"参考 motion 在世界系下的朝向"通过 init_quat 旋转到"机器人 yaw"对齐
-    init_quat_ = YawQuaternion(robot_torso) * YawQuaternion(ref_torso).conjugate();
+    init_quat_ = YawQuaternion(robot_anchor) * YawQuaternion(ref_anchor).conjugate();
     init_quat_.normalize();
 
     std::cout << "[MotionTrackingHelper] Reset 完成" << std::endl;
@@ -226,12 +229,12 @@ void MotionTrackingHelper::Update(double elapsed_s,
     // 参考公式：subtract_frame_transforms(A_pos, A_quat, B_pos, B_quat)
     //   = (A_quat^(-1) × (B_pos - A_pos),  A_quat^(-1) × B_quat)
     // 这里：
-    //   A = robot_anchor (torso) world pose
-    //   B = motion_anchor (ref torso) world pose, 经 init_quat 对齐后
+    //   A = robot_anchor world pose
+    //   B = motion_anchor world pose, 经 init_quat 对齐后
     //
     // 公式主源：unitree_rl_mjlab/src/tasks/tracking/mdp/observations.py:18-41
 
-    // 机器人 anchor (torso) 世界系位姿
+    // 机器人 anchor 世界系位姿
     Eigen::Quaternionf robot_root_q(static_cast<float>(robot.base_quat[0]),
                                     static_cast<float>(robot.base_quat[1]),
                                     static_cast<float>(robot.base_quat[2]),
@@ -240,11 +243,11 @@ void MotionTrackingHelper::Update(double elapsed_s,
     Eigen::Vector3f robot_anchor_pos(static_cast<float>(robot.base_pos[0]),
                                     static_cast<float>(robot.base_pos[1]),
                                     static_cast<float>(robot.base_pos[2]));
-    Eigen::Quaternionf robot_anchor_q = ComputeTorsoQuat(
+    Eigen::Quaternionf robot_anchor_q = ComputeAnchorQuat(
         robot_root_q, waist_yaw_q, waist_roll_q, waist_pitch_q);
 
-    // 参考 anchor (ref torso) 世界系位姿
-    // ref_root_pos_ / ref_root_quat_ 已经从 npz body[kAnchorBodyIndex]=torso_link 取出，直接使用，
+    // 参考 anchor 世界系位姿
+    // ref_root_pos_ / ref_root_quat_ 已经从 npz body[anchor_body_index] 取出，直接使用，
     // 不需要再叠加 waist 关节链（npz body_pos_w/body_quat_w 是 retargeting 时 FK 后的结果）
     Eigen::Vector3f ref_anchor_pos = ref_root_pos_[f];
     Eigen::Quaternionf ref_anchor_q = ref_root_quat_[f];

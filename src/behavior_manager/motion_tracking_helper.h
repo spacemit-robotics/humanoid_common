@@ -38,14 +38,15 @@ public:
      * @brief 加载 npz 参考动作
      * @param npz_path npz 文件路径（绝对路径）
      * @param motion_fps 训练时 motion 帧率（默认 50 Hz）
-     * @throws std::runtime_error 加载失败
+     * @param anchor_body_index anchor body 在 npz body 顺序中的索引（机型相关，由配置提供；<0 视为未配置/非法）
+     * @throws std::runtime_error 加载失败或 npz 维度/索引非法
      */
-    void Load(const std::string &npz_path, double motion_fps = 50.0);
+    void Load(const std::string &npz_path, double motion_fps = 50.0, int anchor_body_index = -1);
 
     /**
      * @brief 进入 tracking 状态时调用：算 yaw 对齐 init_quat，帧索引清零
      * @param robot 当前机器人状态（用于读取当前 anchor 朝向）
-     * @param waist_yaw_q 腰部 yaw 关节当前角度（用于算 torso_link quat）
+     * @param waist_yaw_q 腰部 yaw 关节当前角度（用于算 anchor body quat）
      * @param waist_roll_q 腰部 roll 关节当前角度
      * @param waist_pitch_q 腰部 pitch 关节当前角度
      * @param yaw_align 是否启用 yaw 对齐
@@ -60,7 +61,7 @@ public:
      * @brief 每帧推理前调用：刷新 frame index + 计算 anchor 误差
      * @param elapsed_s 自进入 tracking 状态以来的秒数
      * @param robot 当前机器人状态
-     * @param waist_yaw_q 腰部 3 个关节当前角度（torso_link quat 计算用）
+     * @param waist_yaw_q 腰部 3 个关节当前角度（anchor body quat 计算用）
      * @param waist_roll_q
      * @param waist_pitch_q
      */
@@ -90,12 +91,12 @@ public:
 
 private:
     /**
-     * @brief 计算 torso_link 在世界系下的 quat
+     * @brief 计算 anchor body 在世界系下的 quat
      *
      * 公式（mjlab State_Mimic.cpp:18-21）:
-     *   torso_quat = root_quat × Rz(joint[waist_yaw]) × Rx(joint[waist_roll]) × Ry(joint[waist_pitch])
+     *   anchor_quat = root_quat × Rz(joint[waist_yaw]) × Rx(joint[waist_roll]) × Ry(joint[waist_pitch])
      */
-    static Eigen::Quaternionf ComputeTorsoQuat(
+    static Eigen::Quaternionf ComputeAnchorQuat(
         const Eigen::Quaternionf &root_quat,
         double waist_yaw_q,
         double waist_roll_q,

@@ -132,6 +132,9 @@ void TransportShmImpl::SendState(const robot_base::RobotData& state) {
     p.time = state.time;
     std::memcpy(p.rpy, state.rpy.data(), sizeof(p.rpy));
     std::memcpy(p.gyro, state.gyro.data(), sizeof(p.gyro));
+    std::memcpy(p.base_pos, state.base_pos.data(), sizeof(p.base_pos));
+    std::memcpy(p.base_quat, state.base_quat.data(), sizeof(p.base_quat));
+    std::memcpy(p.base_vel, state.base_vel.data(), sizeof(p.base_vel));
 
     for (int i = 0; i < p.num_dof; ++i) {
         p.joint_pos[i] = (i < static_cast<int>(state.joint_pos.size())) ? state.joint_pos[i] : 0.0;
@@ -157,6 +160,9 @@ bool TransportShmImpl::RecvState(robot_base::RobotData& state) {
     state.time = p.time;
     std::memcpy(state.rpy.data(), p.rpy, sizeof(p.rpy));
     std::memcpy(state.gyro.data(), p.gyro, sizeof(p.gyro));
+    std::memcpy(state.base_pos.data(), p.base_pos, sizeof(p.base_pos));
+    std::memcpy(state.base_quat.data(), p.base_quat, sizeof(p.base_quat));
+    std::memcpy(state.base_vel.data(), p.base_vel, sizeof(p.base_vel));
 
     for (int i = 0; i < state.num_dof; ++i) {
         state.joint_pos[i] = p.joint_pos[i];

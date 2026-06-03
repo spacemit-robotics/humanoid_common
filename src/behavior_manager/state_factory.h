@@ -57,11 +57,21 @@ struct RLConfig {
     // ---- ref_motion_phase 参数 ----
     double motion_length = 0.0;
 
+    // ---- motion tracking 参数（可选；motion_file 为空表示该策略不启用 tracking）----
+    std::string motion_file;                    // npz 路径（绝对或相对 robot_dir）
+    double motion_fps = 50.0;                   // mjlab 训练默认 50 Hz
+    int anchor_body_index = -1;  // anchor body 在 npz body 顺序中的索引（由机型 yaml 提供；<0 表示未配置）
+    std::vector<int> anchor_waist_joint_indices;  // pelvis→anchor 的关节索引 [yaw, roll, pitch]（机型 yaml 提供，用于 yaw 对齐）
+    bool anchor_yaw_align = true;
+
     // ---- 维度校验 ----
     bool strict_obs_dim_check = false;
 
     // ---- 自定义标量默认值（如 "z": 0.42, "stand_flag": 0.5）----
     std::unordered_map<std::string, float> custom_scalar_defaults;
+
+    // ---- 自定义数组维度声明（N 维 obs term，由 yaml custom_array_dims 透传）----
+    std::unordered_map<std::string, int> custom_array_dims;
 
     // ---- PD 控制增益（从 behavior_manager 传入，OnEnter 时恢复）----
     std::vector<double> kp;

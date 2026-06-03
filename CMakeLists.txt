@@ -8,6 +8,9 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_INSTALL_RPATH "\$ORIGIN/../lib:\$ORIGIN")
 set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
 
+# 自定义 Find/Fetch 模块路径（FetchThirdParty / FindCnpy 等）
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
+
 # ============================================================================
 # 平台检测
 # ============================================================================
@@ -39,9 +42,10 @@ else()
     message(STATUS "rl not found in ${CMAKE_INSTALL_PREFIX}, skipping RL-dependent targets (behavior_manager, control_runtime, control_sim2sim_runtime)")
 endif()
 
-# mujoco_sim 可选（仅 x86_64 上查找；找到则启用 driver_runtime，否则跳过）
+# mujoco_sim 可选（x86_64 + riscv64/K3 上查找；找到则启用 driver_runtime，否则跳过）
+# riscv64 上 mujoco_sim 经 gl4es 走 PowerVR 硬件 GLES 渲染（见 components/simulation/mujoco）
 set(BUILD_DRIVER_SIM OFF)
-if(_x86)
+if(_x86 OR CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64|riscv")
     find_library(MUJOCO_SIM_LIB NAMES mujoco_sim
         PATHS ${CMAKE_INSTALL_PREFIX}/lib NO_DEFAULT_PATH)
     find_path(MUJOCO_SIM_INCLUDE_DIR NAMES mujoco_sim.h
@@ -109,9 +113,13 @@ target_link_libraries(transport_executor
 # ============================================================================
 
 if(BUILD_RL)
+    # cnpy：用于 motion_tracking_helper 读取 .npz 参考动作（仅 tracking 策略启用时使用）
+    find_package(Cnpy REQUIRED)
+
     add_library(behavior_manager SHARED
         src/behavior_manager/behavior_fsm.cpp
         src/behavior_manager/behavior_manager.cpp
+        src/behavior_manager/motion_tracking_helper.cpp
         src/behavior_manager/states/state_power_off.cpp
         src/behavior_manager/states/state_damp.cpp
         src/behavior_manager/states/state_zero.cpp
@@ -131,7 +139,7 @@ if(BUILD_RL)
 
     target_link_libraries(behavior_manager
         PUBLIC  robot_base
-        PRIVATE ${RL_LIB}
+        PRIVATE ${RL_LIB} cnpy
     )
 endif()
 
@@ -186,7 +194,7 @@ target_include_directories(hmi_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/inclu
 target_link_libraries(hmi_runtime PRIVATE transport_executor robot_base)
 install(TARGETS hmi_runtime RUNTIME DESTINATION bin)
 
-# driver_runtime（仿真驱动：x86_64 only，链接 mujoco_sim）
+# driver_runtime（仿真驱动，链接 mujoco_sim；x86_64 + riscv64/K3）
 if(BUILD_DRIVER_SIM)
     add_executable(driver_runtime src/runtime/driver_runtime.cpp)
     target_include_directories(driver_runtime PRIVATE

@@ -14,6 +14,7 @@
 #include "behavior_manager.h"  // 对外接口，位于 include/
 
 #include <atomic>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <iostream>
 #include <string>
 #include <unordered_map>
@@ -69,9 +70,33 @@ RLConfig ToRLConfig(const rl_policy::LoadedPolicyConfig &loaded_cfg) {
     rc.motion_length = loaded_cfg.exec_cfg.motion_length;
     rc.strict_obs_dim_check = loaded_cfg.exec_cfg.strict_obs_dim_check;
     rc.custom_scalar_defaults = loaded_cfg.exec_cfg.custom_scalar_defaults;
+    rc.custom_array_dims = loaded_cfg.exec_cfg.custom_array_dims;
     rc.kp = loaded_cfg.kp;
     rc.kd = loaded_cfg.kd;
     return rc;
+}
+
+// 解析 motion tracking 字段（policy 段下可选），写入 RLConfig
+// rl 层 LoadedPolicyConfig 不含这些字段（保持 rl 层 tracking-agnostic），由 behavior 层独立读取
+void LoadTrackingFields(const std::string &yaml_path,
+                        const std::string &policy_name,
+                        const std::string &robot_dir,
+                        RLConfig &rc) {
+    auto yaml = robot_base::YamlFile::Load(yaml_path);
+    const std::string base = "rl_policy.onnx_infer.policies." + policy_name;
+    auto mf = yaml.Read<std::string>(base + ".motion_file");
+    if (mf && !mf->empty()) {
+        std::filesystem::path p(*mf);
+        if (!p.is_absolute()) {
+            p = std::filesystem::path(robot_dir) / *mf;
+        }
+        rc.motion_file = p.string();
+    }
+    rc.motion_fps = yaml.Read<double>(base + ".motion_fps").value_or(50.0);
+    rc.anchor_body_index = yaml.Read<int>(base + ".anchor_body_index").value_or(-1);
+    rc.anchor_waist_joint_indices =
+        yaml.Read<std::vector<int>>(base + ".anchor_waist_joint_indices").value_or(std::vector<int>{});
+    rc.anchor_yaw_align = yaml.Read<bool>(base + ".anchor_yaw_align").value_or(true);
 }
 
 }  // namespace
@@ -175,6 +200,7 @@ public:
             const rl_policy::LoadedPolicyConfig loaded_cfg =
                 rl_policy::LoadPolicyConfigFromYaml(path, active_policy, robot_dir);
             RLConfig rc = ToRLConfig(loaded_cfg);
+            LoadTrackingFields(path, active_policy, robot_dir, rc);
             rc.infer_thread_cfg = infer_thread_cfg;
             rc.rl_freq_hz = &rl_freq_hz;
 
@@ -237,6 +263,7 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
             const rl_policy::LoadedPolicyConfig loaded_cfg = rl_policy::LoadPolicyConfigFromYaml(
                 impl_->config_path, impl_->pending_policy, impl_->robot_dir);
             RLConfig rc = ToRLConfig(loaded_cfg);
+            LoadTrackingFields(impl_->config_path, impl_->pending_policy, impl_->robot_dir, rc);
             rc.infer_thread_cfg = impl_->infer_thread_cfg;
             rc.rl_freq_hz = &impl_->rl_freq_hz;
 

@@ -73,6 +73,17 @@ run_driver_g1.sh    # 终端1（PC）
 run_sim2sim_g1.sh   # 终端2（K3 板卡）
 ```
 
+### CI 测试
+
+模块自带 `test.yaml`（CI 用例清单）+ `tests/`，经 SDK 根目录的 `robot-test` 运行：
+
+```bash
+scripts/test/robot-test list application/native/humanoid_common
+scripts/test/robot-test run  application/native/humanoid_common --scope pr
+```
+
+PR 档含 `humanoid-common-functional`（robot_base / behavior_manager / transport_executor 从 example 配置跑通核心流程 + 维度断言）与 `humanoid-common-error-path`（坏/缺配置快速失败），均不依赖硬件。
+
 ## 详细使用
 
 ### 三进程架构
@@ -112,6 +123,25 @@ rl_policy:
 
 调度流程：HMI 切 `dance` → behavior_manager 命中 map → 内部先把 active 切到 `stand`，进 RL 跑满 2s 后自动切到 `dance`（StateRL 会重新 OnEnter 重置 LSTM）。HMI 单次按键，用户无感。详见 [`src/behavior_manager/README.md`](src/behavior_manager/README.md)。
 
+### Motion tracking 策略
+
+`tracking` 策略与 `dance` / `kungfu` 是不同的 motion mimic 范式：
+
+| | dance/kungfu | tracking (unitree_rl_mjlab) |
+|---|---|---|
+| 训练来源 | RoboMimic_Deploy（1D phase 范式） | unitree_rl_mjlab（多维参考量范式） |
+| obs 维度 | 380（1D phase + history × 4） | 160（多维参考 + 单帧） |
+| motion 数据 | 烘进 actor 权重 | 外挂 npz 文件（cnpy 运行时加载） |
+| anchor 计算 | 不需要 | 需要（anchor body 相对位姿） |
+
+实现路径（rl 层做泛型扩展，tracking 业务逻辑在 common 层）：
+
+1. **rl 层**：`ObsTermCalculator` 把 1D `SetCustomScalar` 扩到 N D `SetCustomArray`，未识别 term 名走 `custom_arrays_` 查表 memcpy（[components/model_zoo/rl/src/obs_term.h](../../components/model_zoo/rl/src/obs_term.h)）。yaml 通过 `custom_array_dims: {name: dim}` 声明 N 维 term 维度。
+2. **common 层**：新增 `MotionTrackingHelper`（[src/behavior_manager/motion_tracking_helper.h](src/behavior_manager/motion_tracking_helper.h)）封装 cnpy npz 加载、yaw 对齐、anchor 计算，state_rl 在 OnEnter / InferStep 各插桩调用，把 `motion_command(58) / motion_anchor_pos_b(3) / motion_anchor_ori_b(6)` 通过 `policy.SetCustomArray(...)` 推给 rl。
+3. **应用层**：机型 yaml 中 tracking 策略段加 `motion_file / motion_fps / anchor_body_index / anchor_waist_joint_indices / anchor_yaw_align` 五个 tracking-specific 字段 + `custom_array_dims` 声明。`anchor_body_index` 是 anchor body 在 npz body 顺序中的索引、`anchor_waist_joint_indices` 是 pelvis→anchor 腰关节 [yaw, roll, pitch] 的关节索引（均机型相关，由各机型 yaml 提供）。
+
+motion 播完后冻结在末帧（帧索引 clamp 到最后一帧）保持，不自动回 ZERO；需切换状态由 HMI/control 手动触发（POWER_OFF / DAMP 等）。第一次进 tracking 时会按机器人当前 yaw vs npz 第 0 帧 yaw 做一次性对齐。
+
 ### ControlMode 数据流（control → driver）
 
 `ControlCmd.mode` 是 control 端发给 driver 的通用控制语义字段（`enum class ControlMode { POWER_OFF, DAMP, ZERO, RL, SAFETY }`），driver 据此自主决定后端行为：
@@ -124,6 +154,8 @@ rl_policy:
 设计原则：跨层接口字段必须用通用语义，禁止携带某一具体后端（mujoco 悬挂等）的私有概念。
 
 ### hmi_runtime 键盘操作
+
+hmi_runtime 使用 ANSI 备用屏幕缓冲区实现全屏 TUI，策略列表自动分行显示。
 
 | 按键 | 动作 |
 | --- | --- |

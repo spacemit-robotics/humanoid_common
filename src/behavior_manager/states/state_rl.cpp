@@ -11,10 +11,10 @@
  */
 
 #include <Eigen/Dense>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <iostream>
 #include <mutex>
 #include <vector>
@@ -22,6 +22,7 @@
 #include <utility>
 
 #include "behavior_state.h"
+#include "motion_tracking_helper.h"
 #include "rl_service.h"
 #include "state_factory.h"
 namespace behavior_manager {
@@ -62,6 +63,7 @@ public:
         runtime_cfg.motion_length = config_.motion_length;
         runtime_cfg.strict_obs_dim_check = config_.strict_obs_dim_check;
         runtime_cfg.custom_scalar_defaults = config_.custom_scalar_defaults;
+        runtime_cfg.custom_array_dims = config_.custom_array_dims;
         policy_.Init(runtime_cfg);
 
         safety_triggered_ = false;
@@ -75,6 +77,39 @@ public:
         time_since_last_infer_ = 0.0f;
         new_data_ready_ = false;
         running_ = true;
+
+        // motion tracking 支持：若策略配置了 motion_file，加载 npz + reset yaw 对齐
+        tracking_helper_.reset();
+        if (!config_.motion_file.empty() && sensor_) {
+            try {
+                tracking_helper_ = std::make_unique<MotionTrackingHelper>();
+                tracking_helper_->Load(config_.motion_file, config_.motion_fps,
+                    config_.anchor_body_index);
+                // pelvis→anchor 的腰关节 [yaw, roll, pitch] 角度，索引由机型 yaml 配置；
+                // 未配置或越界则取 0（anchor quat 退化为仅用 root_quat）。
+                auto joint_at = [&](int idx) -> double {
+                    if (idx < 0 || static_cast<size_t>(idx) >= sensor_->joint_pos.size()) {
+                        return 0.0;
+                    }
+                    return sensor_->joint_pos[idx];
+                };
+                const auto &wj = config_.anchor_waist_joint_indices;
+                const double yaw_q = (wj.size() == 3) ? joint_at(wj[0]) : 0.0;
+                const double roll_q = (wj.size() == 3) ? joint_at(wj[1]) : 0.0;
+                const double pitch_q = (wj.size() == 3) ? joint_at(wj[2]) : 0.0;
+                tracking_helper_->Reset(*sensor_, yaw_q, roll_q, pitch_q, config_.anchor_yaw_align);
+                t_enter_ = std::chrono::steady_clock::now();
+                std::cout << "[StateRL] tracking 启用: motion=" << config_.motion_file
+                        << ", anchor_idx=" << config_.anchor_body_index
+                        << ", duration=" << tracking_helper_->Duration() << "s" << std::endl;
+            } catch (const std::exception &e) {
+                // 加载失败：置安全触发、跳过推理线程启动，由 CheckTransition 切 SAFETY。
+                std::cerr << "[StateRL] tracking 加载失败，切安全态: " << e.what() << std::endl;
+                tracking_helper_.reset();
+                safety_triggered_ = true;
+                return;
+            }
+        }
 
         // 启动推理线程（配置从 RLConfig.infer_thread_cfg 注入）
         infer_loop_ = config_.infer_thread_cfg;
@@ -106,6 +141,7 @@ public:
                 sample_rpy_ = sensor_->rpy;
                 sample_joint_pos_ = sensor_->joint_pos;
                 sample_joint_vel_ = sensor_->joint_vel;
+                sample_base_pos_ = sensor_->base_pos;
                 sample_base_quat_ = sensor_->base_quat;
                 sample_base_vel_ = {
                     {sensor_->base_vel[0], sensor_->base_vel[1], sensor_->base_vel[2]}};
@@ -165,7 +201,7 @@ private:
     // ==================== 推理线程回调 ====================
 
     bool InferStep() {
-        std::array<double, 3> gyro, rpy, base_vel;
+        std::array<double, 3> gyro, rpy, base_pos, base_vel;
         std::array<double, 4> base_quat;
         std::vector<double> joint_pos, joint_vel;
         double cmd_vx, cmd_vy, cmd_wz;
@@ -185,12 +221,43 @@ private:
             rpy = sample_rpy_;
             joint_pos = sample_joint_pos_;
             joint_vel = sample_joint_vel_;
+            base_pos = sample_base_pos_;
             base_quat = sample_base_quat_;
             base_vel = sample_base_vel_;
             cmd_vx = sample_cmd_vx_;
             cmd_vy = sample_cmd_vy_;
             cmd_wz = sample_cmd_wz_;
             rl_dt = sample_rl_dt_;
+        }
+
+        // motion tracking：每帧把 motion + anchor 数据推给 policy（在 AssembleObs 前）
+        if (tracking_helper_) {
+            const auto elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t_enter_).count();
+            auto joint_at = [&](int idx) -> double {
+                if (idx < 0 || static_cast<size_t>(idx) >= joint_pos.size()) {
+                    return 0.0;
+                }
+                return joint_pos[idx];
+            };
+            const auto &wj = config_.anchor_waist_joint_indices;  // [yaw, roll, pitch]
+            const double yaw_q = (wj.size() == 3) ? joint_at(wj[0]) : 0.0;
+            const double roll_q = (wj.size() == 3) ? joint_at(wj[1]) : 0.0;
+            const double pitch_q = (wj.size() == 3) ? joint_at(wj[2]) : 0.0;
+            robot_base::RobotData snapshot;
+            snapshot.base_pos = base_pos;
+            snapshot.base_quat = base_quat;
+            snapshot.joint_pos = joint_pos;
+            tracking_helper_->Update(elapsed, snapshot, yaw_q, roll_q, pitch_q);
+
+            policy_.SetCustomArray("motion_command",
+                                    tracking_helper_->MotionCommand().data(),
+                                    static_cast<int>(tracking_helper_->MotionCommand().size()));
+            policy_.SetCustomArray("motion_anchor_pos_b",
+                                    tracking_helper_->AnchorPosB().data(), 3);
+            policy_.SetCustomArray("motion_anchor_ori_b",
+                                    tracking_helper_->AnchorOriB().data(), 6);
+
         }
 
         // 组装观测 + 推理
@@ -232,6 +299,10 @@ private:
     // 安全标志
     bool safety_triggered_ = false;
 
+    // motion tracking 辅助（motion_file 为空则不启用）
+    std::unique_ptr<MotionTrackingHelper> tracking_helper_;
+    std::chrono::steady_clock::time_point t_enter_;
+
     // 推理频率统计（推理线程内读写）
     int infer_count_window_ = 0;
     std::chrono::steady_clock::time_point infer_window_start_ = std::chrono::steady_clock::now();
@@ -249,6 +320,7 @@ private:
     std::array<double, 3> sample_rpy_ = {};
     std::vector<double> sample_joint_pos_;
     std::vector<double> sample_joint_vel_;
+    std::array<double, 3> sample_base_pos_ = {};
     std::array<double, 4> sample_base_quat_ = {};
     std::array<double, 3> sample_base_vel_ = {};
     double sample_cmd_vx_ = 0;

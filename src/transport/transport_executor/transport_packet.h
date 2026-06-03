@@ -74,6 +74,11 @@ struct RobotStatePacket {
     double time = 0.0;
     double rpy[3] = {0.0, 0.0, 0.0};
     double gyro[3] = {0.0, 0.0, 0.0};
+    // base_pos / base_quat / base_vel 用于 motion tracking 等需要全局位姿/速度的 RL 策略
+    // dance/kungfu/motion 这类用 rpy+gyro 就够，这几项可保持默认值
+    double base_pos[3] = {0.0, 0.0, 0.0};        ///< 世界系位置 (m)
+    double base_quat[4] = {1.0, 0.0, 0.0, 0.0};  ///< 姿态四元数 (w, x, y, z)
+    double base_vel[6] = {0.0};                  ///< 线速度+角速度 (m/s, rad/s)
     double joint_pos[kMaxDof] = {0.0};
     double joint_vel[kMaxDof] = {0.0};
 };

@@ -63,6 +63,7 @@ struct RLConfig {
     int anchor_body_index = -1;  // anchor body 在 npz body 顺序中的索引（由机型 yaml 提供；<0 表示未配置）
     std::vector<int> anchor_waist_joint_indices;  // pelvis→anchor 的关节索引 [yaw, roll, pitch]（机型 yaml 提供，用于 yaw 对齐）
     bool anchor_yaw_align = true;
+    std::vector<double> zero_target_pos;  // ZERO 阶段目标位姿（可选，空则用 rl_default_pos）
 
     // ---- 维度校验 ----
     bool strict_obs_dim_check = false;

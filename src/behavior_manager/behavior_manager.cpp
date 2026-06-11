@@ -97,6 +97,8 @@ void LoadTrackingFields(const std::string &yaml_path,
     rc.anchor_waist_joint_indices =
         yaml.Read<std::vector<int>>(base + ".anchor_waist_joint_indices").value_or(std::vector<int>{});
     rc.anchor_yaw_align = yaml.Read<bool>(base + ".anchor_yaw_align").value_or(true);
+    rc.zero_target_pos =
+        yaml.Read<std::vector<double>>(base + ".zero_target_pos").value_or(std::vector<double>{});
 }
 
 }  // namespace
@@ -204,9 +206,11 @@ public:
             rc.infer_thread_cfg = infer_thread_cfg;
             rc.rl_freq_hz = &rl_freq_hz;
 
-            // ZERO 状态使用当前策略的目标位置和 kp/kd
+            // ZERO 状态目标位姿：优先用 zero_target_pos（如果配了），否则用 rl_default_pos
+            const auto &effective_zero_pos = rc.zero_target_pos.empty()
+                ? loaded_cfg.exec_cfg.rl_default_pos : rc.zero_target_pos;
             fsm.AddState(StateName::ZERO,
-                CreateStateZero(loaded_cfg.exec_cfg.rl_default_pos, zero_duration,
+                CreateStateZero(effective_zero_pos, zero_duration,
                                 loaded_cfg.kp, loaded_cfg.kd));
 
             fsm.AddState(StateName::RL, CreateStateRl(rc));
@@ -269,8 +273,10 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
 
             // 用 ReplaceState 替换 ZERO + RL，安全处理"替换正在运行的当前状态"场景
             // （前置链到期后会在 RL 状态触发 RL→RL 重建，需走 OnExit/OnEnter 重置 LSTM 隐状态）
+            const auto &effective_zero_pos = rc.zero_target_pos.empty()
+                ? loaded_cfg.exec_cfg.rl_default_pos : rc.zero_target_pos;
             impl_->fsm.ReplaceState(StateName::ZERO,
-                CreateStateZero(loaded_cfg.exec_cfg.rl_default_pos, impl_->zero_duration,
+                CreateStateZero(effective_zero_pos, impl_->zero_duration,
                                 loaded_cfg.kp, loaded_cfg.kd));
             impl_->fsm.ReplaceState(StateName::RL, CreateStateRl(rc));
 

@@ -247,13 +247,23 @@ void Render(const std::string &fsm_state,
 int main(int argc, char *argv[]) {
     std::signal(SIGINT, OnSignal);
 
-    if (argc < 2) {
-        fprintf(stderr, "用法: %s ../config/g1.yaml\n", argv[0]);
-        return 1;
+    if (argc < 2 || std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help") {
+        fprintf((argc < 2) ? stderr : stdout,
+            "用法: %s <config.yaml>\n"
+            "选项:\n"
+            "  <config.yaml>  机器人配置文件路径\n"
+            "  -h, --help     显示此帮助信息\n", argv[0]);
+        return (argc < 2) ? 1 : 0;
     }
     std::string yaml_path = argv[1];
 
-    std::vector<std::string> policies = LoadPolicyNames(yaml_path);
+    std::vector<std::string> policies;
+    try {
+        policies = LoadPolicyNames(yaml_path);
+    } catch (const std::exception &e) {
+        fprintf(stderr, "%s\n用法: %s <config.yaml>\n", e.what(), argv[0]);
+        return 1;
+    }
 
     auto transport = transport::Create(yaml_path);
     if (!transport->Init(yaml_path, transport::Role::HMI)) {

@@ -42,14 +42,25 @@ void OnSignal(int) {
 int main(int argc, char *argv[]) {
     std::signal(SIGINT, OnSignal);
 
-    if (argc < 2) {
-        std::cerr << "用法: " << argv[0] << " ../config/g1.yaml\n";
-        return 1;
+    if (argc < 2 || std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help") {
+        auto &out = (argc < 2) ? std::cerr : std::cout;
+        out << "用法: " << argv[0] << " <config.yaml>\n"
+            << "选项:\n"
+            << "  <config.yaml>  机器人配置文件路径\n"
+            << "  -h, --help     显示此帮助信息\n";
+        return (argc < 2) ? 1 : 0;
     }
     std::string yaml_path = argv[1];
 
     // 配置仿真驱动主线程调度（robot_base.threads.driver_main）
-    robot_base::YamlFile yaml_file = robot_base::YamlFile::Load(yaml_path);
+    robot_base::YamlFile yaml_file;
+    try {
+        yaml_file = robot_base::YamlFile::Load(yaml_path);
+    } catch (const std::exception &e) {
+        std::cerr << e.what() << "\n"
+            << "用法: " << argv[0] << " <config.yaml>\n";
+        return 1;
+    }
     robot_base::ThreadLoop::FromYaml(yaml_file, "driver_main").Apply();
 
     // 从 robot_base 读取机器人基础信息

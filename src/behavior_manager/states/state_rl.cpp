@@ -40,31 +40,9 @@ public:
             output_->kd = config_.kd;
         }
 
-        // 每次进入都重新初始化策略运行时（支持策略切换后重新加载模型）
-        rl_policy::PolicyExecutorConfig runtime_cfg;
-        runtime_cfg.model_path = config_.model_path;
-        runtime_cfg.action_scale = config_.action_scale;
-        runtime_cfg.action_blend_ratio = config_.action_blend_ratio;
-        runtime_cfg.rl_default_pos = config_.rl_default_pos;
-        runtime_cfg.action_joint_index = config_.action_joint_index;
-        runtime_cfg.obs_segments = config_.obs_segments;
-        runtime_cfg.ang_vel_scale = config_.ang_vel_scale;
-        runtime_cfg.dof_pos_scale = config_.dof_pos_scale;
-        runtime_cfg.dof_vel_scale = config_.dof_vel_scale;
-        runtime_cfg.euler_angle_scale = config_.euler_angle_scale;
-        runtime_cfg.command_scale = config_.command_scale;
-        runtime_cfg.dof_pos_subtract_default = config_.dof_pos_subtract_default;
-        runtime_cfg.phase_period = config_.phase_period;
-        runtime_cfg.gait_cycle = config_.gait_cycle;
-        runtime_cfg.gait_left_offset = config_.gait_left_offset;
-        runtime_cfg.gait_right_offset = config_.gait_right_offset;
-        runtime_cfg.gait_left_ratio = config_.gait_left_ratio;
-        runtime_cfg.gait_right_ratio = config_.gait_right_ratio;
-        runtime_cfg.motion_length = config_.motion_length;
-        runtime_cfg.strict_obs_dim_check = config_.strict_obs_dim_check;
-        runtime_cfg.custom_scalar_defaults = config_.custom_scalar_defaults;
-        runtime_cfg.custom_array_dims = config_.custom_array_dims;
-        policy_.Init(runtime_cfg);
+        // 每次进入都重新初始化策略运行时（支持策略切换后重新加载模型）。
+        // PolicyExecutorConfig 整体透传，新增底层配置项无需在 common 逐字段同步。
+        policy_.Init(config_.policy);
 
         safety_triggered_ = false;
         has_action_ = false;

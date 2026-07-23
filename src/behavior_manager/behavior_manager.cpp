@@ -46,31 +46,10 @@ namespace {
 
 RLConfig ToRLConfig(const rl_policy::LoadedPolicyConfig &loaded_cfg) {
     RLConfig rc;
-    rc.model_path = loaded_cfg.exec_cfg.model_path;
-    rc.action_scale = loaded_cfg.exec_cfg.action_scale;
-    rc.action_blend_ratio = loaded_cfg.exec_cfg.action_blend_ratio;
-    rc.rl_default_pos = loaded_cfg.exec_cfg.rl_default_pos;
-    rc.action_joint_index = loaded_cfg.exec_cfg.action_joint_index;
+    rc.policy = loaded_cfg.exec_cfg;
     rc.infer_decimation = loaded_cfg.infer_decimation > 0 ? loaded_cfg.infer_decimation : 1;
     rc.max_roll = loaded_cfg.max_roll;
     rc.max_pitch = loaded_cfg.max_pitch;
-    rc.obs_segments = loaded_cfg.exec_cfg.obs_segments;
-    rc.ang_vel_scale = loaded_cfg.exec_cfg.ang_vel_scale;
-    rc.dof_pos_scale = loaded_cfg.exec_cfg.dof_pos_scale;
-    rc.dof_vel_scale = loaded_cfg.exec_cfg.dof_vel_scale;
-    rc.euler_angle_scale = loaded_cfg.exec_cfg.euler_angle_scale;
-    rc.command_scale = loaded_cfg.exec_cfg.command_scale;
-    rc.dof_pos_subtract_default = loaded_cfg.exec_cfg.dof_pos_subtract_default;
-    rc.phase_period = loaded_cfg.exec_cfg.phase_period;
-    rc.gait_cycle = loaded_cfg.exec_cfg.gait_cycle;
-    rc.gait_left_offset = loaded_cfg.exec_cfg.gait_left_offset;
-    rc.gait_right_offset = loaded_cfg.exec_cfg.gait_right_offset;
-    rc.gait_left_ratio = loaded_cfg.exec_cfg.gait_left_ratio;
-    rc.gait_right_ratio = loaded_cfg.exec_cfg.gait_right_ratio;
-    rc.motion_length = loaded_cfg.exec_cfg.motion_length;
-    rc.strict_obs_dim_check = loaded_cfg.exec_cfg.strict_obs_dim_check;
-    rc.custom_scalar_defaults = loaded_cfg.exec_cfg.custom_scalar_defaults;
-    rc.custom_array_dims = loaded_cfg.exec_cfg.custom_array_dims;
     rc.kp = loaded_cfg.kp;
     rc.kd = loaded_cfg.kd;
     return rc;
@@ -216,7 +195,8 @@ public:
             fsm.AddState(StateName::RL, CreateStateRl(rc));
             has_rl = true;
 
-            std::cout << "[BehaviorManager] RL 状态: 已加载 (" << rc.model_path << ")" << std::endl;
+            std::cout << "[BehaviorManager] RL 状态: 已加载 (" << rc.policy.model_path << ")"
+                    << std::endl;
 
             // 解析所有策略的可选 prerequisite 子节点，构建策略链 map
             auto policy_names = yaml_file.Read<std::vector<std::string>>(
@@ -283,7 +263,7 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
             impl_->active_policy = impl_->pending_policy;
             impl_->prerequisite_timer = 0.0;  // 切换后重置计时（仅前置策略生效时再启用）
             std::cout << "[BehaviorManager] 策略已切换: " << impl_->active_policy << " ("
-                    << rc.model_path << ")" << std::endl;
+                    << rc.policy.model_path << ")" << std::endl;
         } catch (const std::exception &e) {
             std::cerr << "[BehaviorManager] 策略切换失败: " << e.what() << std::endl;
             impl_->pending_policy = impl_->active_policy;  // 回滚

@@ -164,26 +164,33 @@ CSV，并可追加 `future_frames/context_length` 或 `future_steps`。策略若
 
 ### hmi_runtime 键盘操作
 
-hmi_runtime 使用 ANSI 备用屏幕缓冲区实现全屏 TUI，策略列表自动分行显示。
+hmi_runtime 使用带颜色的 ANSI 全屏 TUI。FSM、当前策略、Control 实际采用速度和
+RL 频率均来自 control 端回传，不在 HMI 本地预判。主界面用左右键切换相邻 FSM，
+策略和速度分别使用独立子页面。
 
 | 按键 | 动作 |
 | --- | --- |
-| `f` | 切换到 POWER_OFF（完全失力） |
-| `o` | 切换到 DAMP（阻尼保持） |
-| `z` | 切换到 ZERO（回零位） |
-| `r` | 切换到 RL（进入 RL 控制） |
-| `1`~`9` | 切换到对应序号的策略 |
-| `w/s` | 增减 vx |
-| `a/d` | 增减 vy |
-| `q/e` | 增减 wz |
+| `←/→` | 按真实 FSM 后退/前进；RL 按左键直接退到 DAMP |
+| `f` | 全局请求 POWER_OFF（完全失力） |
+| `p` | 打开策略选择页；`↑/↓` 或 `j/k` 移动，Enter 确认，Esc 返回 |
+| `v` / `Enter` | 真实状态为 RL 且心跳正常时进入速度控制页 |
+| `w/s` | 速度页内增减 vx |
+| `a/d` | 速度页内增减 vy |
+| `q/e` | 速度页内增减 wz |
 | `空格` | 速度清零 |
+| `Esc` / `v` | 退出速度页并清零 |
+
+`o/z/r` 保留为兼容快捷键，但合法性仍由 control 端 FSM 校验。HMI 以配置频率发送
+心跳；退出速度页、离开 RL、HMI 退出或心跳超时都会清零速度。步长、限幅和超时在
+YAML 的 `hmi` 节点配置。
 
 ### 通信配置
 
 通过 YAML 中 `transport.type` 字段选择后端：
 
 - `"shm"`：共享内存，同机高性能，默认值
-- `"udp"`：跨机通信或同机隔离进程，需填写 `driver_ip` / `control_ip`
+- `"udp"`：跨机通信或同机隔离进程，需填写 `driver_ip` / `control_ip` /
+  `hmi_ip`，状态回传使用独立 `status_port`
 
 详见 [`src/transport/README.md`](src/transport/README.md)。
 

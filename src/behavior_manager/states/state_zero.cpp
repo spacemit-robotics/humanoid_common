@@ -95,6 +95,8 @@ public:
         return StateName::ZERO;
     }
 
+    bool ReadyForRl() const override { return finished_; }
+
     void OnExit() override {
         std::cout << "[StateZero] 退出回零位状态 (用时: " << timer_ << "s)" << std::endl;
     }

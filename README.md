@@ -91,9 +91,9 @@ PR 档含 `humanoid-common-functional`（robot_base / behavior_manager / transpo
 ```
  ┌───────────┐   HMI cmd    ┌───────────────┐   control cmd   ┌──────────────┐
  │  hmi      │ ───────────▶ │  control      │ ──────────────▶ │  driver      │
- │  _runtime │              │  _runtime     │                 │  _runtime    │
- └───────────┘              │  (FSM + RL)   │ ◀────────────── │  (MuJoCo /   │
-                            └───────────────┘   robot state   │   硬件驱动)  │
+ │  _runtime │ ◀─────────── │  _runtime     │ ◀────────────── │  _runtime    │
+ └───────────┘ ControlStatus│  (FSM + RL)   │   robot state   │  (MuJoCo /   │
+                            └───────────────┘                 │   硬件驱动)  │
                                                               └──────────────┘
 ```
 

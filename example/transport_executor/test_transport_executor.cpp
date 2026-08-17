@@ -11,6 +11,7 @@
  * - 状态通道收发（SendState / RecvState）
  * - 控制通道收发（SendControl / RecvControl）
  * - 命令通道收发（SendCommand / RecvCommand）
+ * - Control 状态回传（SendStatus / RecvStatus）
  *
  * 传输后端由 YAML 中 transport.type 字段决定（udp / shm），
  * 切换后端只需传入不同的配置文件，测试代码无需修改。
@@ -145,6 +146,39 @@ int main(int argc, char *argv[]) {
     } else {
         std::cerr << "[test] 命令接收失败\n";
     }
+
+    // ==================== 测试 Control 状态回传 ====================
+
+    std::cout << "\n--- 测试状态回传 (Control → Hmi) ---\n";
+
+    robot_base::ControlStatus status;
+    status.mode = robot_base::ControlMode::RL;
+    status.zero_ready = false;
+    status.hmi_connected = true;
+    status.vx = 0.3f;
+    status.vy = -0.1f;
+    status.wz = 0.2f;
+    status.rl_frequency_hz = 49.8f;
+    status.active_policy = "test_policy";
+    control->SendStatus(status);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    robot_base::ControlStatus recv_status;
+    if (!hmi->RecvStatus(recv_status)) {
+        std::cerr << "[test] Control 状态接收失败\n";
+        return 1;
+    }
+    const bool status_ok = recv_status.mode == robot_base::ControlMode::RL &&
+        recv_status.hmi_connected &&
+        std::abs(recv_status.vx - status.vx) < 1e-4f &&
+        recv_status.active_policy == status.active_policy;
+    std::cout << "[test] 状态回传: mode="
+        << static_cast<int>(recv_status.mode)
+        << ", policy=" << recv_status.active_policy
+        << ", vx=" << recv_status.vx << "\n";
+    std::cout << "[test] 状态回传验证: "
+        << (status_ok ? "通过" : "失败") << "\n";
+    if (!status_ok) return 1;
 
     std::cout << "\n[test] 全部测试完成\n";
     return 0;

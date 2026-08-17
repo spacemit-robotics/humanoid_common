@@ -332,6 +332,10 @@ StateName BehaviorManagerClass::CurrentState() const {
     return impl_->fsm.CurrentState();
 }
 
+bool BehaviorManagerClass::IsZeroReady() const {
+    return impl_->fsm.ReadyForRl();
+}
+
 std::string BehaviorManagerClass::CurrentPolicyName() const {
     return impl_->active_policy;
 }

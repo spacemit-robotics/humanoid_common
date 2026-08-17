@@ -22,8 +22,8 @@ namespace transport {
  */
 enum class Role {
     DRIVER,   ///< 驱动端（发送状态，接收控制）
-    CONTROL,  ///< 控制端（接收状态，发送控制，接收 HMI）
-    HMI       ///< HMI 端（发送 HMI 命令）
+    CONTROL,  ///< 控制端（接收状态/HMI，发送控制和运行状态）
+    HMI       ///< HMI 端（发送 HMI 命令，接收 Control 运行状态）
 };
 
 /**
@@ -87,6 +87,19 @@ public:
      * @return 成功接收返回 true
      */
     virtual bool RecvCommand(robot_base::Command& cmd) = 0;
+
+    // ==================== Control 状态回传通道 ====================
+
+    /**
+     * @brief 发送 Control 运行状态（CONTROL 使用）
+     */
+    virtual void SendStatus(const robot_base::ControlStatus& status) = 0;
+
+    /**
+     * @brief 接收 Control 运行状态（HMI 使用）
+     * @return 成功接收返回 true
+     */
+    virtual bool RecvStatus(robot_base::ControlStatus& status) = 0;
 };
 
 /**

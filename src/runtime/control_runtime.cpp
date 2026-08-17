@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <iomanip>
 #include <iostream>
@@ -34,6 +35,12 @@ namespace {
 volatile std::sig_atomic_t g_running = 1;
 void OnSignal(int) {
     g_running = 0;
+}
+
+float ClampVelocity(float value, float limit) {
+    if (!std::isfinite(value)) return 0.0f;
+    const float bound = std::max(0.0f, std::abs(limit));
+    return std::clamp(value, -bound, bound);
 }
 }  // namespace
 
@@ -70,6 +77,18 @@ int main(int argc, char *argv[]) {
     // rl_policy.rl_dt: RL 推理周期（对应训练时的推理频率）
     float rl_dt = static_cast<float>(yaml_file.Read<double>("rl_policy.rl_dt").value_or(0.02));
 
+    // HMI 心跳与速度安全边界。界面也会限幅，但 control 端必须独立兜底。
+    const double hmi_command_timeout = std::max(
+        0.1, yaml_file.Read<double>("hmi.command_timeout").value_or(0.5));
+    const double status_hz = std::max(
+        1.0, yaml_file.Read<double>("hmi.status_hz").value_or(20.0));
+    const float max_vx = static_cast<float>(
+        yaml_file.Read<double>("hmi.velocity.max_vx").value_or(0.8));
+    const float max_vy = static_cast<float>(
+        yaml_file.Read<double>("hmi.velocity.max_vy").value_or(0.4));
+    const float max_wz = static_cast<float>(
+        yaml_file.Read<double>("hmi.velocity.max_wz").value_or(1.0));
+
     // 初始化行为管理器
     BehaviorManagerClass bm(yaml_path);
     bm.Init();
@@ -84,8 +103,13 @@ int main(int argc, char *argv[]) {
     robot_base::Command cmd;
     robot_base::RobotData latest_state;
     bool has_state = false;
+    bool has_hmi = false;
 
     auto last_control_time = std::chrono::steady_clock::now();
+    auto last_hmi_time = last_control_time;
+    auto last_status_time = last_control_time -
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(1.0 / status_hz));
     int step_count = 0;
     auto last_print_time = std::chrono::steady_clock::now();
     const double target_control_hz = (control_dt > 1e-6f) ? (1.0 / control_dt) : 0.0;
@@ -99,7 +123,12 @@ int main(int argc, char *argv[]) {
         {
             robot_base::Command hmi;
             while (transport->RecvCommand(hmi)) {
+                hmi.vx = ClampVelocity(hmi.vx, max_vx);
+                hmi.vy = ClampVelocity(hmi.vy, max_vy);
+                hmi.wz = ClampVelocity(hmi.wz, max_wz);
                 cmd = hmi;
+                has_hmi = true;
+                last_hmi_time = std::chrono::steady_clock::now();
             }
         }
 
@@ -114,13 +143,31 @@ int main(int argc, char *argv[]) {
 
         // 3) 基于时间触发控制周期
         auto now = std::chrono::steady_clock::now();
+        const bool hmi_connected = has_hmi &&
+            std::chrono::duration<double>(now - last_hmi_time).count()
+                <= hmi_command_timeout;
+        if (!hmi_connected) {
+            // HMI 退出或链路中断后不保留旧速度和一次性请求。
+            cmd.key = 0;
+            cmd.vx = 0.0f;
+            cmd.vy = 0.0f;
+            cmd.wz = 0.0f;
+            cmd.switch_policy.clear();
+        }
+        if (bm.CurrentState() != behavior_manager::StateName::RL) {
+            // 禁止在非 RL 状态预置速度，避免进入 RL 时突然起步。
+            cmd.vx = 0.0f;
+            cmd.vy = 0.0f;
+            cmd.wz = 0.0f;
+        }
         double elapsed = std::chrono::duration<double>(now - last_control_time).count();
         if (elapsed >= control_dt && has_state) {
             last_control_time = now;
+            const float actual_control_dt = static_cast<float>(elapsed);
 
             bm.SetSensorData(latest_state);
             bm.SetCommand(cmd);
-            bm.Step(control_dt, rl_dt);
+            bm.Step(actual_control_dt, rl_dt);
             const auto &out = bm.GetOutput();
             robot_base::ControlCmd ctrl;
             ctrl.enable = out.enable;
@@ -132,7 +179,29 @@ int main(int argc, char *argv[]) {
             ctrl.mode = static_cast<robot_base::ControlMode>(bm.CurrentState());
             transport->SendControl(ctrl);
 
+            if (bm.CurrentState() != behavior_manager::StateName::RL) {
+                cmd.vx = 0.0f;
+                cmd.vy = 0.0f;
+                cmd.wz = 0.0f;
+            }
+
             step_count++;
+        }
+
+        // 真实 FSM、策略和 control 采用速度定频回传给 HMI。
+        if (std::chrono::duration<double>(now - last_status_time).count()
+            >= 1.0 / status_hz) {
+            robot_base::ControlStatus status;
+            status.mode = static_cast<robot_base::ControlMode>(bm.CurrentState());
+            status.zero_ready = bm.IsZeroReady();
+            status.hmi_connected = hmi_connected;
+            status.vx = cmd.vx;
+            status.vy = cmd.vy;
+            status.wz = cmd.wz;
+            status.rl_frequency_hz = static_cast<float>(bm.GetRlFreq());
+            status.active_policy = bm.CurrentPolicyName();
+            transport->SendStatus(status);
+            last_status_time = now;
         }
 
         // 固定 3 行动态刷新，避免增量日志刷屏
@@ -144,7 +213,11 @@ int main(int argc, char *argv[]) {
                 bm.CurrentPolicyName().empty() ? "-" : bm.CurrentPolicyName();
 
             std::ostringstream line0, line1, line2;
-            line0 << "[control] state=" << StateNameStr(bm.CurrentState()) << " policy=" << policy;
+            line0 << "[control] state=" << StateNameStr(bm.CurrentState())
+                << " policy=" << policy
+                << " hmi=" << (hmi_connected ? "online" : "timeout")
+                << std::fixed << std::setprecision(2)
+                << " cmd=(" << cmd.vx << "," << cmd.vy << "," << cmd.wz << ")";
             line1 << std::fixed << std::setprecision(4) << "control_dt=" << control_dt
                 << "s target=" << std::setprecision(1) << target_control_hz
                 << "Hz actual=" << std::setprecision(2) << control_freq << "Hz";

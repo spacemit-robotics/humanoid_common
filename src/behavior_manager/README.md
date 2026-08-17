@@ -54,6 +54,7 @@
 | `SetCommand(cmd)` | 设置命令（状态切换、速度指令、策略切换）|
 | `GetOutput()` | 获取控制输出 |
 | `CurrentState()` | 获取当前状态 |
+| `IsZeroReady()` | 查询 ZERO 是否完成、是否可进入 RL |
 | `CurrentPolicyName()` | 获取当前 RL 策略名 |
 | `GetRlFreq()` | 获取 RL 推理频率（Hz）|
 
@@ -124,7 +125,9 @@ POWER_OFF ──key=1──→ DAMP ──key=2──→ ZERO ──key=3(插值
 
 - **异步推理：** StateRL 在独立线程执行 ONNX 推理，不阻塞主循环
 - **通用模型 I/O：** `PolicyExecutorConfig` 整体透传给 RL 组件；多输入输出、feedback、external 等拓扑由策略 YAML `model_io` 声明，common 无需复制底层字段
+- **策略协议适配：** `policy_adapter` 是 behavior_manager 的私有子模块；机型仓库只配置参数和资源，robot_base、transport 与 RL 执行层不感知具体 tracker
 - **动态策略切换：** 仅在 `POWER_OFF` / `DAMP` 状态接受 `Command.switch_policy`；进入 `ZERO` 后策略锁定（ZERO 的目标位置/kp/kd 取自当前策略，切换会同步重建 ZERO 状态）
 - **前置策略链调度：** 目标策略可在 yaml 配置 `prerequisite: { policy, duration }`，behavior_manager 收到切换请求后自动先切前置策略，在 RL 状态运行 `duration` 秒后再切目标策略；用户感知层面只发一次切换命令。典型场景：`dance` / `kungfu` 配 `prerequisite: stand`，先用 LocoMode 站稳并预热 LSTM，再进 dance/kungfu，避免直接从 PD 锁位的 ZERO 切动态动作时摔倒
 - **安全保护：** IMU 倾角/关节限位自动触发安全状态
+- **状态回传：** `CurrentState()`、`IsZeroReady()`、当前策略和 RL 频率由 control_runtime 组装为 `ControlStatus` 发给 HMI
 - **参数隔离：** damp_kd ≈ policy kd / 5（不同阶段刚度需求不同）

@@ -38,24 +38,30 @@ public:
     void SendCommand(const robot_base::Command& cmd) override;
     bool RecvCommand(robot_base::Command& cmd) override;
 
+    void SendStatus(const robot_base::ControlStatus& status) override;
+    bool RecvStatus(robot_base::ControlStatus& status) override;
+
 private:
     // ==================== 成员变量 ====================
 
     Role role_ = Role::DRIVER;
 
     // Driver: state_sender_ + control_receiver_
-    // Control: state_receiver_ + control_sender_ + hmi_receiver_
-    // Hmi: hmi_sender_
+    // Control: state_receiver_ + control_sender_ + hmi_receiver_ + status_sender_
+    // Hmi: hmi_sender_ + status_receiver_
     std::unique_ptr<transport_udp::Udp> state_sender_;
     std::unique_ptr<transport_udp::Udp> state_receiver_;
     std::unique_ptr<transport_udp::Udp> control_sender_;
     std::unique_ptr<transport_udp::Udp> control_receiver_;
     std::unique_ptr<transport_udp::Udp> hmi_sender_;
     std::unique_ptr<transport_udp::Udp> hmi_receiver_;
+    std::unique_ptr<transport_udp::Udp> status_sender_;
+    std::unique_ptr<transport_udp::Udp> status_receiver_;
 
     uint32_t state_seq_ = 0;
     uint32_t control_seq_ = 0;
     uint32_t hmi_seq_ = 0;
+    uint32_t status_seq_ = 0;
 };
 
 }  // namespace transport

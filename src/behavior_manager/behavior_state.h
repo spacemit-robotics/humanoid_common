@@ -30,6 +30,8 @@ public:
     virtual StateName CheckTransition() = 0;
     // 退出状态
     virtual void OnExit() = 0;
+    // 当前状态是否已满足进入 RL 的前置条件（仅 ZERO 覆盖）
+    virtual bool ReadyForRl() const { return false; }
 
     StateName name;
 

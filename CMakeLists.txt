@@ -113,13 +113,13 @@ target_link_libraries(transport_executor
 # ============================================================================
 
 if(BUILD_RL)
-    # cnpy：用于 motion_tracking_helper 读取 .npz 参考动作（仅 tracking 策略启用时使用）
+    # cnpy：MJLab policy adapter 读取外置 .npz 参考动作。
     find_package(Cnpy REQUIRED)
 
     add_library(behavior_manager SHARED
         src/behavior_manager/behavior_fsm.cpp
         src/behavior_manager/behavior_manager.cpp
-        src/behavior_manager/motion_tracking_helper.cpp
+        src/behavior_manager/policy_adapter/policy_adapter.cpp
         src/behavior_manager/states/state_power_off.cpp
         src/behavior_manager/states/state_damp.cpp
         src/behavior_manager/states/state_zero.cpp
@@ -133,6 +133,7 @@ if(BUILD_RL)
             $<INSTALL_INTERFACE:include>
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager/policy_adapter
             ${RL_INCLUDE_DIR}
             ${EIGEN3_INCLUDE_DIR}
     )

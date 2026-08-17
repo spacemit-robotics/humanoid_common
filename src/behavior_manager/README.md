@@ -103,6 +103,7 @@ cd ~/spacemit_robot
 **关键参数：**
 - `rl_policy.policies.<name>.kp/kd`：各策略训练时的 PD 增益（每帧随控制命令下发）
 - `rl_policy.policies.<name>.prerequisite.policy / .duration`（可选）：前置策略链——切到本策略前先自动跑前置策略 `duration` 秒
+- `rl_policy.onnx_infer.policies.<name>.policy_adapter`（可选）：参考动作和特殊模型输入适配；支持 `mjlab`、`holomotion`、`protomotions`
 - `behavior_manager.damp_kd`：阻尼状态 kd（≈ policy kd / 5）
 - `behavior_manager.zero_pos`：回零位置（无 rl_policy 时的 fallback；完整 FSM 用 `rl_policy.policies.<name>.rl_default_pos`）
 - `behavior_manager.zero_duration`：回零时间（秒）

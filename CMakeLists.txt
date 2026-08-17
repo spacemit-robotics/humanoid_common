@@ -231,4 +231,16 @@ if(BUILD_RL)
     )
     target_link_libraries(test_behavior PRIVATE behavior_manager transport_executor robot_base)
     install(TARGETS test_behavior RUNTIME DESTINATION bin)
+
+    add_executable(test_policy_adapter
+        example/behavior_manager/test_policy_adapter.cpp)
+    target_include_directories(test_policy_adapter PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager
+        ${RL_INCLUDE_DIR}
+        ${EIGEN3_INCLUDE_DIR}
+    )
+    target_link_libraries(test_policy_adapter PRIVATE
+        behavior_manager robot_base ${RL_LIB})
+    install(TARGETS test_policy_adapter RUNTIME DESTINATION bin)
 endif()

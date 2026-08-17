@@ -30,9 +30,6 @@ namespace {
 
 namespace fs = std::filesystem;
 
-constexpr int kG1NumDof = 29;
-constexpr int kHolomotionObsDim = 604;
-
 struct PlaybackSample {
     int frame0 = 0;
     int frame1 = 0;
@@ -342,8 +339,8 @@ struct GeneralMotionFrame {
     Eigen::Quaternionf anchor_quat = Eigen::Quaternionf::Identity();
     Eigen::Vector3f root_velocity_world = Eigen::Vector3f::Zero();
     Eigen::Vector3f root_angular_velocity_world = Eigen::Vector3f::Zero();
-    std::array<float, kG1NumDof> dof_pos = {};
-    std::array<float, kG1NumDof> dof_vel = {};
+    std::vector<float> dof_pos;
+    std::vector<float> dof_vel;
 };
 
 std::vector<double> ParseCsvRow(const std::string &line) {
@@ -386,7 +383,7 @@ public:
         : kind_(kind), config_(config), policy_config_(policy_config) {
         ValidateConfig();
         LoadReference();
-        last_holomotion_action_.assign(kG1NumDof, 0.0F);
+        last_holomotion_action_.assign(model_dof_count_, 0.0F);
     }
 
     const char *Type() const override {
@@ -407,7 +404,7 @@ public:
             QuaternionYaw(robot_heading_source) -
             QuaternionYaw(motion_heading_source));
         heading_offset_.normalize();
-        last_holomotion_action_.assign(kG1NumDof, 0.0F);
+        last_holomotion_action_.assign(model_dof_count_, 0.0F);
     }
 
     void PrepareInputs(const robot_base::RobotData &robot,
@@ -431,38 +428,86 @@ public:
         if (kind_ != GeneralTrackerKind::HOLOMOTION) {
             return;
         }
-        if (action.size() != kG1NumDof) {
+        if (action.size() != static_cast<std::size_t>(model_dof_count_)) {
             throw std::runtime_error(
-                "[policy_adapter] HoloMotion action 必须为 29 维");
+                "[policy_adapter] HoloMotion action 维度错误: 实际=" +
+                std::to_string(action.size()) + ", 期望=" +
+                std::to_string(model_dof_count_));
         }
-        for (int joint = 0; joint < kG1NumDof; ++joint) {
-            last_holomotion_action_[joint] =
-                static_cast<float>(action[joint]);
+        for (int index = 0; index < model_dof_count_; ++index) {
+            last_holomotion_action_[index] =
+                static_cast<float>(action[index]);
         }
     }
 
 private:
-    void ValidateConfig() const {
-        if (policy_config_.rl_default_pos.size() != kG1NumDof ||
-            policy_config_.action_joint_index.size() != kG1NumDof) {
+    int ExpectedHolomotionObsDim() const {
+        const int current_state_dim = 18 + 4 * model_dof_count_;
+        const int future_frame_dim = 18 + model_dof_count_;
+        return current_state_dim +
+            config_.future_frames * future_frame_dim;
+    }
+
+    void ValidateConfig() {
+        robot_dof_count_ =
+            static_cast<int>(policy_config_.rl_default_pos.size());
+        if (robot_dof_count_ <= 0) {
             throw std::runtime_error(
-                "[policy_adapter] G1 tracker 需要 29 维默认位姿和关节映射");
+                "[policy_adapter] tracker 需要非空 rl_default_pos");
         }
-        if (kind_ == GeneralTrackerKind::HOLOMOTION &&
-            (config_.future_frames != 10 || config_.context_length != 32)) {
-            throw std::runtime_error(
-                "[policy_adapter] HoloMotion v1.3.2 需要 "
-                "future_frames=10、context_length=32");
+        model_dof_count_ = policy_config_.action_joint_index.empty()
+            ? robot_dof_count_
+            : static_cast<int>(policy_config_.action_joint_index.size());
+        for (const int joint : policy_config_.action_joint_index) {
+            if (joint < 0 || joint >= robot_dof_count_) {
+                throw std::runtime_error(
+                    "[policy_adapter] action_joint_index 越界: " +
+                    std::to_string(joint));
+            }
         }
-        if (kind_ == GeneralTrackerKind::PROTOMOTIONS &&
-            config_.future_steps != std::vector<int>({1, 2, 4, 8})) {
-            throw std::runtime_error(
-                "[policy_adapter] ProtoMotions 需要 future_steps=[1,2,4,8]");
+
+        if (kind_ == GeneralTrackerKind::HOLOMOTION) {
+            const auto obs_dim =
+                policy_config_.custom_array_dims.find("holomotion_obs");
+            if (obs_dim == policy_config_.custom_array_dims.end() ||
+                obs_dim->second <= 0) {
+                throw std::runtime_error(
+                    "[policy_adapter] HoloMotion 需要声明 "
+                    "custom_array_dims.holomotion_obs");
+            }
+            holomotion_obs_dim_ = obs_dim->second;
+            if (config_.future_frames < 0 || config_.context_length <= 0) {
+                throw std::runtime_error(
+                    "[policy_adapter] HoloMotion future_frames 不能小于 0，"
+                    "context_length 必须大于 0");
+            }
+            const int assembled_obs_dim = ExpectedHolomotionObsDim();
+            if (holomotion_obs_dim_ != assembled_obs_dim) {
+                throw std::runtime_error(
+                    "[policy_adapter] HoloMotion 观测维度配置错误: 配置=" +
+                    std::to_string(holomotion_obs_dim_) + ", 按策略参数计算=" +
+                    std::to_string(assembled_obs_dim));
+            }
         }
-        if (kind_ == GeneralTrackerKind::PROTOMOTIONS &&
-            config_.anchor_waist_joint_indices.size() != 3) {
-            throw std::runtime_error(
-                "[policy_adapter] ProtoMotions 需要 3 个 anchor 腰关节索引");
+
+        if (kind_ == GeneralTrackerKind::PROTOMOTIONS) {
+            int previous_step = 0;
+            for (const int step : config_.future_steps) {
+                if (step <= previous_step) {
+                    throw std::runtime_error(
+                        "[policy_adapter] ProtoMotions future_steps "
+                        "必须为严格递增的正整数");
+                }
+                previous_step = step;
+            }
+            if (config_.future_steps.empty()) {
+                throw std::runtime_error(
+                    "[policy_adapter] ProtoMotions future_steps 不能为空");
+            }
+            if (config_.anchor_waist_joint_indices.size() != 3) {
+                throw std::runtime_error(
+                    "[policy_adapter] ProtoMotions 需要 3 个 anchor 腰关节索引");
+            }
         }
     }
 
@@ -473,8 +518,9 @@ private:
                 "[policy_adapter] 无法打开参考 CSV: " +
                 config_.reference_file);
         }
-        const int expected_columns =
-            kind_ == GeneralTrackerKind::HOLOMOTION ? 40 : 67;
+        const int expected_columns = kind_ == GeneralTrackerKind::HOLOMOTION
+            ? 11 + robot_dof_count_
+            : 9 + 2 * robot_dof_count_;
         std::string line;
         int line_number = 0;
         while (std::getline(input, line)) {
@@ -486,10 +532,14 @@ private:
             if (static_cast<int>(values.size()) != expected_columns) {
                 throw std::runtime_error(
                     "[policy_adapter] 参考 CSV 第 " +
-                    std::to_string(line_number) + " 行列数错误");
+                    std::to_string(line_number) + " 行列数错误: 实际=" +
+                    std::to_string(values.size()) + ", 期望=" +
+                    std::to_string(expected_columns));
             }
 
             GeneralMotionFrame frame;
+            frame.dof_pos.assign(robot_dof_count_, 0.0F);
+            frame.dof_vel.assign(robot_dof_count_, 0.0F);
             frame.root_z = static_cast<float>(values[0]);
             frame.root_quat = MakeXyzwQuaternion(values, 1);
             if (kind_ == GeneralTrackerKind::HOLOMOTION) {
@@ -497,17 +547,17 @@ private:
                     values[5], values[6], values[7]);
                 frame.root_angular_velocity_world = Eigen::Vector3f(
                     values[8], values[9], values[10]);
-                for (int joint = 0; joint < kG1NumDof; ++joint) {
+                for (int joint = 0; joint < robot_dof_count_; ++joint) {
                     frame.dof_pos[joint] =
                         static_cast<float>(values[11 + joint]);
                 }
             } else {
                 frame.anchor_quat = MakeXyzwQuaternion(values, 5);
-                for (int joint = 0; joint < kG1NumDof; ++joint) {
+                for (int joint = 0; joint < robot_dof_count_; ++joint) {
                     frame.dof_pos[joint] =
                         static_cast<float>(values[9 + joint]);
                     frame.dof_vel[joint] = static_cast<float>(
-                        values[9 + kG1NumDof + joint]);
+                        values[9 + robot_dof_count_ + joint]);
                 }
             }
             motion_.push_back(frame);
@@ -516,7 +566,8 @@ private:
             throw std::runtime_error("[policy_adapter] 参考 CSV 没有数据帧");
         }
         std::cout << "[policy_adapter] " << Type() << ": "
-            << motion_.size() << " 帧, reference="
+            << motion_.size() << " 帧, robot_dof=" << robot_dof_count_
+            << ", model_dof=" << model_dof_count_ << ", reference="
             << config_.reference_file << std::endl;
     }
 
@@ -525,29 +576,42 @@ private:
             index, 0, static_cast<int>(motion_.size()) - 1)];
     }
 
-    void AppendDofInModelOrder(
-        const std::array<float, kG1NumDof> &dof,
+    int ModelJointAt(int model_index) const {
+        return policy_config_.action_joint_index.empty()
+            ? model_index
+            : policy_config_.action_joint_index[model_index];
+    }
+
+    void AppendDofInModelOrder(const std::vector<float> &dof,
         std::vector<float> &output) const {
-        for (const int joint : policy_config_.action_joint_index) {
-            output.push_back(dof[joint]);
+        for (int model_index = 0;
+            model_index < model_dof_count_;
+            ++model_index) {
+            output.push_back(dof[ModelJointAt(model_index)]);
         }
     }
 
     void AppendRobotDofInModelOrder(
         const std::vector<double> &dof,
         std::vector<float> &output) const {
-        for (const int joint : policy_config_.action_joint_index) {
-            output.push_back(static_cast<float>(dof[joint]));
+        for (int model_index = 0;
+            model_index < model_dof_count_;
+            ++model_index) {
+            output.push_back(static_cast<float>(
+                dof[ModelJointAt(model_index)]));
         }
     }
 
     void BuildHolomotionObservation(
         const robot_base::RobotData &robot,
         rl_policy::PolicyExecutor &policy) const {
-        if (robot.joint_pos.size() < kG1NumDof ||
-            robot.joint_vel.size() < kG1NumDof) {
+        if (robot.joint_pos.size() <
+                static_cast<std::size_t>(robot_dof_count_) ||
+            robot.joint_vel.size() <
+                static_cast<std::size_t>(robot_dof_count_)) {
             throw std::runtime_error(
-                "[policy_adapter] HoloMotion 需要 29 维机器人状态");
+                "[policy_adapter] HoloMotion 机器人状态维度不足，期望=" +
+                std::to_string(robot_dof_count_));
         }
         const GeneralMotionFrame &current = FrameAt(frame_index_);
         const Eigen::Quaternionf robot_quat = RobotQuaternion(robot);
@@ -556,7 +620,7 @@ private:
         const Eigen::Vector3f gravity(0.0F, 0.0F, -1.0F);
 
         std::vector<float> values;
-        values.reserve(kHolomotionObsDim);
+        values.reserve(holomotion_obs_dim_);
         AppendVector(current.root_quat.conjugate() * gravity, values);
         AppendVector(
             current.root_quat.conjugate() * current.root_velocity_world,
@@ -576,8 +640,10 @@ private:
         values.push_back(static_cast<float>(robot.gyro[1]));
         values.push_back(static_cast<float>(robot.gyro[2]));
 
-        for (int model_index = 0; model_index < kG1NumDof; ++model_index) {
-            const int joint = policy_config_.action_joint_index[model_index];
+        for (int model_index = 0;
+            model_index < model_dof_count_;
+            ++model_index) {
+            const int joint = ModelJointAt(model_index);
             values.push_back(static_cast<float>(
                 robot.joint_pos[joint] -
                 policy_config_.rl_default_pos[joint]));
@@ -629,10 +695,12 @@ private:
             values.push_back(matrix(2, 0));
             values.push_back(matrix(2, 1));
         }
-        if (values.size() != kHolomotionObsDim) {
+        if (values.size() !=
+            static_cast<std::size_t>(holomotion_obs_dim_)) {
             throw std::runtime_error(
-                "[policy_adapter] HoloMotion 观测维度错误: " +
-                std::to_string(values.size()));
+                "[policy_adapter] HoloMotion 观测维度错误: 实际=" +
+                std::to_string(values.size()) + ", 配置=" +
+                std::to_string(holomotion_obs_dim_));
         }
         policy.SetCustomArray(
             "holomotion_obs", values.data(), static_cast<int>(values.size()));
@@ -646,10 +714,13 @@ private:
     void SetProtomotionsInputs(
         const robot_base::RobotData &robot,
         rl_policy::PolicyExecutor &policy) const {
-        if (robot.joint_pos.size() < kG1NumDof ||
-            robot.joint_vel.size() < kG1NumDof) {
+        if (robot.joint_pos.size() <
+                static_cast<std::size_t>(robot_dof_count_) ||
+            robot.joint_vel.size() <
+                static_cast<std::size_t>(robot_dof_count_)) {
             throw std::runtime_error(
-                "[policy_adapter] ProtoMotions 需要 29 维机器人状态");
+                "[policy_adapter] ProtoMotions 机器人状态维度不足，期望=" +
+                std::to_string(robot_dof_count_));
         }
         const Eigen::Quaternionf anchor =
             ProtomotionsAnchorQuaternion(robot);
@@ -658,11 +729,9 @@ private:
         policy.SetModelInput(
             "current_anchor_rot", anchor_xyzw.data(), anchor_xyzw.size());
 
-        std::array<float, kG1NumDof> dof_velocity = {};
-        for (int joint = 0; joint < kG1NumDof; ++joint) {
-            dof_velocity[joint] =
-                static_cast<float>(robot.joint_vel[joint]);
-        }
+        std::vector<float> dof_velocity;
+        dof_velocity.reserve(model_dof_count_);
+        AppendRobotDofInModelOrder(robot.joint_vel, dof_velocity);
         policy.SetModelInput("current_dof_vel", dof_velocity.data(),
             dof_velocity.size());
 
@@ -678,19 +747,17 @@ private:
         std::vector<float> future_dof_pos;
         std::vector<float> future_dof_vel;
         future_anchor.reserve(config_.future_steps.size() * 4);
-        future_dof_pos.reserve(config_.future_steps.size() * kG1NumDof);
-        future_dof_vel.reserve(config_.future_steps.size() * kG1NumDof);
+        future_dof_pos.reserve(
+            config_.future_steps.size() * model_dof_count_);
+        future_dof_vel.reserve(
+            config_.future_steps.size() * model_dof_count_);
         for (const int offset : config_.future_steps) {
             const GeneralMotionFrame &future = FrameAt(frame_index_ + offset);
             Eigen::Quaternionf aligned =
                 (heading_offset_ * future.anchor_quat).normalized();
             AppendQuaternionXyzw(aligned, future_anchor);
-            future_dof_pos.insert(future_dof_pos.end(),
-                future.dof_pos.begin(),
-                future.dof_pos.end());
-            future_dof_vel.insert(future_dof_vel.end(),
-                future.dof_vel.begin(),
-                future.dof_vel.end());
+            AppendDofInModelOrder(future.dof_pos, future_dof_pos);
+            AppendDofInModelOrder(future.dof_vel, future_dof_vel);
         }
         policy.SetModelInput("mimic_future_anchor_rot", future_anchor.data(),
             future_anchor.size());
@@ -703,6 +770,9 @@ private:
     GeneralTrackerKind kind_;
     Config config_;
     rl_policy::PolicyExecutorConfig policy_config_;
+    int robot_dof_count_ = 0;
+    int model_dof_count_ = 0;
+    int holomotion_obs_dim_ = 0;
     std::vector<GeneralMotionFrame> motion_;
     int frame_index_ = 0;
     Eigen::Quaternionf heading_offset_ = Eigen::Quaternionf::Identity();

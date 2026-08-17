@@ -133,6 +133,10 @@ rl_policy:
 2. [`policy_adapter`](src/behavior_manager/policy_adapter/) 负责参考动作读取、时间轴、朝向对齐，以及 HoloMotion / ProtoMotions 的输入协议。
 3. 应用层机型仓库只提供模型、参考动作和 YAML 参数，不放 tracker C++ 代码。
 
+机器人自由度取自策略 `rl_default_pos`，模型关节顺序取自
+`action_joint_index`，自定义观测维度取自 `custom_array_dims`；这些机型和
+模型参数均由应用层 YAML 传入，不在 common 中固定。
+
 ```yaml
 policy_adapter:
   type: mjlab                 # mjlab / holomotion / protomotions

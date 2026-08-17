@@ -110,7 +110,8 @@ public:
         // 基于控制循环时间的推理触发机制
         time_since_last_infer_ += control_dt;
         if (time_since_last_infer_ >= rl_dt) {
-            time_since_last_infer_ = 0.0f;  // 重置累加器
+            // 保留调度余量，避免控制循环频率不能整除 rl_dt 时长期降频。
+            time_since_last_infer_ -= rl_dt;
 
             // 1) 写入最新传感器数据和命令到共享区（供推理线程读取）
             {

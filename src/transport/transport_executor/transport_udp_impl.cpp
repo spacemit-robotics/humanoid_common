@@ -31,9 +31,11 @@ bool TransportUdpImpl::Init(const std::string& yaml_path, Role role) {
     robot_base::YamlFile yaml_file = robot_base::YamlFile::Load(yaml_path);
     std::string driver_ip = "127.0.0.1";
     std::string control_ip = "127.0.0.1";
+    std::string hmi_ip = "127.0.0.1";
     int state_port = 8800;
     int control_port = 8801;
     int hmi_port = 8802;
+    int status_port = 8803;
 
     const std::string udp_prefix = "transport.udp";
     const std::string legacy_ip = yaml_file.Read<std::string>(udp_prefix + ".ip").value_or("");
@@ -41,9 +43,12 @@ bool TransportUdpImpl::Init(const std::string& yaml_path, Role role) {
                     .value_or(!legacy_ip.empty() ? legacy_ip : driver_ip);
     control_ip = yaml_file.Read<std::string>(udp_prefix + ".control_ip")
                     .value_or(!legacy_ip.empty() ? legacy_ip : control_ip);
+    hmi_ip = yaml_file.Read<std::string>(udp_prefix + ".hmi_ip")
+                    .value_or(!legacy_ip.empty() ? legacy_ip : driver_ip);
     state_port = yaml_file.Read<int>(udp_prefix + ".state_port").value_or(state_port);
     control_port = yaml_file.Read<int>(udp_prefix + ".control_port").value_or(control_port);
     hmi_port = yaml_file.Read<int>(udp_prefix + ".hmi_port").value_or(control_port + 1);
+    status_port = yaml_file.Read<int>(udp_prefix + ".status_port").value_or(hmi_port + 1);
 
     if (role == Role::DRIVER) {
         // Driver: 发送状态 → control_ip:state_port
@@ -107,6 +112,18 @@ bool TransportUdpImpl::Init(const std::string& yaml_path, Role role) {
             return false;
         }
 
+        // Control: 回传运行状态 → hmi_ip:status_port
+        status_sender_ = std::make_unique<transport_udp::Udp>();
+        transport_udp::UdpConfig ss;
+        ss.role = transport_udp::Role::CLIENT;
+        ss.remote_ip = hmi_ip;
+        ss.remote_port = status_port;
+        ss.timeout_ms = kUdpTimeoutMs;
+        if (!status_sender_->Init(ss)) {
+            std::cerr << "[transport_executor] status_sender 初始化失败\n";
+            return false;
+        }
+
     } else if (role == Role::HMI) {
         // Hmi: 发送 HMI → control_ip:hmi_port
         hmi_sender_ = std::make_unique<transport_udp::Udp>();
@@ -117,6 +134,18 @@ bool TransportUdpImpl::Init(const std::string& yaml_path, Role role) {
         hc.timeout_ms = kUdpTimeoutMs;
         if (!hmi_sender_->Init(hc)) {
             std::cerr << "[transport_executor] hmi_sender 初始化失败\n";
+            return false;
+        }
+
+        // Hmi: 接收 Control 运行状态 ← 0.0.0.0:status_port
+        status_receiver_ = std::make_unique<transport_udp::Udp>();
+        transport_udp::UdpConfig sr;
+        sr.role = transport_udp::Role::SERVER;
+        sr.local_ip = "0.0.0.0";
+        sr.local_port = status_port;
+        sr.timeout_ms = kUdpTimeoutMs;
+        if (!status_receiver_->Init(sr)) {
+            std::cerr << "[transport_executor] status_receiver 初始化失败\n";
             return false;
         }
     }
@@ -258,6 +287,50 @@ bool TransportUdpImpl::RecvCommand(robot_base::Command& cmd) {
     cmd.wz = p.wz;
     cmd.switch_policy = p.switch_policy;
 
+    return true;
+}
+
+// ==================== Control 状态回传通道 ====================
+
+void TransportUdpImpl::SendStatus(const robot_base::ControlStatus& status) {
+    if (!status_sender_)
+        return;
+
+    ControlStatusPacket p{};
+    p.header.type = static_cast<uint16_t>(MsgType::CONTROL_STATUS);
+    p.header.seq = ++status_seq_;
+    p.control_mode = static_cast<int8_t>(status.mode);
+    p.zero_ready = status.zero_ready ? 1 : 0;
+    p.hmi_connected = status.hmi_connected ? 1 : 0;
+    p.vx = status.vx;
+    p.vy = status.vy;
+    p.wz = status.wz;
+    p.rl_frequency_hz = status.rl_frequency_hz;
+    std::strncpy(p.active_policy, status.active_policy.c_str(),
+        sizeof(p.active_policy) - 1);
+
+    status_sender_->Send(&p, sizeof(p));
+}
+
+bool TransportUdpImpl::RecvStatus(robot_base::ControlStatus& status) {
+    if (!status_receiver_)
+        return false;
+
+    ControlStatusPacket p{};
+    int n = status_receiver_->Recv(&p, sizeof(p));
+    if (n != static_cast<int>(sizeof(p)) ||
+        !ValidHeader(p.header, MsgType::CONTROL_STATUS)) {
+        return false;
+    }
+
+    status.mode = static_cast<robot_base::ControlMode>(p.control_mode);
+    status.zero_ready = (p.zero_ready != 0);
+    status.hmi_connected = (p.hmi_connected != 0);
+    status.vx = p.vx;
+    status.vy = p.vy;
+    status.wz = p.wz;
+    status.rl_frequency_hz = p.rl_frequency_hz;
+    status.active_policy = p.active_policy;
     return true;
 }
 

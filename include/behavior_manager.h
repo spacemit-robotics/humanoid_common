@@ -101,6 +101,11 @@ public:
     StateName CurrentState() const;
 
     /**
+     * @brief ZERO 回零是否完成、当前是否可请求进入 RL
+     */
+    bool IsZeroReady() const;
+
+    /**
      * @brief 获取当前生效策略名
      */
     std::string CurrentPolicyName() const;

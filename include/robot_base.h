@@ -201,6 +201,23 @@ enum class ControlMode : int8_t {
     SAFETY = 4      ///< 安全保护
 };
 
+/**
+ * @brief Control 运行状态回传
+ *
+ * 由 control_runtime 发布给 HMI。HMI 只把键盘操作作为请求发送，界面显示以
+ * 该结构中的真实 FSM、实际生效策略和经过 control 限幅后的速度为准。
+ */
+struct ControlStatus {
+    ControlMode mode = ControlMode::POWER_OFF;  ///< 当前真实 FSM 状态
+    bool zero_ready = false;                    ///< ZERO 已完成，可请求进入 RL
+    bool hmi_connected = false;                 ///< Control 在超时内收到过 HMI 心跳
+    float vx = 0.0f;                            ///< Control 实际采用的前进速度 (m/s)
+    float vy = 0.0f;                            ///< Control 实际采用的横向速度 (m/s)
+    float wz = 0.0f;                            ///< Control 实际采用的转向角速度 (rad/s)
+    float rl_frequency_hz = 0.0f;               ///< RL 当前推理频率 (Hz)
+    std::string active_policy;                  ///< 当前实际生效策略
+};
+
 struct ControlCmd {
     bool enable = false;             ///< 使能标志
     ControlMode mode = ControlMode::POWER_OFF;  ///< 控制模式（通用）

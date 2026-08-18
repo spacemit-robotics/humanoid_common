@@ -101,6 +101,10 @@ StateName FSM::CurrentState() const {
     return current_name_;
 }
 
+bool FSM::ReadyForRl() const {
+    return current_ && current_->ReadyForRl();
+}
+
 void FSM::SwitchTo(StateName target) {
     auto it = states_.find(target);
     if (it == states_.end()) {

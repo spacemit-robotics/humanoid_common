@@ -1,6 +1,7 @@
 # transport — 统一传输模块
 
-跨进程通信接口，负责机器人状态、控制命令、HMI 命令的收发。完全由 YAML 配置驱动，与具体通信方式无关。通过 `transport.type` 字段在 UDP 和 SHM 之间切换，应用代码无需修改。
+跨进程通信接口，负责机器人状态、控制命令、HMI 命令及 Control 状态回传。
+完全由 YAML 配置驱动，通过 `transport.type` 在 UDP 和 SHM 之间切换。
 
 ## 接口说明
 
@@ -11,8 +12,8 @@
 | 角色 | 发送 | 接收 |
 |------|------|------|
 | `DRIVER` | 状态（RobotData） | 控制命令（ControlCmd） |
-| `CONTROL` | 控制命令（ControlCmd） | 状态（RobotData）+ 命令（Command） |
-| `HMI` | 命令（Command） | — |
+| `CONTROL` | 控制命令（ControlCmd）+ 运行状态（ControlStatus） | 状态（RobotData）+ 命令（Command） |
+| `HMI` | 命令（Command） | 运行状态（ControlStatus） |
 
 ### `TransportBase` — 传输接口
 
@@ -26,6 +27,8 @@
 | `RecvControl(cmd)` | 接收控制命令（DRIVER 使用）|
 | `SendCommand(cmd)` | 发送行为命令（HMI 使用）|
 | `RecvCommand(cmd)` | 接收行为命令（CONTROL 使用）|
+| `SendStatus(status)` | 回传真实 FSM、策略、速度和 RL 频率（CONTROL 使用）|
+| `RecvStatus(status)` | 接收 Control 运行状态（HMI 使用）|
 
 ## 依赖
 
@@ -66,9 +69,11 @@ transport:
   udp:
     driver_ip: 127.0.0.1
     control_ip: 127.0.0.1
+    hmi_ip: 127.0.0.1
     state_port: 8800
     control_port: 8801
     hmi_port: 8802
+    status_port: 8803
 
   shm:
     prefix: "robot1"
@@ -77,6 +82,7 @@ transport:
 ```
 
 切换传输方式只需修改 `type` 字段，应用代码无需任何改动。
+SHM 会建立 `state`、`control`、`hmi`、`status` 四个独立通道。
 
 ### 传输方式对比
 

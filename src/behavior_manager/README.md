@@ -54,6 +54,7 @@
 | `SetCommand(cmd)` | 设置命令（状态切换、速度指令、策略切换）|
 | `GetOutput()` | 获取控制输出 |
 | `CurrentState()` | 获取当前状态 |
+| `IsZeroReady()` | 查询 ZERO 是否完成、是否可进入 RL |
 | `CurrentPolicyName()` | 获取当前 RL 策略名 |
 | `GetRlFreq()` | 获取 RL 推理频率（Hz）|
 
@@ -103,6 +104,7 @@ cd ~/spacemit_robot
 **关键参数：**
 - `rl_policy.policies.<name>.kp/kd`：各策略训练时的 PD 增益（每帧随控制命令下发）
 - `rl_policy.policies.<name>.prerequisite.policy / .duration`（可选）：前置策略链——切到本策略前先自动跑前置策略 `duration` 秒
+- `rl_policy.onnx_infer.policies.<name>.policy_adapter`（可选）：参考动作和特殊模型输入适配；支持 `mjlab`、`protomotions`
 - `behavior_manager.damp_kd`：阻尼状态 kd（≈ policy kd / 5）
 - `behavior_manager.zero_pos`：回零位置（无 rl_policy 时的 fallback；完整 FSM 用 `rl_policy.policies.<name>.rl_default_pos`）
 - `behavior_manager.zero_duration`：回零时间（秒）
@@ -123,7 +125,9 @@ POWER_OFF ──key=1──→ DAMP ──key=2──→ ZERO ──key=3(插值
 
 - **异步推理：** StateRL 在独立线程执行 ONNX 推理，不阻塞主循环
 - **通用模型 I/O：** `PolicyExecutorConfig` 整体透传给 RL 组件；多输入输出、feedback、external 等拓扑由策略 YAML `model_io` 声明，common 无需复制底层字段
+- **策略协议适配：** `policy_adapter` 是 behavior_manager 的私有子模块；机器人自由度、关节映射和自定义观测维度由机型 YAML 透传，common 不固定具体机型维度
 - **动态策略切换：** 仅在 `POWER_OFF` / `DAMP` 状态接受 `Command.switch_policy`；进入 `ZERO` 后策略锁定（ZERO 的目标位置/kp/kd 取自当前策略，切换会同步重建 ZERO 状态）
 - **前置策略链调度：** 目标策略可在 yaml 配置 `prerequisite: { policy, duration }`，behavior_manager 收到切换请求后自动先切前置策略，在 RL 状态运行 `duration` 秒后再切目标策略；用户感知层面只发一次切换命令。典型场景：`dance` / `kungfu` 配 `prerequisite: stand`，先用 LocoMode 站稳并预热 LSTM，再进 dance/kungfu，避免直接从 PD 锁位的 ZERO 切动态动作时摔倒
 - **安全保护：** IMU 倾角/关节限位自动触发安全状态
+- **状态回传：** `CurrentState()`、`IsZeroReady()`、当前策略和 RL 频率由 control_runtime 组装为 `ControlStatus` 发给 HMI
 - **参数隔离：** damp_kd ≈ policy kd / 5（不同阶段刚度需求不同）

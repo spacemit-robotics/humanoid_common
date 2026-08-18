@@ -9,7 +9,7 @@
  * - 构造与初始化（BehaviorManagerClass / Init）
  * - 数据输入（SetSensorData / SetCommand）
  * - 状态机驱动（Step）
- * - 状态查询（CurrentState / CurrentPolicyName / GetRlFreq / IsRunning）
+ * - 状态查询（CurrentState / IsZeroReady / CurrentPolicyName / GetRlFreq / IsRunning）
  * - 控制输出获取（GetOutput）
  * - FSM 状态切换流程（不含 RL）：POWER_OFF → DAMP → ZERO → POWER_OFF
  *
@@ -112,13 +112,21 @@ int main(int argc, char *argv[]) {
         bm.Step(control_dt, rl_dt);
         cmd.key = 0;
         std::cout << "当前状态: " << StateNameStr(bm.CurrentState()) << std::endl;
+        if (bm.IsZeroReady()) {
+            std::cerr << "[错误] ZERO 刚进入时不应报告 READY" << std::endl;
+            return 1;
+        }
 
         // 运行回零过程（2秒）
-        for (int i = 0; i < 1000; i++) {
+        for (int i = 0; i < 1001; i++) {
             sensor.time = i * control_dt;
             bm.SetSensorData(sensor);
             bm.SetCommand(cmd);
             bm.Step(control_dt, rl_dt);
+        }
+        if (!bm.IsZeroReady()) {
+            std::cerr << "[错误] ZERO 完成后未报告 READY" << std::endl;
+            return 1;
         }
 
         // 打印回零后的目标位置

@@ -37,6 +37,7 @@ enum class MsgType : uint16_t {
     HMI_CMD = 1,      ///< HMI 命令
     ROBOT_STATE = 2,  ///< 机器人状态
     CONTROL_CMD = 3,  ///< 控制命令
+    CONTROL_STATUS = 4,  ///< Control → HMI 运行状态
 };
 
 // ==================== 数据包定义 ====================
@@ -95,6 +96,22 @@ struct ControlCmdPacket {
     double target_vel[kMaxDof] = {0.0};
     double kp[kMaxDof] = {0.0};
     double kd[kMaxDof] = {0.0};
+};
+
+/**
+ * @brief Control → HMI 运行状态数据包
+ */
+struct ControlStatusPacket {
+    PacketHeader header{};
+    int8_t control_mode = 0;
+    uint8_t zero_ready = 0;
+    uint8_t hmi_connected = 0;
+    uint8_t reserved = 0;
+    float vx = 0.0f;
+    float vy = 0.0f;
+    float wz = 0.0f;
+    float rl_frequency_hz = 0.0f;
+    char active_policy[64] = {};
 };
 
 #pragma pack(pop)

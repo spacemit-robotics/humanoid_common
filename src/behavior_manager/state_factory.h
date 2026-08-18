@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "behavior_state.h"  // 内部实现，位于 src/
+#include "policy_adapter/policy_adapter.h"
 #include "robot_base.h"      // robot_base::ThreadLoop
 #include "rl_service.h"      // rl_policy::PolicyExecutorConfig
 namespace behavior_manager {
@@ -30,12 +31,8 @@ struct RLConfig {
     double max_roll = 0.7;                    // 最大翻滚角 (rad)
     double max_pitch = 0.7;                   // 最大俯仰角 (rad)
 
-    // ---- motion tracking 参数（可选；motion_file 为空表示该策略不启用 tracking）----
-    std::string motion_file;                    // npz 路径（绝对或相对 robot_dir）
-    double motion_fps = 50.0;                   // mjlab 训练默认 50 Hz
-    int anchor_body_index = -1;  // anchor body 在 npz body 顺序中的索引（由机型 yaml 提供；<0 表示未配置）
-    std::vector<int> anchor_waist_joint_indices;  // pelvis→anchor 的关节索引 [yaw, roll, pitch]（机型 yaml 提供，用于 yaw 对齐）
-    bool anchor_yaw_align = true;
+    // ---- 策略输入协议适配（可选；type 为空表示普通 RL 策略）----
+    policy_adapter::Config policy_adapter;
     std::vector<double> zero_target_pos;  // ZERO 阶段目标位姿（可选，空则用 rl_default_pos）
 
     // ---- PD 控制增益（从 behavior_manager 传入，OnEnter 时恢复）----

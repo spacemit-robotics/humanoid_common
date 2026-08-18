@@ -17,19 +17,21 @@ robot_base:
 # ============================================================
 transport:
   # 传输方式选择：udp（跨机器）或 shm（单机多进程）
-  type: "udp"
+  type: "shm"  # standalone functional test 默认使用本机可靠的 SHM
 
   # UDP 后端配置（跨机器通信）
   udp:
     driver_ip: "10.0.90.6"     # Driver 端 IP（运行 driver_demo 的机器）
     control_ip: "10.0.91.225"  # Control 端 IP（运行 control_demo 的机器）
+    hmi_ip: "10.0.90.6"        # HMI 端 IP（接收 Control 状态回传）
     state_port: 8800            # Driver → Control，机器人状态数据
     control_port: 8801          # Control → Driver，控制命令
     hmi_port: 8802              # Hmi → Control，键盘命令
+    status_port: 8803           # Control → Hmi，真实 FSM/策略/速度
 
   # SHM 后端配置（单机多进程，极低延迟）
   shm:
     prefix: "g1"       # 共享内存名称前缀
-                       # 实际创建：/dev/shm/hmrs_g1_state、hmrs_g1_control、hmrs_g1_hmi
+                       # 实际创建：state、control、hmi、status 四个通道
     capacity: 4        # 环形缓冲区槽位数
     slot_size: 4096    # 每个槽位大小（字节，需大于最大 packet）

@@ -72,6 +72,11 @@ public:
     StateName CurrentState() const;
 
     /**
+     * @brief 当前状态是否已满足进入 RL 的前置条件
+     */
+    bool ReadyForRl() const;
+
+    /**
      * @brief 设置共享数据指针（所有状态共享）
      */
     void SetDataPointers(robot_base::RobotData *sensor,

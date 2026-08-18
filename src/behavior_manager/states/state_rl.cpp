@@ -14,7 +14,6 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
-#include <filesystem>  // NOLINT(build/c++17)
 #include <iostream>
 #include <mutex>
 #include <vector>
@@ -22,7 +21,7 @@
 #include <utility>
 
 #include "behavior_state.h"
-#include "motion_tracking_helper.h"
+#include "policy_adapter/policy_adapter.h"
 #include "rl_service.h"
 #include "state_factory.h"
 namespace behavior_manager {
@@ -56,34 +55,21 @@ public:
         new_data_ready_ = false;
         running_ = true;
 
-        // motion tracking 支持：若策略配置了 motion_file，加载 npz + reset yaw 对齐
-        tracking_helper_.reset();
-        if (!config_.motion_file.empty() && sensor_) {
+        // 可选策略适配器：负责参考动作、模型特殊输入和时序状态。
+        policy_adapter_.reset();
+        if (config_.policy_adapter.Enabled() && sensor_) {
             try {
-                tracking_helper_ = std::make_unique<MotionTrackingHelper>();
-                tracking_helper_->Load(config_.motion_file, config_.motion_fps,
-                    config_.anchor_body_index);
-                // pelvis→anchor 的腰关节 [yaw, roll, pitch] 角度，索引由机型 yaml 配置；
-                // 未配置或越界则取 0（anchor quat 退化为仅用 root_quat）。
-                auto joint_at = [&](int idx) -> double {
-                    if (idx < 0 || static_cast<size_t>(idx) >= sensor_->joint_pos.size()) {
-                        return 0.0;
-                    }
-                    return sensor_->joint_pos[idx];
-                };
-                const auto &wj = config_.anchor_waist_joint_indices;
-                const double yaw_q = (wj.size() == 3) ? joint_at(wj[0]) : 0.0;
-                const double roll_q = (wj.size() == 3) ? joint_at(wj[1]) : 0.0;
-                const double pitch_q = (wj.size() == 3) ? joint_at(wj[2]) : 0.0;
-                tracking_helper_->Reset(*sensor_, yaw_q, roll_q, pitch_q, config_.anchor_yaw_align);
+                policy_adapter_ = policy_adapter::Create(
+                    config_.policy_adapter, config_.policy);
+                policy_adapter_->Reset(*sensor_);
                 t_enter_ = std::chrono::steady_clock::now();
-                std::cout << "[StateRL] tracking 启用: motion=" << config_.motion_file
-                        << ", anchor_idx=" << config_.anchor_body_index
-                        << ", duration=" << tracking_helper_->Duration() << "s" << std::endl;
+                std::cout << "[StateRL] policy_adapter 启用: type="
+                    << policy_adapter_->Type() << ", reference="
+                    << config_.policy_adapter.reference_file << std::endl;
             } catch (const std::exception &e) {
-                // 加载失败：置安全触发、跳过推理线程启动，由 CheckTransition 切 SAFETY。
-                std::cerr << "[StateRL] tracking 加载失败，切安全态: " << e.what() << std::endl;
-                tracking_helper_.reset();
+                std::cerr << "[StateRL] policy_adapter 加载失败，切安全态: "
+                    << e.what() << std::endl;
+                policy_adapter_.reset();
                 safety_triggered_ = true;
                 return;
             }
@@ -110,7 +96,8 @@ public:
         // 基于控制循环时间的推理触发机制
         time_since_last_infer_ += control_dt;
         if (time_since_last_infer_ >= rl_dt) {
-            time_since_last_infer_ = 0.0f;  // 重置累加器
+            // 保留调度余量，避免控制循环频率不能整除 rl_dt 时长期降频。
+            time_since_last_infer_ -= rl_dt;
 
             // 1) 写入最新传感器数据和命令到共享区（供推理线程读取）
             {
@@ -208,34 +195,22 @@ private:
             rl_dt = sample_rl_dt_;
         }
 
-        // motion tracking：每帧把 motion + anchor 数据推给 policy（在 AssembleObs 前）
-        if (tracking_helper_) {
+        // 在 AssembleObs 前注入 tracker-specific 输入。
+        if (policy_adapter_) {
             const auto elapsed = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t_enter_).count();
-            auto joint_at = [&](int idx) -> double {
-                if (idx < 0 || static_cast<size_t>(idx) >= joint_pos.size()) {
-                    return 0.0;
-                }
-                return joint_pos[idx];
-            };
-            const auto &wj = config_.anchor_waist_joint_indices;  // [yaw, roll, pitch]
-            const double yaw_q = (wj.size() == 3) ? joint_at(wj[0]) : 0.0;
-            const double roll_q = (wj.size() == 3) ? joint_at(wj[1]) : 0.0;
-            const double pitch_q = (wj.size() == 3) ? joint_at(wj[2]) : 0.0;
             robot_base::RobotData snapshot;
+            snapshot.num_dof = static_cast<int>(joint_pos.size());
             snapshot.base_pos = base_pos;
             snapshot.base_quat = base_quat;
+            snapshot.base_vel = {
+                base_vel[0], base_vel[1], base_vel[2],
+                gyro[0], gyro[1], gyro[2]};
+            snapshot.rpy = rpy;
+            snapshot.gyro = gyro;
             snapshot.joint_pos = joint_pos;
-            tracking_helper_->Update(elapsed, snapshot, yaw_q, roll_q, pitch_q);
-
-            policy_.SetCustomArray("motion_command",
-                                    tracking_helper_->MotionCommand().data(),
-                                    static_cast<int>(tracking_helper_->MotionCommand().size()));
-            policy_.SetCustomArray("motion_anchor_pos_b",
-                                    tracking_helper_->AnchorPosB().data(), 3);
-            policy_.SetCustomArray("motion_anchor_ori_b",
-                                    tracking_helper_->AnchorOriB().data(), 6);
-
+            snapshot.joint_vel = joint_vel;
+            policy_adapter_->PrepareInputs(snapshot, elapsed, policy_);
         }
 
         // 组装观测 + 推理
@@ -254,6 +229,9 @@ private:
 
         std::vector<double> action;
         policy_.Infer(obs, action);
+        if (policy_adapter_) {
+            policy_adapter_->OnAction(action);
+        }
         UpdateRlFreq();
 
         // 写入动作缓存
@@ -277,8 +255,8 @@ private:
     // 安全标志
     bool safety_triggered_ = false;
 
-    // motion tracking 辅助（motion_file 为空则不启用）
-    std::unique_ptr<MotionTrackingHelper> tracking_helper_;
+    // 策略输入协议适配器（policy_adapter.type 为空则不启用）
+    std::unique_ptr<policy_adapter::PolicyAdapter> policy_adapter_;
     std::chrono::steady_clock::time_point t_enter_;
 
     // 推理频率统计（推理线程内读写）

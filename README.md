@@ -91,9 +91,9 @@ PR 档含 `humanoid-common-functional`（robot_base / behavior_manager / transpo
 ```
  ┌───────────┐   HMI cmd    ┌───────────────┐   control cmd   ┌──────────────┐
  │  hmi      │ ───────────▶ │  control      │ ──────────────▶ │  driver      │
- │  _runtime │              │  _runtime     │                 │  _runtime    │
- └───────────┘              │  (FSM + RL)   │ ◀────────────── │  (MuJoCo /   │
-                            └───────────────┘   robot state   │   硬件驱动)  │
+ │  _runtime │ ◀─────────── │  _runtime     │ ◀────────────── │  _runtime    │
+ └───────────┘ ControlStatus│  (FSM + RL)   │   robot state   │  (MuJoCo /   │
+                            └───────────────┘                 │   硬件驱动)  │
                                                               └──────────────┘
 ```
 
@@ -121,26 +121,39 @@ rl_policy:
           duration: 2.0                        # 前置运行时长（秒）
 ```
 
-调度流程：HMI 切 `dance` → behavior_manager 命中 map → 内部先把 active 切到 `stand`，进 RL 跑满 2s 后自动切到 `dance`（StateRL 会重新 OnEnter 重置 LSTM）。HMI 单次按键，用户无感。详见 [`src/behavior_manager/README.md`](src/behavior_manager/README.md)。
+调度流程：HMI 选择 `dance` → behavior_manager 命中 map → 内部先把 active 切到 `stand`，进 RL 跑满 2s 后自动切到 `dance`（StateRL 会重新 OnEnter 重置 LSTM）。HMI 单次确认，用户无感。详见 [`src/behavior_manager/README.md`](src/behavior_manager/README.md)。
 
 ### Motion tracking 策略
 
-`tracking` 策略与 `dance` / `kungfu` 是不同的 motion mimic 范式：
+需要外置参考动作或特殊模型输入的策略，在机型 YAML 的策略段配置
+`policy_adapter`。它是 `behavior_manager` 的内部子模块，不是与
+`behavior_manager` 平级的新 common 模块：
 
-| | dance/kungfu | tracking (unitree_rl_mjlab) |
-|---|---|---|
-| 训练来源 | RoboMimic_Deploy（1D phase 范式） | unitree_rl_mjlab（多维参考量范式） |
-| obs 维度 | 380（1D phase + history × 4） | 160（多维参考 + 单帧） |
-| motion 数据 | 烘进 actor 权重 | 外挂 npz 文件（cnpy 运行时加载） |
-| anchor 计算 | 不需要 | 需要（anchor body 相对位姿） |
+1. `model_zoo/rl` 只负责通用 ONNX I/O、feedback tensor 和观测项组装。
+2. [`policy_adapter`](src/behavior_manager/policy_adapter/) 负责参考动作读取、时间轴、朝向对齐，以及 HoloMotion / ProtoMotions 的输入协议。
+3. 应用层机型仓库只提供模型、参考动作和 YAML 参数，不放 tracker C++ 代码。
 
-实现路径（rl 层做泛型扩展，tracking 业务逻辑在 common 层）：
+机器人自由度取自策略 `rl_default_pos`，模型关节顺序取自
+`action_joint_index`，自定义观测维度取自 `custom_array_dims`；这些机型和
+模型参数均由应用层 YAML 传入，不在 common 中固定。
 
-1. **rl 层**：`ObsTermCalculator` 把 1D `SetCustomScalar` 扩到 N D `SetCustomArray`，未识别 term 名走 `custom_arrays_` 查表 memcpy（[components/model_zoo/rl/src/obs_term.h](../../components/model_zoo/rl/src/obs_term.h)）。yaml 通过 `custom_array_dims: {name: dim}` 声明 N 维 term 维度。
-2. **common 层**：新增 `MotionTrackingHelper`（[src/behavior_manager/motion_tracking_helper.h](src/behavior_manager/motion_tracking_helper.h)）封装 cnpy npz 加载、yaw 对齐、anchor 计算，state_rl 在 OnEnter / InferStep 各插桩调用，把 `motion_command(58) / motion_anchor_pos_b(3) / motion_anchor_ori_b(6)` 通过 `policy.SetCustomArray(...)` 推给 rl。
-3. **应用层**：机型 yaml 中 tracking 策略段加 `motion_file / motion_fps / anchor_body_index / anchor_waist_joint_indices / anchor_yaw_align` 五个 tracking-specific 字段 + `custom_array_dims` 声明。`anchor_body_index` 是 anchor body 在 npz body 顺序中的索引、`anchor_waist_joint_indices` 是 pelvis→anchor 腰关节 [yaw, roll, pitch] 的关节索引（均机型相关，由各机型 yaml 提供）。另有可选 `zero_target_pos`（URDF 顺序关节角）：配置后 ZERO 阶段以其为 PD 目标（通常取 motion npz frame 0 姿态，使 RL 接管时姿态衔接），未配置时用 `rl_default_pos`。
+```yaml
+policy_adapter:
+  type: mjlab                 # mjlab / holomotion / protomotions
+  reference_file: policy/example/motion.npz
+  motion_fps: 50
+  playback_speed: 1.0
+  loop: false
+  loop_pause: 0.0
+  anchor_body_index: 0
+  anchor_waist_joint_indices: []
+  anchor_yaw_align: true
+```
 
-motion 播完后冻结在末帧（帧索引 clamp 到最后一帧）保持，不自动回 ZERO；需切换状态由 HMI/control 手动触发（POWER_OFF / DAMP 等）。第一次进 tracking 时会按机器人当前 yaw vs npz 第 0 帧 yaw 做一次性对齐。
+MJLab 使用 NPZ 参考动作；HoloMotion 和 ProtoMotions 使用各自预处理后的
+CSV，并可追加 `future_frames/context_length` 或 `future_steps`。策略若配置
+`zero_target_pos`，ZERO 阶段先过渡到参考动作起始姿态。非循环动作播放完成后
+保持末帧，状态切换仍由 HMI/control 负责。
 
 ### ControlMode 数据流（control → driver）
 
@@ -155,26 +168,33 @@ motion 播完后冻结在末帧（帧索引 clamp 到最后一帧）保持，不
 
 ### hmi_runtime 键盘操作
 
-hmi_runtime 使用 ANSI 备用屏幕缓冲区实现全屏 TUI，策略列表自动分行显示。
+hmi_runtime 使用带颜色的 ANSI 全屏 TUI。FSM、当前策略、Control 实际采用速度和
+RL 频率均来自 control 端回传，不在 HMI 本地预判。主界面用左右键切换相邻 FSM，
+策略和速度分别使用独立子页面。
 
 | 按键 | 动作 |
 | --- | --- |
-| `f` | 切换到 POWER_OFF（完全失力） |
-| `o` | 切换到 DAMP（阻尼保持） |
-| `z` | 切换到 ZERO（回零位） |
-| `r` | 切换到 RL（进入 RL 控制） |
-| `1`~`9` | 切换到对应序号的策略 |
-| `w/s` | 增减 vx |
-| `a/d` | 增减 vy |
-| `q/e` | 增减 wz |
+| `←/→` | 按真实 FSM 后退/前进；RL 按左键直接退到 DAMP |
+| `f` | 全局请求 POWER_OFF（完全失力） |
+| `p` | 打开策略选择页；`↑/↓` 或 `j/k` 移动，Enter 确认，Esc 返回 |
+| `v` / `Enter` | 真实状态为 RL 且心跳正常时进入速度控制页 |
+| `w/s` | 速度页内增减 vx |
+| `a/d` | 速度页内增减 vy |
+| `q/e` | 速度页内增减 wz |
 | `空格` | 速度清零 |
+| `Esc` / `v` | 退出速度页并清零 |
+
+`o/z/r` 保留为兼容快捷键，但合法性仍由 control 端 FSM 校验。HMI 以配置频率发送
+心跳；退出速度页、离开 RL、HMI 退出或心跳超时都会清零速度。步长、限幅和超时在
+YAML 的 `hmi` 节点配置。
 
 ### 通信配置
 
 通过 YAML 中 `transport.type` 字段选择后端：
 
 - `"shm"`：共享内存，同机高性能，默认值
-- `"udp"`：跨机通信或同机隔离进程，需填写 `driver_ip` / `control_ip`
+- `"udp"`：跨机通信或同机隔离进程，需填写 `driver_ip` / `control_ip` /
+  `hmi_ip`，状态回传使用独立 `status_port`
 
 详见 [`src/transport/README.md`](src/transport/README.md)。
 

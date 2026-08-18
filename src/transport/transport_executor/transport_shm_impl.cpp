@@ -102,6 +102,18 @@ bool TransportShmImpl::Init(const std::string& yaml_path, Role role) {
             return false;
         }
 
+        // Control: 写运行状态
+        status_writer_ = std::make_unique<transport_shm::Shm>();
+        transport_shm::ShmConfig ss;
+        ss.channel_name = "/hmrs_" + prefix + "_status";
+        ss.role = transport_shm::Role::WRITER;
+        ss.capacity = capacity;
+        ss.slot_size = slot_size;
+        if (!status_writer_->Init(ss)) {
+            std::cerr << "[transport_shm] status_writer 初始化失败\n";
+            return false;
+        }
+
     } else if (role == Role::HMI) {
         // Hmi: 写 HMI
         hmi_writer_ = std::make_unique<transport_shm::Shm>();
@@ -112,6 +124,19 @@ bool TransportShmImpl::Init(const std::string& yaml_path, Role role) {
         hc.slot_size = slot_size;
         if (!hmi_writer_->Init(hc)) {
             std::cerr << "[transport_shm] hmi_writer 初始化失败\n";
+            return false;
+        }
+
+        // Hmi: 读 Control 运行状态
+        status_reader_ = std::make_unique<transport_shm::Shm>();
+        transport_shm::ShmConfig sr;
+        sr.channel_name = "/hmrs_" + prefix + "_status";
+        sr.role = transport_shm::Role::READER;
+        sr.capacity = capacity;
+        sr.slot_size = slot_size;
+        sr.create_if_not_exist = true;
+        if (!status_reader_->Init(sr)) {
+            std::cerr << "[transport_shm] status_reader 初始化失败\n";
             return false;
         }
     }
@@ -260,6 +285,52 @@ bool TransportShmImpl::RecvCommand(robot_base::Command& cmd) {
     cmd.wz = p.wz;
     cmd.switch_policy = p.switch_policy;
 
+    return true;
+}
+
+// ==================== Control 状态回传通道 ====================
+
+void TransportShmImpl::SendStatus(const robot_base::ControlStatus& status) {
+    if (!status_writer_)
+        return;
+
+    ControlStatusPacket p{};
+    p.header.type = static_cast<uint16_t>(MsgType::CONTROL_STATUS);
+    p.header.seq = ++status_seq_;
+    p.control_mode = static_cast<int8_t>(status.mode);
+    p.zero_ready = status.zero_ready ? 1 : 0;
+    p.hmi_connected = status.hmi_connected ? 1 : 0;
+    p.vx = status.vx;
+    p.vy = status.vy;
+    p.wz = status.wz;
+    p.rl_frequency_hz = status.rl_frequency_hz;
+    std::strncpy(p.active_policy, status.active_policy.c_str(),
+        sizeof(p.active_policy) - 1);
+
+    status_writer_->Write(&p, sizeof(p));
+}
+
+bool TransportShmImpl::RecvStatus(robot_base::ControlStatus& status) {
+    if (!status_reader_)
+        return false;
+
+    ControlStatusPacket p{};
+    std::size_t actual_len = 0;
+    if (!status_reader_->Read(&p, sizeof(p), actual_len))
+        return false;
+    if (actual_len != sizeof(p) ||
+        !ValidHeader(p.header, MsgType::CONTROL_STATUS)) {
+        return false;
+    }
+
+    status.mode = static_cast<robot_base::ControlMode>(p.control_mode);
+    status.zero_ready = (p.zero_ready != 0);
+    status.hmi_connected = (p.hmi_connected != 0);
+    status.vx = p.vx;
+    status.vy = p.vy;
+    status.wz = p.wz;
+    status.rl_frequency_hz = p.rl_frequency_hz;
+    status.active_policy = p.active_policy;
     return true;
 }
 

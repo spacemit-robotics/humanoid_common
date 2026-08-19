@@ -9,6 +9,8 @@
 #include "policy_adapter/policy_adapter.h"
 
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <iostream>
@@ -23,6 +25,57 @@ namespace fs = std::filesystem;
 using behavior_manager::policy_adapter::Config;
 using behavior_manager::policy_adapter::Create;
 using behavior_manager::policy_adapter::LoadConfig;
+
+const char kZip64UnicodeNpz[] =
+    "UEsDBBQAAAAAAAAAIQBVhn5qkAAAAJAAAAAPABQAam9pbnRfbmFtZXMubnB5AQAQAJAAAAAA"
+    "AAAAkAAAAAAAAACTTlVNUFkBAHYAeydkZXNjcic6ICc8VTInLCAnZm9ydHJhbl9vcmRlcic6"
+    "IEZhbHNlLCAnc2hhcGUnOiAoMiwpLCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+    "ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgCmoAAAAwAAAAagAAADEAAABQSwMELQAA"
+    "AAAAAAAhAFglFiP//////////w0AFABqb2ludF9wb3MubnB5AQAQAJAAAAAAAAAAkAAAAAAA"
+    "AACTTlVNUFkBAHYAeydkZXNjcic6ICc8ZjQnLCAnZm9ydHJhbl9vcmRlcic6IEZhbHNlLCAn"
+    "c2hhcGUnOiAoMiwgMiksIH0gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+    "ICAgICAgICAgICAgICAgICAgICAgCs3MzD3NzEy+zcxMPs3MzL1QSwMELQAAAAAAAAAhAE+k"
+    "PBL//////////w0AFABqb2ludF92ZWwubnB5AQAQAJAAAAAAAAAAkAAAAAAAAACTTlVNUFkB"
+    "AHYAeydkZXNjcic6ICc8ZjQnLCAnZm9ydHJhbl9vcmRlcic6IEZhbHNlLCAnc2hhcGUnOiAo"
+    "MiwgMiksIH0gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+    "ICAgICAgICAgICAgCgAAAAAAAAAAAAAAAAAAAABQSwMELQAAAAAAAAAhAFpEfnr/////////"
+    "/w4AFABib2R5X3Bvc193Lm5weQEAEACYAAAAAAAAAJgAAAAAAAAAk05VTVBZAQB2AHsnZGVz"
+    "Y3InOiAnPGY0JywgJ2ZvcnRyYW5fb3JkZXInOiBGYWxzZSwgJ3NoYXBlJzogKDIsIDEsIDMp"
+    "LCB9ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+    "ICAgIAoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABQSwMELQAAAAAAAAAhAOfTumP/////////"
+    "/w8AFABib2R5X3F1YXRfdy5ucHkBABAAoAAAAAAAAACgAAAAAAAAAJNOVU1QWQEAdgB7J2Rl"
+    "c2NyJzogJzxmNCcsICdmb3J0cmFuX29yZGVyJzogRmFsc2UsICdzaGFwZSc6ICgyLCAxLCA0"
+    "KSwgfSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg"
+    "ICAgICAKAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAAAAAAAAAAAABQSwECFAMUAAAAAAAAACEA"
+    "VYZ+apAAAACQAAAADwAAAAAAAAAAAAAAgAEAAAAAam9pbnRfbmFtZXMubnB5UEsBAhQDFAAA"
+    "AAAAAAAhAFglFiOQAAAAkAAAAA0AAAAAAAAAAAAAAIAB0QAAAGpvaW50X3Bvcy5ucHlQSwEC"
+    "FAMUAAAAAAAAACEAT6Q8EpAAAACQAAAADQAAAAAAAAAAAAAAgAGgAQAAam9pbnRfdmVsLm5w"
+    "eVBLAQIUAxQAAAAAAAAAIQBaRH56mAAAAJgAAAAOAAAAAAAAAAAAAACAAW8CAABib2R5X3Bv"
+    "c193Lm5weVBLAQIUAxQAAAAAAAAAIQDn07pjoAAAAKAAAAAPAAAAAAAAAAAAAACAAUcDAABi"
+    "b2R5X3F1YXRfdy5ucHlQSwUGAAAAAAUABQAsAQAAKAQAAAAA";
+
+std::vector<unsigned char> DecodeBase64(const std::string &encoded) {
+    static const char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::vector<unsigned char> decoded;
+    uint32_t accumulator = 0;
+    int bits = -8;
+    for (const char character : encoded) {
+        const char *position = std::strchr(kAlphabet, character);
+        if (!position) {
+            throw std::runtime_error("测试 NPZ 的 base64 数据非法");
+        }
+        accumulator = (accumulator << 6) |
+            static_cast<uint32_t>(position - kAlphabet);
+        bits += 6;
+        if (bits >= 0) {
+            decoded.push_back(static_cast<unsigned char>(
+                (accumulator >> bits) & 0xffU));
+            bits -= 8;
+        }
+    }
+    return decoded;
+}
 
 class TempReference {
 public:
@@ -39,6 +92,36 @@ public:
     }
 
     ~TempReference() {
+        std::error_code error;
+        fs::remove(path_, error);
+    }
+
+    const fs::path &Path() const { return path_; }
+
+private:
+    fs::path path_;
+};
+
+class TempNpzReference {
+public:
+    TempNpzReference() {
+        const auto nonce = std::chrono::steady_clock::now()
+            .time_since_epoch().count();
+        path_ = fs::temp_directory_path() /
+            ("mjlab_zip64_unicode_" + std::to_string(nonce) + ".npz");
+        std::ofstream output(path_, std::ios::binary);
+        if (!output) {
+            throw std::runtime_error("无法创建临时 NPZ 参考动作");
+        }
+        const auto bytes = DecodeBase64(kZip64UnicodeNpz);
+        output.write(reinterpret_cast<const char *>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+        if (!output) {
+            throw std::runtime_error("无法写入临时 NPZ 参考动作");
+        }
+    }
+
+    ~TempNpzReference() {
         std::error_code error;
         fs::remove(path_, error);
     }
@@ -122,6 +205,20 @@ void TestProtomotionsDynamicDimensions() {
     adapter->Reset(MakeTwoDofRobot());
 }
 
+void TestMjlabZip64AndUnicodeMetadata() {
+    const TempNpzReference reference;
+    Config config;
+    config.type = "mjlab";
+    config.reference_file = reference.Path().string();
+    config.anchor_body_index = 0;
+    config.anchor_yaw_align = false;
+
+    auto adapter = Create(config, MakeTwoDofPolicyConfig());
+    Require(adapter && std::string(adapter->Type()) == "mjlab",
+        "未创建兼容 ZIP64 的 MJLab adapter");
+    adapter->Reset(MakeTwoDofRobot());
+}
+
 void TestConfiguredPolicy(const std::string &yaml_path,
     const std::string &robot_dir,
     const std::string &policy_name) {
@@ -154,6 +251,7 @@ int main(int argc, char **argv) {
         }
         TestHolomotionDynamicDimensions();
         TestProtomotionsDynamicDimensions();
+        TestMjlabZip64AndUnicodeMetadata();
         if (argc == 4) {
             TestConfiguredPolicy(argv[1], argv[2], argv[3]);
         }

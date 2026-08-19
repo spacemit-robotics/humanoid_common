@@ -1,0 +1,109 @@
+diff --git a/cnpy.cpp b/cnpy.cpp
+index 2d28578..a08459f 100644
+--- a/cnpy.cpp
++++ b/cnpy.cpp
+@@ -13,0 +14,65 @@
++#include <limits>
++
++namespace {
++
++uint64_t read_little_endian(const char* data, size_t width) {
++    uint64_t value = 0;
++    for(size_t index = 0; index < width; ++index) {
++        value |= static_cast<uint64_t>(
++            static_cast<unsigned char>(data[index])) << (index * 8);
++    }
++    return value;
++}
++
++void resolve_zip64_sizes(const std::vector<char>& extra,
++                         uint64_t& compressed_bytes,
++                         uint64_t& uncompressed_bytes) {
++    const uint64_t marker = std::numeric_limits<uint32_t>::max();
++    const bool needs_uncompressed = uncompressed_bytes == marker;
++    const bool needs_compressed = compressed_bytes == marker;
++    if(!needs_uncompressed && !needs_compressed) return;
++
++    size_t offset = 0;
++    while(offset + 4 <= extra.size()) {
++        const uint16_t header_id = static_cast<uint16_t>(
++            read_little_endian(extra.data() + offset, 2));
++        const size_t data_size = static_cast<size_t>(
++            read_little_endian(extra.data() + offset + 2, 2));
++        offset += 4;
++        if(offset + data_size > extra.size()) {
++            throw std::runtime_error("npz_load: malformed ZIP extra field");
++        }
++        if(header_id != 0x0001) {
++            offset += data_size;
++            continue;
++        }
++
++        size_t value_offset = offset;
++        if(needs_uncompressed) {
++            if(value_offset + 8 > offset + data_size) {
++                throw std::runtime_error("npz_load: missing ZIP64 uncompressed size");
++            }
++            uncompressed_bytes = read_little_endian(
++                extra.data() + value_offset, 8);
++            value_offset += 8;
++        }
++        if(needs_compressed) {
++            if(value_offset + 8 > offset + data_size) {
++                throw std::runtime_error("npz_load: missing ZIP64 compressed size");
++            }
++            compressed_bytes = read_little_endian(
++                extra.data() + value_offset, 8);
++        }
++        return;
++    }
++    throw std::runtime_error("npz_load: missing ZIP64 size extra field");
++}
++
++void skip_bytes(FILE* fp, uint64_t bytes) {
++    if(bytes > static_cast<uint64_t>(std::numeric_limits<long>::max()) ||
++       fseek(fp, static_cast<long>(bytes), SEEK_CUR) != 0) {
++        throw std::runtime_error("npz_load: failed to skip ZIP member");
++    }
++}
++
++}  // namespace
+@@ -301 +366 @@ cnpy::NpyArray cnpy::npz_load(std::string fname, std::string varname) {
+-        //read in the extra field
++        //read in the extra field, including ZIP64 size values when present
+@@ -303 +368,6 @@ cnpy::NpyArray cnpy::npz_load(std::string fname, std::string varname) {
+-        fseek(fp,extra_field_len,SEEK_CUR); //skip past the extra field
++        std::vector<char> extra_field(extra_field_len);
++        if(extra_field_len > 0) {
++            size_t extra_res = fread(&extra_field[0],sizeof(char),extra_field_len,fp);
++            if(extra_res != extra_field_len)
++                throw std::runtime_error("npz_load: failed fread");
++        }
+@@ -306,2 +376,3 @@ cnpy::NpyArray cnpy::npz_load(std::string fname, std::string varname) {
+-        uint32_t compr_bytes = *reinterpret_cast<uint32_t*>(&local_header[0]+18);
+-        uint32_t uncompr_bytes = *reinterpret_cast<uint32_t*>(&local_header[0]+22);
++        uint64_t compr_bytes = read_little_endian(&local_header[18],4);
++        uint64_t uncompr_bytes = read_little_endian(&local_header[22],4);
++        resolve_zip64_sizes(extra_field,compr_bytes,uncompr_bytes);
+@@ -310 +381,14 @@ cnpy::NpyArray cnpy::npz_load(std::string fname, std::string varname) {
+-            NpyArray array  = (compr_method == 0) ? load_the_npy_file(fp) : load_the_npz_array(fp,compr_bytes,uncompr_bytes);
++            NpyArray array;
++            if(compr_method == 0) {
++                array = load_the_npy_file(fp);
++            }
++            else {
++                const uint64_t limit = std::numeric_limits<uint32_t>::max();
++                if(compr_bytes > limit || uncompr_bytes > limit) {
++                    fclose(fp);
++                    throw std::runtime_error("npz_load: ZIP member is too large");
++                }
++                array = load_the_npz_array(fp,
++                    static_cast<uint32_t>(compr_bytes),
++                    static_cast<uint32_t>(uncompr_bytes));
++            }
+@@ -315,3 +399,2 @@ cnpy::NpyArray cnpy::npz_load(std::string fname, std::string varname) {
+-            //skip past the data
+-            uint32_t size = *(uint32_t*) &local_header[22];
+-            fseek(fp,size,SEEK_CUR);
++            //skip the encoded member without parsing unrelated NumPy dtypes
++            skip_bytes(fp,compr_bytes);

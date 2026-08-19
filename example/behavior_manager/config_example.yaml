@@ -1,7 +1,7 @@
 # ============================================================
 # behavior_manager 配置示例
 # ============================================================
-# 演示 FSM 单独使用（不含 RL 策略）的最小配置：POWER_OFF → DAMP → ZERO
+# 演示 FSM 单独使用（不含 RL 策略）的最小配置：POWER_OFF → DAMP → HOME → ZERO
 # 完整 FSM（含 RL 状态）的 yaml 示例参考机型仓库 application/native/humanoid_*/config/
 
 # ============================================================
@@ -11,6 +11,21 @@ robot_base:
   name: "g1"
   num_dof: 29
   robot_dir: "../robot/g1"
+  kp: [100, 100, 100, 150, 40, 40,
+       100, 100, 100, 150, 40, 40,
+       600, 500, 500,
+       40, 40, 40, 40, 20, 10, 10,
+       40, 40, 40, 40, 20, 10, 10]
+  kd: [2, 2, 2, 4, 2, 2,
+       2, 2, 2, 4, 2, 2,
+       15, 12, 12,
+       1, 1, 1, 1, 0.5, 0.2, 0.2,
+       1, 1, 1, 1, 0.5, 0.2, 0.2]
+  default_joint_pos: [-0.1, 0.0, 0.0, 0.3, -0.2, 0.0,
+                      -0.1, 0.0, 0.0, 0.3, -0.2, 0.0,
+                      0.0, 0.0, 0.0,
+                      0.0, 0.2, 0.0, 0.3, 0.0, 0.0, 0.0,
+                      0.0, -0.2, 0.0, 0.3, 0.0, 0.0, 0.0]
   threads:
     rl_infer:
       cpu_id: -1
@@ -28,8 +43,8 @@ robot_base:
 # ============================================================
 # Behavior Manager — FSM 行为管理配置
 # ============================================================
-# 完整 FSM 流程下：ZERO 状态的目标位置和 PD 增益由当前 RL 策略提供
-# （rl_policy.policies.<name>.rl_default_pos / kp / kd）。
+# 完整 FSM 流程下：ZERO 目标位置来自当前 RL 策略，PD 增益由 behavior_manager.zero
+# 独立配置；进入 RL 后立即使用当前策略增益。
 # 本示例不配置 rl_policy 节，演示 behavior_manager 单独使用：
 # ZERO 状态目标位置回退到 behavior_manager.zero_pos。
 behavior_manager:
@@ -40,6 +55,11 @@ behavior_manager:
             0.2, 0.2, 0.2, 0.2, 0.1, 0.04, 0.04,
             0.2, 0.2, 0.2, 0.2, 0.1, 0.04, 0.04]
 
+  # HOME 恢复 robot_base.default_joint_pos；未单独配置 kp/kd 时回退到 robot_base。
+  home:
+    gain_ramp_duration: 0.01
+    move_duration: 0.02
+
   # 回零位置（无 rl_policy 时 ZERO 状态的目标位置 fallback）
   # 完整 FSM（含 rl_policy）会改用 rl_policy.policies.<name>.rl_default_pos
   zero_pos: [-0.1, 0.0, 0.0, 0.3, -0.2, 0.0,
@@ -48,8 +68,10 @@ behavior_manager:
              0.0, 0.2, 0.0, 0.3, 0.0, 0.0, 0.0,
              0.0, -0.2, 0.0, 0.3, 0.0, 0.0, 0.0]
 
-  # 回零时间（秒），ZERO 状态使用五次多项式插值
-  zero_duration: 2.0
+  zero:
+    # 回零时间（秒），ZERO 状态使用五次多项式插值
+    move_duration: 0.02
+    # kp/kd 可选；未配置时回退到 HOME 增益
 
   # 控制周期（秒），主控制循环频率
   control_dt: 0.002

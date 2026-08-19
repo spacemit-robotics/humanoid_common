@@ -157,6 +157,7 @@ void TransportShmImpl::SendState(const robot_base::RobotData& state) {
     p.time = state.time;
     std::memcpy(p.rpy, state.rpy.data(), sizeof(p.rpy));
     std::memcpy(p.gyro, state.gyro.data(), sizeof(p.gyro));
+    std::memcpy(p.acceleration, state.acceleration.data(), sizeof(p.acceleration));
     std::memcpy(p.base_pos, state.base_pos.data(), sizeof(p.base_pos));
     std::memcpy(p.base_quat, state.base_quat.data(), sizeof(p.base_quat));
     std::memcpy(p.base_vel, state.base_vel.data(), sizeof(p.base_vel));
@@ -164,6 +165,13 @@ void TransportShmImpl::SendState(const robot_base::RobotData& state) {
     for (int i = 0; i < p.num_dof; ++i) {
         p.joint_pos[i] = (i < static_cast<int>(state.joint_pos.size())) ? state.joint_pos[i] : 0.0;
         p.joint_vel[i] = (i < static_cast<int>(state.joint_vel.size())) ? state.joint_vel[i] : 0.0;
+        p.joint_torque[i] =
+            (i < static_cast<int>(state.joint_torque.size())) ? state.joint_torque[i] : 0.0;
+        p.joint_temperature[i] = (i < static_cast<int>(state.joint_temperature.size()))
+            ? state.joint_temperature[i]
+            : 0.0;
+        p.joint_error[i] =
+            (i < static_cast<int>(state.joint_error.size())) ? state.joint_error[i] : 0U;
     }
 
     state_writer_->Write(&p, sizeof(p));
@@ -185,6 +193,7 @@ bool TransportShmImpl::RecvState(robot_base::RobotData& state) {
     state.time = p.time;
     std::memcpy(state.rpy.data(), p.rpy, sizeof(p.rpy));
     std::memcpy(state.gyro.data(), p.gyro, sizeof(p.gyro));
+    std::memcpy(state.acceleration.data(), p.acceleration, sizeof(p.acceleration));
     std::memcpy(state.base_pos.data(), p.base_pos, sizeof(p.base_pos));
     std::memcpy(state.base_quat.data(), p.base_quat, sizeof(p.base_quat));
     std::memcpy(state.base_vel.data(), p.base_vel, sizeof(p.base_vel));
@@ -192,6 +201,9 @@ bool TransportShmImpl::RecvState(robot_base::RobotData& state) {
     for (int i = 0; i < state.num_dof; ++i) {
         state.joint_pos[i] = p.joint_pos[i];
         state.joint_vel[i] = p.joint_vel[i];
+        state.joint_torque[i] = p.joint_torque[i];
+        state.joint_temperature[i] = p.joint_temperature[i];
+        state.joint_error[i] = p.joint_error[i];
     }
 
     return true;
@@ -209,10 +221,14 @@ void TransportShmImpl::SendControl(const robot_base::ControlCmd& cmd) {
     p.num_dof = std::clamp(static_cast<int>(cmd.target_pos.size()), 0, kMaxDof);
     p.enable = cmd.enable ? 1 : 0;
     p.control_mode = static_cast<int8_t>(cmd.mode);
+    p.actuation_mode = static_cast<int8_t>(cmd.actuation_mode);
 
     for (int i = 0; i < p.num_dof; ++i) {
         p.target_pos[i] = cmd.target_pos[i];
         p.target_vel[i] = (i < static_cast<int>(cmd.target_vel.size())) ? cmd.target_vel[i] : 0.0;
+        p.target_torque[i] = (i < static_cast<int>(cmd.target_torque.size()))
+            ? cmd.target_torque[i]
+            : 0.0;
         p.kp[i] = (i < static_cast<int>(cmd.kp.size())) ? cmd.kp[i] : 0.0;
         p.kd[i] = (i < static_cast<int>(cmd.kd.size())) ? cmd.kd[i] : 0.0;
     }
@@ -232,16 +248,21 @@ bool TransportShmImpl::RecvControl(robot_base::ControlCmd& cmd) {
         return false;
 
     int ndof = std::clamp(p.num_dof, 0, kMaxDof);
+    const auto actuation_mode = static_cast<robot_base::ActuationMode>(p.actuation_mode);
+    if (!robot_base::IsValidActuationMode(actuation_mode)) return false;
     cmd.enable = (p.enable != 0);
     cmd.mode = static_cast<robot_base::ControlMode>(p.control_mode);
+    cmd.actuation_mode = actuation_mode;
     cmd.target_pos.resize(ndof);
     cmd.target_vel.resize(ndof);
+    cmd.target_torque.resize(ndof);
     cmd.kp.resize(ndof);
     cmd.kd.resize(ndof);
 
     for (int i = 0; i < ndof; ++i) {
         cmd.target_pos[i] = p.target_pos[i];
         cmd.target_vel[i] = p.target_vel[i];
+        cmd.target_torque[i] = p.target_torque[i];
         cmd.kp[i] = p.kp[i];
         cmd.kd[i] = p.kd[i];
     }

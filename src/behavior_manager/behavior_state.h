@@ -5,7 +5,7 @@
  * @file behavior_state.h
  * @brief 行为状态基类与接口定义
  *
- * 定义行为状态的抽象基类 State，规定所有具体状态（POWER_OFF、DAMP、ZERO、RL、SAFETY）
+ * 定义行为状态的抽象基类 State，规定所有具体状态（POWER_OFF、DAMP、HOME、ZERO、RL、SAFETY）
  * 的生命周期接口（OnEnter、Run、CheckTransition、OnExit）和数据指针注入机制。
  */
 

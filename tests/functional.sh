@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# humanoid_common functional 用例：内部模块和 policy_adapter 跑通核心流程。
+# humanoid_common functional 用例：公共模块、policy_adapter 和 driver_runtime 跑通核心流程。
 # 二进制内部已对维度/字段做断言（不一致即非 0 退出），此处再校验退出码 + 成功标志。
 # 由 robot-test 调用，CWD = 模块根，二进制经 staging/bin 在 PATH 中。
 set -uo pipefail
@@ -34,6 +34,7 @@ check test_robot_base         "$EX/robot_base/config_example.yaml"         "测�
 check test_behavior           "$EX/behavior_manager/config_example.yaml"   "测试完成"
 check test_transport_executor "$EX/transport_executor/config_example.yaml" "全部测试完成"
 check_no_args test_policy_adapter "动态维度测试完成"
+check test_driver_runtime     "$EX/driver_runtime/config_example.yaml"     "测试完成"
 
 if [[ "$fail" -ne 0 ]]; then echo "humanoid-common functional: FAILED"; exit 1; fi
 echo "humanoid-common functional: PASS"

@@ -5,7 +5,7 @@
 人形机器人通用控制层，提供三进程（driver / control / hmi）的可执行程序以及它们共用的三个基础库：
 
 - `robot_base` — 统一数据结构与 YAML 配置解析
-- `behavior_manager` — FSM 行为管理（POWER_OFF / DAMP / ZERO / RL / SAFETY）
+- `behavior_manager` — FSM 行为管理（POWER_OFF / DAMP / HOME / ZERO / RL / SAFETY）
 - `transport` — 跨进程通信（UDP / SHM 可切换）
 
 所有机型（g1、asimov、tinker、tiangong、qinglong、go1）共用本模块的二进制，机型差异由各机型仓库的 `config/<robot>.yaml` 描述。
@@ -13,13 +13,13 @@
 ## 功能特性
 
 支持：
-- FSM 完整控制流程（POWER_OFF / DAMP / ZERO / RL / SAFETY 状态切换）
+- FSM 完整控制流程（POWER_OFF / DAMP / HOME / ZERO / RL / SAFETY 状态切换）
 - sim2sim 模式（跳过 FSM，直接 RL 推理，用于算法验证）
 - SHM / UDP 两种通信后端（同机 / 跨机均可）
+- `driver_runtime` 通过 YAML 选择 MuJoCo 或 `whole_body` backend
 - x86_64 与 riscv64（K3 板卡）双平台编译
 
 不支持：
-- 硬件驱动（driver_runtime 当前仅对接 MuJoCo 仿真器）
 - 在线训练或策略更新
 
 ## 快速开始
@@ -30,7 +30,9 @@
 sudo apt install -y libeigen3-dev libyaml-cpp-dev
 ```
 
-本模块还依赖 SDK 内部组件 `model_zoo/rl` 和 `simulation/mujoco`（x86_64），需先完成它们的编译安装。
+本模块还依赖 SDK 内部组件 `model_zoo/rl`。`simulation/mujoco` 和
+`control/whole_body` 分别提供可选 driver backend；至少找到其中一个时才构建
+`driver_runtime`。
 
 ### 构建编译
 
@@ -43,9 +45,9 @@ mm
 
 编译产物安装到 `output/staging/`：
 - `lib/`：`librobot_base.so`、`libbehavior_manager.so`、`libtransport_executor.so`
-- `bin/`：`driver_runtime`（x86_64）、`control_runtime`、`hmi_runtime`、`control_sim2sim_runtime`
+- `bin/`：`driver_runtime`、`control_runtime`、`hmi_runtime`、`control_sim2sim_runtime`
 
-**独立 cmake 编译**（需确保 rl、mujoco 两个组件均经过 mm 编译、产物已安装到 `output/staging/`）：
+**独立 cmake 编译**（需确保 rl 和所需 driver backend 已安装到 `output/staging/`）：
 
 ```bash
 cd application/native/humanoid_common
@@ -82,7 +84,9 @@ scripts/test/robot-test list application/native/humanoid_common
 scripts/test/robot-test run  application/native/humanoid_common --scope pr
 ```
 
-PR 档含 `humanoid-common-functional`（robot_base / behavior_manager / transport_executor 从 example 配置跑通核心流程 + 维度断言）与 `humanoid-common-error-path`（坏/缺配置快速失败），均不依赖硬件。
+PR 档含 `humanoid-common-functional`（前三个公共模块跑通离线流程，driver_runtime
+验证后端解析、能力检测和 factory 分派）与
+`humanoid-common-error-path`（坏/缺配置快速失败），均不依赖硬件。
 
 ## 详细使用
 
@@ -93,17 +97,84 @@ PR 档含 `humanoid-common-functional`（robot_base / behavior_manager / transpo
  │  hmi      │ ───────────▶ │  control      │ ──────────────▶ │  driver      │
  │  _runtime │ ◀─────────── │  _runtime     │ ◀────────────── │  _runtime    │
  └───────────┘ ControlStatus│  (FSM + RL)   │   robot state   │  (MuJoCo /   │
-                            └───────────────┘                 │   硬件驱动)  │
+                            └───────────────┘                 │ whole_body)  │
                                                               └──────────────┘
 ```
+
+### Driver backend
+
+机型 YAML 通过以下字段选择 driver：
+
+```yaml
+driver:
+  backend: mujoco       # 或 whole_body
+```
+
+旧配置缺少该字段时默认选择 `mujoco`。`driver_runtime` 只负责 transport、信号和
+backend 生命周期；MuJoCo 与整机硬件细节分别封装在私有 adapter 中，不进入 common
+公共 API。选择了当前构建未包含的 backend 时，进程会在启动阶段明确失败。
+
+`RobotData` 在原位置/速度基础上携带关节力矩、温度、错误码和 IMU 加速度；
+`ControlCmd` 携带执行器模式及位置、速度、力矩、KP/KD 命令。力矩向量为空时
+按全零处理。SHM/UDP 使用同一版二进制协议，协议版本不匹配会拒绝数据包，
+不会静默按旧布局解析。
+
+### Runtime 日志
+
+日志是 common 内部能力，不进入公开头文件，也不扩展 `RobotData` 或 SHM 协议。
+机型 YAML 可按需启用：
+
+```yaml
+logging:
+  level: debug
+  directory: "../../../../log/humanoid"  # 相对当前机型 YAML
+  console:
+    enabled: true
+  file:
+    enabled: true
+    max_size_mb: 32
+    max_files: 3
+  queue_capacity: 8192
+  telemetry:
+    enabled: true
+    rate_hz: 20
+  driver_monitor:
+    enabled: true
+    rate_hz: 2
+```
+
+未配置时保留原控制行为且不落盘。启用后，每个 runtime 建立独立 session 目录：
+`events.log` 记录生命周期、FSM、策略和错误；driver 记录物理电机、虚拟关节和 IMU
+CSV；control 记录控制状态以及关节目标/反馈 CSV。driver 终端以固定屏限频刷新，
+不会按控制频率刷屏。落盘由有界后台队列完成，磁盘跟不上时丢弃日志并记录丢弃数，
+不会阻塞控制循环。
+
+### 执行器模式
+
+`ControlMode` 和 `ActuationMode` 是两个正交的语义层：
+
+- `ControlMode` 表示 `POWER_OFF/DAMP/HOME/ZERO/RL/SAFETY` 行为与安全状态。
+- `ActuationMode` 表示整条命令中哪些字段是执行器的主目标。
+
+| `ActuationMode` | 命令语义 |
+| --- | --- |
+| `HYBRID` | 阻抗控制：`kp * (target_pos - q) + kd * (target_vel - dq) + target_torque`，其中 `target_torque` 是前馈项 |
+| `POSITION` | 位置闭环，`target_pos` 为主目标 |
+| `VELOCITY` | 速度闭环，`target_vel` 为主目标 |
+| `TORQUE` | 力矩控制，`target_torque` 是直接目标力矩 |
+
+当前 FSM 和已有 RL 策略均输出 `HYBRID`，且前馈力矩默认为零，因此不改变
+现有机型行为。whole_body backend 会将该模式映射到 motor 组件；MuJoCo backend
+当前仅接受 `HYBRID/POSITION`，且不支持非零前馈力矩，传入时会明确报错。
 
 ### PD 增益数据流
 
 kp/kd 在不同阶段由不同来源提供，配置上分散在两个 yaml 节点：
 
-- **driver 启动期**：`driver_runtime` 读取 `robot_base.kp/kd/default_joint_pos`，作为 MuJoCo 仿真的初始 PD 增益与默认站立姿态。
-- **RL 控制期**：进入 RL 状态后，control 端每帧通过 `ControlCmd.kp/kd` 下发当前策略训练时的真实增益（来自 `rl_policy.policies.<name>.kp/kd`），driver 端原样转发给 MuJoCo，不再使用启动期的默认值。
-- **ZERO/DAMP 阶段**：ZERO 优先用当前策略的可选 `zero_target_pos`（动作起始姿态与训练默认差距大的 tracking 类策略用），未配置时用 `rl_default_pos`，kp/kd 同策略（无策略时回退到 `behavior_manager.zero_pos`，kp/kd 由 robot_base 兜底）；DAMP 用 `behavior_manager.damp_kd`（≈ policy kd / 5）。
+- **MuJoCo 启动期**：MuJoCo backend 读取 `robot_base.kp/kd/default_joint_pos`，作为仿真的初始 PD 增益与默认站立姿态。
+- **HOME 阶段**：从当前实机关节位置先平滑建立增益，再恢复到 `robot_base.default_joint_pos`；可用 `behavior_manager.home` 单独配置时长和 kp/kd。
+- **RL 控制期**：进入 RL 状态后，control 端每帧通过 `ControlCmd.kp/kd` 下发当前策略训练时的真实增益（来自 `rl_policy.policies.<name>.kp/kd`），driver backend 转发给实际执行组件。
+- **ZERO/DAMP 阶段**：ZERO 优先用当前策略的可选 `zero_target_pos`，未配置时用 `rl_default_pos`；机型可配置独立 ZERO 安全增益，进入 RL 后立即使用当前策略增益。未配置 ZERO 增益的已有机型保持原有策略增益行为；DAMP 使用 `behavior_manager.damp_kd`。
 
 ### 策略链调度（prerequisite chain）
 
@@ -157,12 +228,12 @@ CSV，并可追加 `future_frames/context_length` 或 `future_steps`。策略若
 
 ### ControlMode 数据流（control → driver）
 
-`ControlCmd.mode` 是 control 端发给 driver 的通用控制语义字段（`enum class ControlMode { POWER_OFF, DAMP, ZERO, RL, SAFETY }`），driver 据此自主决定后端行为：
+`ControlCmd.mode` 是 control 端发给 driver 的通用控制语义字段（`enum class ControlMode { POWER_OFF, DAMP, ZERO, RL, SAFETY, HOME }`），driver 据此自主决定后端行为：
 
 - **三进程 FSM 模式**：`control_runtime` 把 `bm.CurrentState()` 透传到 `ctrl.mode`
 - **sim2sim 模式**：`control_sim2sim_runtime` 始终发 `ControlMode::RL`
 - **mujoco driver**：边沿检测 mode 变化—— `RL` → 自动取消悬挂保护，`POWER_OFF` → 自动启用悬挂；其余 mode 不主动覆盖（保留 mujoco 界面 F 键的手动权限）
-- **实机 driver**：可忽略此字段，或用于状态阈值/恢复策略/遥测打点
+- **whole_body driver**：转换为整机控制模式，并由组件本地安全门控与 watchdog 约束
 
 设计原则：跨层接口字段必须用通用语义，禁止携带某一具体后端（mujoco 悬挂等）的私有概念。
 
@@ -184,7 +255,7 @@ RL 频率均来自 control 端回传，不在 HMI 本地预判。主界面用左
 | `空格` | 速度清零 |
 | `Esc` / `v` | 退出速度页并清零 |
 
-`o/z/r` 保留为兼容快捷键，但合法性仍由 control 端 FSM 校验。HMI 以配置频率发送
+`o/h/z/r` 保留为兼容快捷键，但合法性仍由 control 端 FSM 校验。HMI 以配置频率发送
 心跳；退出速度页、离开 RL、HMI 退出或心跳超时都会清零速度。按键步长和通信超时在
 YAML 的 `hmi` 节点配置；速度范围由应用层在每个策略的
 `command.limits.{max_vx,max_vy,max_wz}` 中声明。未声明范围的策略不接受速度命令。
@@ -204,9 +275,9 @@ YAML 的 `hmi` 节点配置；速度范围由应用层在每个策略的
 | 现象 | 处理 |
 | --- | --- |
 | cmake 报 `rl not found` | 先编译安装 `components/model_zoo/rl`，确认 `--prefix` 路径一致 |
-| cmake 报 `mujoco_sim not found` | 先编译安装 `components/simulation/mujoco`（仅 x86_64 需要） |
+| `driver_runtime` 未生成 | 先编译安装 `components/simulation/mujoco` 或 `components/control/whole_body` |
+| YAML 选择的 backend unavailable | 编译对应组件后重新编译 `humanoid_common` |
 | control_runtime 启动后无数据 | 检查 YAML 中 `transport.type` 及 IP 配置，确认 driver/control 两端可互相 ping 通 |
-| K3 板卡上 driver_runtime 不存在 | 正常现象，driver_runtime 仅在 x86_64 上编译 |
 
 ## 版本与发布
 

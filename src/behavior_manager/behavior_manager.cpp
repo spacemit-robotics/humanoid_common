@@ -13,14 +13,19 @@
 
 #include "behavior_manager.h"  // 对外接口，位于 include/
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "behavior_fsm.h"      // 内部实现，位于 src/
+#include "runtime_logger.h"
 #include "state_factory.h"     // 内部实现，位于 src/
 namespace behavior_manager {
 
@@ -36,12 +41,36 @@ const char *StateNameStr(StateName s) {
         return "RL";
     case StateName::SAFETY:
         return "SAFETY";
+    case StateName::HOME:
+        return "HOME";
     default:
         return "UNKNOWN";
     }
 }
 
 namespace {
+
+void ValidateJointVector(const std::vector<double> &values,
+        int num_dof,
+        const std::string &path) {
+    if (static_cast<int>(values.size()) != num_dof) {
+        throw std::runtime_error("[BehaviorManager] " + path + " 维度与 num_dof 不一致");
+    }
+    for (double value : values) {
+        if (!std::isfinite(value)) {
+            throw std::runtime_error("[BehaviorManager] " + path + " 包含非有限值");
+        }
+    }
+}
+
+void ValidateGainVector(const std::vector<double> &values,
+                        int num_dof,
+                        const std::string &path) {
+    ValidateJointVector(values, num_dof, path);
+    if (std::any_of(values.begin(), values.end(), [](double value) { return value < 0.0; })) {
+        throw std::runtime_error("[BehaviorManager] " + path + " 包含负增益");
+    }
+}
 
 RLConfig ToRLConfig(const rl_policy::LoadedPolicyConfig &loaded_cfg) {
     RLConfig rc;
@@ -65,6 +94,13 @@ void LoadBehaviorPolicyFields(const std::string &yaml_path,
         policy_adapter::LoadConfig(yaml_path, policy_name, robot_dir);
     rc.zero_target_pos =
         yaml.Read<std::vector<double>>(base + ".zero_target_pos").value_or(std::vector<double>{});
+    rc.entry_target_transition_duration =
+        yaml.Read<double>(base + ".entry_target_transition_duration").value_or(0.0);
+    if (!std::isfinite(rc.entry_target_transition_duration) ||
+        rc.entry_target_transition_duration < 0.0) {
+        throw std::runtime_error(
+            "[BehaviorManager] " + base + ".entry_target_transition_duration 配置无效");
+    }
 }
 
 }  // namespace
@@ -78,6 +114,8 @@ public:
     std::string config_path;
     std::string robot_dir;  // 机器人资源根目录（绝对路径）
     double zero_duration = 2.0;               // 回零时长（秒），策略切换时重建 ZERO 需要
+    std::vector<double> zero_kp;
+    std::vector<double> zero_kd;
     bool initialized = false;
     std::string pending_policy;               // 待生效的策略名
     std::string active_policy;                // 当前已加载的策略名
@@ -119,12 +157,21 @@ public:
         std::cout << "[BehaviorManager] 机器人: " << sensor.name << ", 自由度: " << num_dof
                 << std::endl;
 
-        // 加载 ZERO 状态目标关节位置
+        const auto default_joint_pos =
+            yaml_file.Read<std::vector<double>>("robot_base.default_joint_pos").value_or(
+                std::vector<double>{});
+        const auto robot_kp = yaml_file.Read<std::vector<double>>("robot_base.kp").value_or(
+            std::vector<double>{});
+        const auto robot_kd = yaml_file.Read<std::vector<double>>("robot_base.kd").value_or(
+            std::vector<double>{});
+        ValidateJointVector(default_joint_pos, num_dof, "robot_base.default_joint_pos");
+        ValidateGainVector(robot_kp, num_dof, "robot_base.kp");
+        ValidateGainVector(robot_kd, num_dof, "robot_base.kd");
+
+        // 无 RL 时，ZERO 默认回退到机型默认姿态。
         auto zero_pos_opt = yaml_file.Read<std::vector<double>>("behavior_manager.zero_pos");
-        std::vector<double> zero_pos = zero_pos_opt.value_or(std::vector<double>(num_dof, 0.0));
-        if (!zero_pos_opt) {
-            std::cout << "[BehaviorManager] 警告: 未配置 zero_pos，使用零位" << std::endl;
-        }
+        std::vector<double> zero_pos = zero_pos_opt.value_or(default_joint_pos);
+        ValidateJointVector(zero_pos, num_dof, "behavior_manager.zero_pos");
 
         // 加载 PD 参数（仅 damp_kd，RL 策略 kp/kd 由各策略配置独立提供）
         auto load_array = [&](const std::string &key) {
@@ -132,25 +179,63 @@ public:
                 .value_or(std::vector<double>{});
         };
 
-        // 加载回零时间（缓存供策略切换时重建 ZERO 使用）
-        zero_duration = yaml_file.Read<double>("behavior_manager.zero_duration").value_or(2.0);
+        // 缓存状态参数，供初始注册和运行时策略切换共同使用。
+        const double legacy_zero_duration =
+            yaml_file.Read<double>("behavior_manager.zero_duration").value_or(2.0);
+        zero_duration = yaml_file.Read<double>("behavior_manager.zero.move_duration")
+            .value_or(legacy_zero_duration);
+        const double home_gain_ramp_duration =
+            yaml_file.Read<double>("behavior_manager.home.gain_ramp_duration").value_or(1.0);
+        const double home_move_duration =
+            yaml_file.Read<double>("behavior_manager.home.move_duration").value_or(5.0);
+        if (!std::isfinite(zero_duration) || zero_duration <= 0.0 ||
+            !std::isfinite(home_gain_ramp_duration) || home_gain_ramp_duration <= 0.0 ||
+            !std::isfinite(home_move_duration) || home_move_duration <= 0.0) {
+            throw std::runtime_error("[BehaviorManager] HOME/ZERO 切换时长配置无效");
+        }
+
+        const auto home_kp =
+            yaml_file.Read<std::vector<double>>("behavior_manager.home.kp").value_or(robot_kp);
+        const auto home_kd =
+            yaml_file.Read<std::vector<double>>("behavior_manager.home.kd").value_or(robot_kd);
+        ValidateGainVector(home_kp, num_dof, "behavior_manager.home.kp");
+        ValidateGainVector(home_kd, num_dof, "behavior_manager.home.kd");
+        const auto zero_kp_opt =
+            yaml_file.Read<std::vector<double>>("behavior_manager.zero.kp");
+        const auto zero_kd_opt =
+            yaml_file.Read<std::vector<double>>("behavior_manager.zero.kd");
+        if (zero_kp_opt.has_value() != zero_kd_opt.has_value()) {
+            throw std::runtime_error(
+                "[BehaviorManager] behavior_manager.zero.kp/kd 必须同时配置");
+        }
+        if (zero_kp_opt) {
+            zero_kp = *zero_kp_opt;
+            zero_kd = *zero_kd_opt;
+            ValidateGainVector(zero_kp, num_dof, "behavior_manager.zero.kp");
+            ValidateGainVector(zero_kd, num_dof, "behavior_manager.zero.kd");
+        }
 
         // 初始化输出维度
         output.target_pos.assign(num_dof, 0.0);
         output.target_vel.assign(num_dof, 0.0);
+        output.target_torque.assign(num_dof, 0.0);
 
         // 加载 DAMP 状态阻尼 kd
         std::vector<double> damp_kd = load_array("damp_kd");
         if (damp_kd.empty()) {
             throw std::runtime_error("[BehaviorManager] 缺少配置项 behavior_manager.damp_kd");
         }
+        ValidateGainVector(damp_kd, num_dof, "behavior_manager.damp_kd");
 
         // 注册固定状态
         fsm.AddState(StateName::POWER_OFF, CreateStatePowerOff());
         fsm.AddState(StateName::DAMP, CreateStateDamp(damp_kd));
+        fsm.AddState(StateName::HOME,
+            CreateStateHome(default_joint_pos, home_gain_ramp_duration,
+                            home_move_duration, home_kp, home_kd));
 
         // RL 状态配置：调用 policy_executor 提供的统一解析接口
-        // ZERO 状态在 RL 策略加载后注册，使用策略的 rl_default_pos 和 kp/kd
+        // ZERO 目标位置跟随当前策略，控制增益使用 behavior_manager.zero。
         auto rl_type_opt = yaml_file.Read<std::string>("rl_policy.type");
         if (rl_type_opt) {
             const std::string rl_type = rl_type_opt.value();
@@ -175,9 +260,11 @@ public:
             // ZERO 状态目标位姿：优先用 zero_target_pos（如果配了），否则用 rl_default_pos
             const auto &effective_zero_pos = rc.zero_target_pos.empty()
                 ? loaded_cfg.exec_cfg.rl_default_pos : rc.zero_target_pos;
+            const auto &effective_zero_kp = zero_kp.empty() ? loaded_cfg.kp : zero_kp;
+            const auto &effective_zero_kd = zero_kd.empty() ? loaded_cfg.kd : zero_kd;
             fsm.AddState(StateName::ZERO,
                 CreateStateZero(effective_zero_pos, zero_duration,
-                                loaded_cfg.kp, loaded_cfg.kd));
+                                effective_zero_kp, effective_zero_kd));
 
             fsm.AddState(StateName::RL, CreateStateRl(rc));
             has_rl = true;
@@ -199,8 +286,12 @@ public:
                 }
             }
         } else {
-            // 无 RL 策略时 ZERO 回退到 yaml 配置的 zero_pos（空 kp/kd 由 mujoco robot_base 兜底）
-            fsm.AddState(StateName::ZERO, CreateStateZero(zero_pos, zero_duration, {}, {}));
+            // 无 RL 策略时，ZERO 使用独立安全增益和可选 zero_pos。
+            const auto &effective_zero_kp = zero_kp.empty() ? home_kp : zero_kp;
+            const auto &effective_zero_kd = zero_kd.empty() ? home_kd : zero_kd;
+            fsm.AddState(StateName::ZERO,
+                CreateStateZero(
+                    zero_pos, zero_duration, effective_zero_kp, effective_zero_kd));
             std::cout << "[BehaviorManager] RL 状态: 未配置" << std::endl;
         }
 
@@ -243,17 +334,27 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
             // （前置链到期后会在 RL 状态触发 RL→RL 重建，需走 OnExit/OnEnter 重置 LSTM 隐状态）
             const auto &effective_zero_pos = rc.zero_target_pos.empty()
                 ? loaded_cfg.exec_cfg.rl_default_pos : rc.zero_target_pos;
+            const auto &effective_zero_kp =
+                impl_->zero_kp.empty() ? loaded_cfg.kp : impl_->zero_kp;
+            const auto &effective_zero_kd =
+                impl_->zero_kd.empty() ? loaded_cfg.kd : impl_->zero_kd;
             impl_->fsm.ReplaceState(StateName::ZERO,
                 CreateStateZero(effective_zero_pos, impl_->zero_duration,
-                                loaded_cfg.kp, loaded_cfg.kd));
+                                effective_zero_kp, effective_zero_kd));
             impl_->fsm.ReplaceState(StateName::RL, CreateStateRl(rc));
 
             impl_->active_policy = impl_->pending_policy;
             impl_->prerequisite_timer = 0.0;  // 切换后重置计时（仅前置策略生效时再启用）
             std::cout << "[BehaviorManager] 策略已切换: " << impl_->active_policy << " ("
                     << rc.policy.model_path << ")" << std::endl;
+            runtime_logging::Log(runtime_logging::Level::kInfo,
+                "policy switched: " + impl_->active_policy + " (" +
+                    rc.policy.model_path + ")",
+                false);
         } catch (const std::exception &e) {
             std::cerr << "[BehaviorManager] 策略切换失败: " << e.what() << std::endl;
+            runtime_logging::Log(runtime_logging::Level::kError,
+                std::string("policy switch failed: ") + e.what(), false);
             impl_->pending_policy = impl_->active_policy;  // 回滚
             impl_->final_target_policy.clear();
             impl_->waiting_prerequisite = false;
@@ -272,6 +373,10 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
             std::cout << "[BehaviorManager] 前置策略 " << impl_->active_policy << " 运行 "
                     << impl_->prerequisite_timer << "s 完成，自动切换至目标策略 "
                     << impl_->final_target_policy << std::endl;
+            runtime_logging::Log(runtime_logging::Level::kInfo,
+                "prerequisite policy completed: " + impl_->active_policy +
+                    " -> " + impl_->final_target_policy,
+                false);
             impl_->pending_policy = impl_->final_target_policy;
             impl_->final_target_policy.clear();
             impl_->waiting_prerequisite = false;
@@ -281,6 +386,8 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
     if (impl_->waiting_prerequisite &&
         impl_->prev_fsm_state == StateName::RL && cur == StateName::POWER_OFF) {
         std::cout << "[BehaviorManager] RL → POWER_OFF，取消前置链调度" << std::endl;
+        runtime_logging::Log(runtime_logging::Level::kWarning,
+            "prerequisite policy chain cancelled by RL -> POWER_OFF", false);
         impl_->final_target_policy.clear();
         impl_->waiting_prerequisite = false;
         impl_->prerequisite_timer = 0.0;
@@ -315,6 +422,9 @@ void BehaviorManagerClass::SetCommand(const robot_base::Command &cmd) {
         impl_->waiting_prerequisite = true;
         std::cout << "[BehaviorManager] 策略链调度: " << it->second.policy << " ("
                 << it->second.duration << "s) → " << target << std::endl;
+        runtime_logging::Log(runtime_logging::Level::kInfo,
+            "policy chain scheduled: " + it->second.policy + " -> " + target,
+            false);
     } else {
         // 无前置链：直接切目标策略，并清除可能残留的前置链状态
         impl_->pending_policy = target;

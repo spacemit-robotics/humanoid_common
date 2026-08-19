@@ -6,6 +6,7 @@
   <description>Humanoid robot shared layer: robot_base, behavior_manager, transport, and runtime processes</description>
   <depend>rl</depend>
   <depend>mujoco</depend>
+  <depend option_key="enabled_backends" option_value="whole_body">whole_body</depend>
   <system_depend check="pkg-config --exists eigen3">libeigen3-dev</system_depend>
   <system_depend check="pkg-config --exists yaml-cpp">libyaml-cpp-dev</system_depend>
 

@@ -28,7 +28,7 @@ namespace transport {
 // ==================== 协议常量 ====================
 
 static constexpr uint32_t kMagic = 0x484D5253;  ///< "HMRS" 魔数
-static constexpr uint16_t kVersion = 1;         ///< 协议版本
+static constexpr uint16_t kVersion = 4;         ///< 协议版本
 static constexpr int kMaxDof = 64;              ///< 最大自由度数
 
 // ==================== 消息类型 ====================
@@ -75,6 +75,7 @@ struct RobotStatePacket {
     double time = 0.0;
     double rpy[3] = {0.0, 0.0, 0.0};
     double gyro[3] = {0.0, 0.0, 0.0};
+    double acceleration[3] = {0.0, 0.0, 0.0};
     // base_pos / base_quat / base_vel 用于 motion tracking 等需要全局位姿/速度的 RL 策略
     // dance/kungfu/motion 这类用 rpy+gyro 就够，这几项可保持默认值
     double base_pos[3] = {0.0, 0.0, 0.0};        ///< 世界系位置 (m)
@@ -82,6 +83,9 @@ struct RobotStatePacket {
     double base_vel[6] = {0.0};                  ///< 线速度+角速度 (m/s, rad/s)
     double joint_pos[kMaxDof] = {0.0};
     double joint_vel[kMaxDof] = {0.0};
+    double joint_torque[kMaxDof] = {0.0};
+    double joint_temperature[kMaxDof] = {0.0};
+    uint32_t joint_error[kMaxDof] = {0};
 };
 
 /**
@@ -91,9 +95,13 @@ struct ControlCmdPacket {
     PacketHeader header{};
     int32_t num_dof = 0;
     uint8_t enable = 0;
-    int8_t control_mode = 0;  // robot_base::ControlMode（POWER_OFF=0/DAMP=1/ZERO=2/RL=3/SAFETY=4）
+    // robot_base::ControlMode: POWER_OFF/DAMP/HOME/ZERO/RL/SAFETY.
+    int8_t control_mode = 0;
+    // robot_base::ActuationMode: HYBRID/POSITION/VELOCITY/TORQUE.
+    int8_t actuation_mode = 0;
     double target_pos[kMaxDof] = {0.0};
     double target_vel[kMaxDof] = {0.0};
+    double target_torque[kMaxDof] = {0.0};
     double kp[kMaxDof] = {0.0};
     double kd[kMaxDof] = {0.0};
 };

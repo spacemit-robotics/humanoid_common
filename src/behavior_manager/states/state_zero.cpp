@@ -32,6 +32,8 @@ public:
 
         // 恢复 kp/kd（从 POWER_OFF 清零状态恢复）
         if (output_) {
+            output_->actuation_mode = robot_base::ActuationMode::HYBRID;
+            output_->target_torque.assign(default_pos_.size(), 0.0);
             output_->kp = kp_;
             output_->kd = kd_;
         }

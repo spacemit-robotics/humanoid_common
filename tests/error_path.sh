@@ -18,6 +18,7 @@ expect_fail() {  # $@ = 待执行命令
 expect_fail test_robot_base /nonexistent/path.yaml      # 坏配置路径
 expect_fail test_behavior                               # 缺参
 expect_fail test_transport_executor                     # 缺参
+expect_fail test_driver_runtime                         # 缺参
 
 if [[ "$fail" -ne 0 ]]; then echo "humanoid-common error-path: FAILED"; exit 1; fi
 echo "humanoid-common error-path: PASS"

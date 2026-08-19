@@ -226,22 +226,14 @@ private:
     void LoadReference() {
         std::cout << "[policy_adapter] 加载 MJLab NPZ: "
             << config_.reference_file << std::endl;
-        cnpy::npz_t archive = cnpy::npz_load(config_.reference_file);
-        auto require_key = [&archive](const std::string &key) {
-            if (archive.find(key) == archive.end()) {
-                throw std::runtime_error(
-                    "[policy_adapter] MJLab NPZ 缺少字段: " + key);
-            }
-        };
-        require_key("joint_pos");
-        require_key("joint_vel");
-        require_key("body_pos_w");
-        require_key("body_quat_w");
-
-        const auto &joint_pos = archive["joint_pos"];
-        const auto &joint_vel = archive["joint_vel"];
-        const auto &body_pos = archive["body_pos_w"];
-        const auto &body_quat = archive["body_quat_w"];
+        const auto joint_pos =
+            cnpy::npz_load(config_.reference_file, "joint_pos");
+        const auto joint_vel =
+            cnpy::npz_load(config_.reference_file, "joint_vel");
+        const auto body_pos =
+            cnpy::npz_load(config_.reference_file, "body_pos_w");
+        const auto body_quat =
+            cnpy::npz_load(config_.reference_file, "body_quat_w");
 
         auto require = [](bool condition, const std::string &message) {
             if (!condition) {

@@ -27,6 +27,7 @@
 
 #include "transport_executor.h"
 #include "behavior_manager.h"
+#include "policy_command_limits.h"
 #include "robot_base.h"
 using behavior_manager::BehaviorManagerClass;
 using behavior_manager::StateNameStr;
@@ -35,12 +36,6 @@ namespace {
 volatile std::sig_atomic_t g_running = 1;
 void OnSignal(int) {
     g_running = 0;
-}
-
-float ClampVelocity(float value, float limit) {
-    if (!std::isfinite(value)) return 0.0f;
-    const float bound = std::max(0.0f, std::abs(limit));
-    return std::clamp(value, -bound, bound);
 }
 }  // namespace
 
@@ -59,8 +54,10 @@ int main(int argc, char *argv[]) {
 
     // 从配置读取控制频率参数
     robot_base::YamlFile yaml_file;
+    runtime_config::PolicyCommandLimitMap policy_command_limits;
     try {
         yaml_file = robot_base::YamlFile::Load(yaml_path);
+        policy_command_limits = runtime_config::LoadPolicyCommandLimits(yaml_file);
     } catch (const std::exception &e) {
         std::cerr << e.what() << "\n"
             << "用法: " << argv[0] << " <config.yaml>\n";
@@ -77,17 +74,11 @@ int main(int argc, char *argv[]) {
     // rl_policy.rl_dt: RL 推理周期（对应训练时的推理频率）
     float rl_dt = static_cast<float>(yaml_file.Read<double>("rl_policy.rl_dt").value_or(0.02));
 
-    // HMI 心跳与速度安全边界。界面也会限幅，但 control 端必须独立兜底。
+    // HMI 心跳边界；速度范围由应用层每个策略的 command.limits 提供。
     const double hmi_command_timeout = std::max(
         0.1, yaml_file.Read<double>("hmi.command_timeout").value_or(0.5));
     const double status_hz = std::max(
         1.0, yaml_file.Read<double>("hmi.status_hz").value_or(20.0));
-    const float max_vx = static_cast<float>(
-        yaml_file.Read<double>("hmi.velocity.max_vx").value_or(0.8));
-    const float max_vy = static_cast<float>(
-        yaml_file.Read<double>("hmi.velocity.max_vy").value_or(0.4));
-    const float max_wz = static_cast<float>(
-        yaml_file.Read<double>("hmi.velocity.max_wz").value_or(1.0));
 
     // 初始化行为管理器
     BehaviorManagerClass bm(yaml_path);
@@ -123,9 +114,6 @@ int main(int argc, char *argv[]) {
         {
             robot_base::Command hmi;
             while (transport->RecvCommand(hmi)) {
-                hmi.vx = ClampVelocity(hmi.vx, max_vx);
-                hmi.vy = ClampVelocity(hmi.vy, max_vy);
-                hmi.wz = ClampVelocity(hmi.wz, max_wz);
                 cmd = hmi;
                 has_hmi = true;
                 last_hmi_time = std::chrono::steady_clock::now();
@@ -154,7 +142,11 @@ int main(int argc, char *argv[]) {
             cmd.wz = 0.0f;
             cmd.switch_policy.clear();
         }
-        if (bm.CurrentState() != behavior_manager::StateName::RL) {
+        if (bm.CurrentState() == behavior_manager::StateName::RL) {
+            const auto *limits = runtime_config::FindPolicyCommandLimits(
+                policy_command_limits, bm.CurrentPolicyName());
+            runtime_config::ApplyPolicyCommandLimits(limits, &cmd);
+        } else {
             // 禁止在非 RL 状态预置速度，避免进入 RL 时突然起步。
             cmd.vx = 0.0f;
             cmd.vy = 0.0f;

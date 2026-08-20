@@ -217,6 +217,17 @@ target_include_directories(test_robot_base PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/i
 target_link_libraries(test_robot_base PRIVATE robot_base)
 install(TARGETS test_robot_base RUNTIME DESTINATION bin)
 
+add_executable(test_policy_command_limits
+    example/runtime/test_policy_command_limits.cpp)
+target_include_directories(test_policy_command_limits PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime)
+target_compile_definitions(test_policy_command_limits PRIVATE
+    "POLICY_COMMAND_LIMITS_TEST_CONFIG=\"${CMAKE_CURRENT_SOURCE_DIR}/example/runtime/policy_command_limits.yaml\"")
+target_link_libraries(test_policy_command_limits PRIVATE robot_base)
+enable_testing()
+add_test(NAME policy_command_limits COMMAND test_policy_command_limits)
+
 add_executable(test_transport_executor example/transport_executor/test_transport_executor.cpp)
 target_include_directories(test_transport_executor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(test_transport_executor PRIVATE transport_executor robot_base)

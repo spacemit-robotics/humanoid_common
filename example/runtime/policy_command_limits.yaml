@@ -1,0 +1,13 @@
+rl_policy:
+  onnx_infer:
+    policy_names: [walk, wave]
+    policies:
+      walk:
+        command:
+          limits:
+            max_vx: 1.5
+            max_vy: 0.5
+            max_wz: 2.2
+      wave:
+        command:
+          init: [0.0, 0.0, 0.0]

@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "policy_command_limits.h"
 #include "robot_base.h"
 #include "transport_executor.h"
 
@@ -177,14 +178,12 @@ struct HmiConfig {
     float step_vx = 0.1f;
     float step_vy = 0.1f;
     float step_wz = 0.1f;
-    float max_vx = 0.8f;
-    float max_vy = 0.4f;
-    float max_wz = 1.0f;
 };
 
 struct UiConfig {
     HmiConfig hmi;
     std::vector<std::string> policies;
+    runtime_config::PolicyCommandLimitMap command_limits;
     int default_policy_idx = 0;
 };
 
@@ -220,12 +219,7 @@ UiConfig LoadUiConfig(const std::string &yaml_path) {
         yaml.Read<double>("hmi.velocity.step_vy").value_or(0.1)));
     config.hmi.step_wz = static_cast<float>(std::abs(
         yaml.Read<double>("hmi.velocity.step_wz").value_or(0.1)));
-    config.hmi.max_vx = static_cast<float>(std::abs(
-        yaml.Read<double>("hmi.velocity.max_vx").value_or(0.8)));
-    config.hmi.max_vy = static_cast<float>(std::abs(
-        yaml.Read<double>("hmi.velocity.max_vy").value_or(0.4)));
-    config.hmi.max_wz = static_cast<float>(std::abs(
-        yaml.Read<double>("hmi.velocity.max_wz").value_or(1.0)));
+    config.command_limits = runtime_config::LoadPolicyCommandLimits(yaml);
     return config;
 }
 
@@ -252,6 +246,7 @@ struct UiState {
     robot_base::Command target_command;
     PendingTransition transition;
     std::vector<std::string> policies;
+    runtime_config::PolicyCommandLimitMap command_limits;
     int active_policy_idx = 0;
     int policy_cursor_idx = 0;
     std::string pending_policy;
@@ -261,6 +256,12 @@ struct UiState {
     int highlighted_key = -1;
     Clock::time_point highlight_until{};
 };
+
+const runtime_config::PolicyCommandLimits *ActiveCommandLimits(
+        const UiState &state) {
+    return runtime_config::FindPolicyCommandLimits(
+        state.command_limits, state.status.active_policy);
+}
 
 const char *ModeName(ControlMode mode) {
     switch (mode) {
@@ -778,10 +779,13 @@ void ProcessStatus(UiState *state, const robot_base::ControlStatus &status,
         }
     }
 
-    if (state->page == HmiPage::VELOCITY && status.mode != ControlMode::RL) {
+    if (state->page == HmiPage::VELOCITY &&
+        (status.mode != ControlMode::RL || !ActiveCommandLimits(*state))) {
         ZeroVelocity(state);
         state->page = HmiPage::MAIN;
-        state->last_action = "已离开 RL，速度清零并返回主界面";
+        state->last_action = status.mode == ControlMode::RL
+            ? "当前策略未配置速度命令范围，速度已清零"
+            : "已离开 RL，速度清零并返回主界面";
         *send_immediately = true;
     }
 }
@@ -826,6 +830,7 @@ int main(int argc, char *argv[]) {
 
     UiState state;
     state.policies = config.policies;
+    state.command_limits = config.command_limits;
     state.active_policy_idx = config.default_policy_idx;
     state.policy_cursor_idx = config.default_policy_idx;
 
@@ -936,45 +941,51 @@ int main(int argc, char *argv[]) {
                     state.last_action = "取消策略选择";
                 }
             } else if (state.page == HmiPage::VELOCITY) {
+                const auto *limits = ActiveCommandLimits(state);
                 if (key == kKeyEscape || key == 'v') {
                     ZeroVelocity(&state);
                     state.page = HmiPage::MAIN;
                     state.last_action = "退出速度控制，速度清零";
                     send_immediately = true;
+                } else if (!limits) {
+                    ZeroVelocity(&state);
+                    state.page = HmiPage::MAIN;
+                    state.last_action = "当前策略未配置速度命令范围";
+                    send_immediately = true;
                 } else if (key == 'w') {
                     state.target_command.vx = std::clamp(
                         state.target_command.vx + config.hmi.step_vx,
-                        -config.hmi.max_vx, config.hmi.max_vx);
+                        -limits->max_vx, limits->max_vx);
                     state.last_action = "W：增加前进速度";
                     send_immediately = true;
                 } else if (key == 's') {
                     state.target_command.vx = std::clamp(
                         state.target_command.vx - config.hmi.step_vx,
-                        -config.hmi.max_vx, config.hmi.max_vx);
+                        -limits->max_vx, limits->max_vx);
                     state.last_action = "S：增加后退速度";
                     send_immediately = true;
                 } else if (key == 'a') {
                     state.target_command.vy = std::clamp(
                         state.target_command.vy + config.hmi.step_vy,
-                        -config.hmi.max_vy, config.hmi.max_vy);
+                        -limits->max_vy, limits->max_vy);
                     state.last_action = "A：增加左移速度";
                     send_immediately = true;
                 } else if (key == 'd') {
                     state.target_command.vy = std::clamp(
                         state.target_command.vy - config.hmi.step_vy,
-                        -config.hmi.max_vy, config.hmi.max_vy);
+                        -limits->max_vy, limits->max_vy);
                     state.last_action = "D：增加右移速度";
                     send_immediately = true;
                 } else if (key == 'q') {
                     state.target_command.wz = std::clamp(
                         state.target_command.wz + config.hmi.step_wz,
-                        -config.hmi.max_wz, config.hmi.max_wz);
+                        -limits->max_wz, limits->max_wz);
                     state.last_action = "Q：增加左转角速度";
                     send_immediately = true;
                 } else if (key == 'e') {
                     state.target_command.wz = std::clamp(
                         state.target_command.wz - config.hmi.step_wz,
-                        -config.hmi.max_wz, config.hmi.max_wz);
+                        -limits->max_wz, limits->max_wz);
                     state.last_action = "E：增加右转角速度";
                     send_immediately = true;
                 } else if (key == ' ') {
@@ -1006,9 +1017,14 @@ int main(int argc, char *argv[]) {
                     }
                 } else if (key == 'v' || key == '\r' || key == '\n') {
                     if (state.status_online && state.status.hmi_connected &&
-                        state.status.mode == ControlMode::RL) {
+                        state.status.mode == ControlMode::RL &&
+                        ActiveCommandLimits(state)) {
                         state.page = HmiPage::VELOCITY;
                         state.last_action = "进入键盘速度控制";
+                    } else if (state.status_online &&
+                        state.status.mode == ControlMode::RL) {
+                        state.last_action =
+                            "当前策略未配置 command.limits，不接受速度命令";
                     } else {
                         state.last_action =
                             "速度页仅在真实 FSM=RL 且心跳正常时开放";

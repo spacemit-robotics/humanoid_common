@@ -16,6 +16,8 @@
 #include <string>
 #include <utility>
 
+#include "runtime_logger.h"
+
 namespace behavior_manager {
 
 FSM::FSM() : current_name_(StateName::POWER_OFF) {}
@@ -71,6 +73,8 @@ void FSM::Init() {
     current_->OnEnter();
 
     std::cout << "[FSM] 初始化完成，当前状态: " << StateNameStr(current_name_) << std::endl;
+    runtime_logging::Log(runtime_logging::Level::kInfo,
+        std::string("FSM initialized: ") + StateNameStr(current_name_), false);
 }
 
 void FSM::Step(float control_dt, float rl_dt) {
@@ -93,6 +97,10 @@ void FSM::ForceSwitch(StateName target, const std::string &reason) {
 
     std::cout << "[FSM] 强制切换: " << StateNameStr(current_name_) << " → " << StateNameStr(target)
             << " (原因: " << reason << ")" << std::endl;
+    runtime_logging::Log(runtime_logging::Level::kWarning,
+        std::string("FSM forced transition: ") + StateNameStr(current_name_) + " -> " +
+            StateNameStr(target) + ", reason=" + reason,
+        false);
 
     SwitchTo(target);
 }
@@ -109,11 +117,17 @@ void FSM::SwitchTo(StateName target) {
     auto it = states_.find(target);
     if (it == states_.end()) {
         std::cerr << "[FSM] 目标状态未注册: " << StateNameStr(target) << std::endl;
+        runtime_logging::Log(runtime_logging::Level::kError,
+            std::string("unregistered FSM target: ") + StateNameStr(target), false);
         return;
     }
 
     std::cout << "[FSM] 切换: " << StateNameStr(current_name_) << " → " << StateNameStr(target)
             << std::endl;
+    runtime_logging::Log(runtime_logging::Level::kInfo,
+        std::string("FSM transition: ") + StateNameStr(current_name_) + " -> " +
+            StateNameStr(target),
+        false);
 
     if (current_) {
         current_->OnExit();

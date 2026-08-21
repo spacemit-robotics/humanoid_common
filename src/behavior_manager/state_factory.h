@@ -34,8 +34,9 @@ struct RLConfig {
     // ---- 策略输入协议适配（可选；type 为空表示普通 RL 策略）----
     policy_adapter::Config policy_adapter;
     std::vector<double> zero_target_pos;  // ZERO 阶段目标位姿（可选，空则用 rl_default_pos）
+    double entry_target_transition_duration = 0.0;  // RL 入场目标位置过渡时长（秒）
 
-    // ---- PD 控制增益（从 behavior_manager 传入，OnEnter 时恢复）----
+    // ---- RL 策略增益 ----
     std::vector<double> kp;
     std::vector<double> kd;
 
@@ -46,6 +47,11 @@ struct RLConfig {
 // 工厂函数
 std::unique_ptr<State> CreateStatePowerOff();
 std::unique_ptr<State> CreateStateDamp(const std::vector<double> &damp_kd);
+std::unique_ptr<State> CreateStateHome(const std::vector<double> &default_pos,
+        double gain_ramp_duration,
+        double move_duration,
+        const std::vector<double> &kp,
+        const std::vector<double> &kd);
 std::unique_ptr<State> CreateStateZero(const std::vector<double> &default_pos,
                                         double duration,
                                         const std::vector<double> &kp,

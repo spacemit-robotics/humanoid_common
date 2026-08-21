@@ -10,7 +10,7 @@
  * 执行状态转换和控制逻辑，最后将控制命令发送给 driver。
  *
  * 调用的模块：
- * - behavior_manager: 行为状态机管理（POWER_OFF → DAMP → ZERO → RL）
+ * - behavior_manager: 行为状态机管理（POWER_OFF → DAMP → HOME → ZERO → RL）
  * - transport_executor: 统一传输接口
  * - robot_base: 机器人状态数据结构
  */
@@ -21,14 +21,16 @@
 #include <csignal>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <sstream>
-#include <thread>
 #include <string>
+#include <thread>
 
 #include "transport_executor.h"
 #include "behavior_manager.h"
 #include "policy_command_limits.h"
 #include "robot_base.h"
+#include "runtime_logger.h"
 using behavior_manager::BehaviorManagerClass;
 using behavior_manager::StateNameStr;
 
@@ -36,6 +38,66 @@ namespace {
 volatile std::sig_atomic_t g_running = 1;
 void OnSignal(int) {
     g_running = 0;
+}
+
+double WallTimeSeconds() {
+    return std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+void RecordControlTelemetry(const robot_base::RobotData &state,
+    const robot_base::ControlCmd &control, behavior_manager::StateName mode,
+    const std::string &policy, bool hmi_connected, const robot_base::Command &command,
+    double control_hz, double rl_hz, const std::vector<std::string> &joint_names) {
+    const double wall_time = WallTimeSeconds();
+    std::ostringstream summary;
+    summary << std::fixed << std::setprecision(9)
+            << wall_time << "," << state.time << "," << StateNameStr(mode) << ","
+            << policy << "," << hmi_connected << "," << command.vx << ","
+            << command.vy << "," << command.wz << "," << control_hz << ","
+            << rl_hz << "," << control.enable;
+    runtime_logging::RecordCsv("control_trace",
+        "wall_time_s,device_time_s,state,policy,hmi_connected,vx,vy,wz,"
+        "control_hz,rl_hz,enabled",
+        summary.str());
+
+    const size_t count = std::min({
+        joint_names.size(), state.joint_pos.size(), state.joint_vel.size(),
+        state.joint_torque.size(), control.target_pos.size(),
+        control.target_vel.size(), control.target_torque.size(),
+        control.kp.size(), control.kd.size()});
+    std::ostringstream joints;
+    joints << std::fixed << std::setprecision(9);
+    for (size_t i = 0; i < count; ++i) {
+        joints << wall_time << "," << state.time << "," << joint_names[i] << ","
+            << state.joint_pos[i] << "," << state.joint_vel[i] << ","
+            << state.joint_torque[i] << "," << control.target_pos[i] << ","
+            << control.target_vel[i] << "," << control.target_torque[i] << ","
+            << control.kp[i] << "," << control.kd[i];
+        if (i + 1 < count) joints << "\n";
+    }
+    runtime_logging::RecordCsv("control_joint",
+        "wall_time_s,device_time_s,joint,position,velocity,torque,target_position,"
+        "target_velocity,target_torque,kp,kd",
+        joints.str());
+}
+
+robot_base::ControlMode ToControlMode(behavior_manager::StateName state) {
+    switch (state) {
+    case behavior_manager::StateName::POWER_OFF:
+        return robot_base::ControlMode::POWER_OFF;
+    case behavior_manager::StateName::DAMP:
+        return robot_base::ControlMode::DAMP;
+    case behavior_manager::StateName::HOME:
+        return robot_base::ControlMode::HOME;
+    case behavior_manager::StateName::ZERO:
+        return robot_base::ControlMode::ZERO;
+    case behavior_manager::StateName::RL:
+        return robot_base::ControlMode::RL;
+    case behavior_manager::StateName::SAFETY:
+        return robot_base::ControlMode::SAFETY;
+    }
+    return robot_base::ControlMode::SAFETY;
 }
 }  // namespace
 
@@ -55,9 +117,12 @@ int main(int argc, char *argv[]) {
     // 从配置读取控制频率参数
     robot_base::YamlFile yaml_file;
     runtime_config::PolicyCommandLimitMap policy_command_limits;
+    std::unique_ptr<runtime_logging::Session> logging_session;
     try {
         yaml_file = robot_base::YamlFile::Load(yaml_path);
         policy_command_limits = runtime_config::LoadPolicyCommandLimits(yaml_file);
+        logging_session = std::make_unique<runtime_logging::Session>(
+            yaml_file, yaml_path, "control", false);
     } catch (const std::exception &e) {
         std::cerr << e.what() << "\n"
             << "用法: " << argv[0] << " <config.yaml>\n";
@@ -87,17 +152,31 @@ int main(int argc, char *argv[]) {
     // 初始化传输（Control 角色）
     auto transport = transport::Create(yaml_path);
     if (!transport->Init(yaml_path, transport::Role::CONTROL)) {
+        runtime_logging::Log(
+            runtime_logging::Level::kError, "control transport initialization failed", false);
         std::cerr << "[control_demo] 传输初始化失败\n";
         return 1;
     }
 
     robot_base::Command cmd;
     robot_base::RobotData latest_state;
+    robot_base::ControlCmd latest_control;
     bool has_state = false;
+    bool has_control = false;
     bool has_hmi = false;
+    bool reported_state = false;
+    bool previous_hmi_connected = false;
+    const auto joint_names =
+        yaml_file.Read<std::vector<std::string>>("robot_base.joint_names").value_or(
+            std::vector<std::string>{});
+    const auto logging_config = runtime_logging::GetConfig();
+    const auto telemetry_period =
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(1.0 / logging_config.telemetry_rate_hz));
 
     auto last_control_time = std::chrono::steady_clock::now();
     auto last_hmi_time = last_control_time;
+    auto last_telemetry_time = last_control_time - telemetry_period;
     auto last_status_time = last_control_time -
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(1.0 / status_hz));
@@ -106,6 +185,8 @@ int main(int argc, char *argv[]) {
     const double target_control_hz = (control_dt > 1e-6f) ? (1.0 / control_dt) : 0.0;
     const double target_rl_hz = (rl_dt > 1e-6f) ? (1.0 / rl_dt) : 0.0;
 
+    runtime_logging::Log(
+        runtime_logging::Level::kInfo, "control runtime started", false);
     std::cout << "[control_demo] 启动（使用 transport_executor）\n";
     std::cout << "\n\n\n";
 
@@ -126,6 +207,11 @@ int main(int argc, char *argv[]) {
             while (transport->RecvState(state)) {
                 latest_state = state;
                 has_state = true;
+                if (!reported_state) {
+                    runtime_logging::Log(runtime_logging::Level::kInfo,
+                        "driver state channel connected", false);
+                    reported_state = true;
+                }
             }
         }
 
@@ -134,6 +220,15 @@ int main(int argc, char *argv[]) {
         const bool hmi_connected = has_hmi &&
             std::chrono::duration<double>(now - last_hmi_time).count()
                 <= hmi_command_timeout;
+        if (hmi_connected != previous_hmi_connected) {
+            runtime_logging::Log(
+                hmi_connected ? runtime_logging::Level::kInfo
+                    : runtime_logging::Level::kWarning,
+                hmi_connected ? "HMI command channel connected"
+                    : "HMI command channel timed out",
+                false);
+            previous_hmi_connected = hmi_connected;
+        }
         if (!hmi_connected) {
             // HMI 退出或链路中断后不保留旧速度和一次性请求。
             cmd.key = 0;
@@ -163,13 +258,17 @@ int main(int argc, char *argv[]) {
             const auto &out = bm.GetOutput();
             robot_base::ControlCmd ctrl;
             ctrl.enable = out.enable;
+            ctrl.actuation_mode = out.actuation_mode;
             ctrl.target_pos = out.target_pos;
             ctrl.target_vel = out.target_vel;
+            ctrl.target_torque = out.target_torque;
             ctrl.kp = out.kp;
             ctrl.kd = out.kd;
-            // 透传 FSM 状态作为通用控制模式（driver 侧自主解释；mujoco 据此调整悬挂、实机据此判定阈值/恢复）
-            ctrl.mode = static_cast<robot_base::ControlMode>(bm.CurrentState());
+            // 透传 FSM 状态作为通用控制模式，由 driver backend 自主解释。
+            ctrl.mode = ToControlMode(bm.CurrentState());
             transport->SendControl(ctrl);
+            latest_control = ctrl;
+            has_control = true;
 
             if (bm.CurrentState() != behavior_manager::StateName::RL) {
                 cmd.vx = 0.0f;
@@ -180,11 +279,20 @@ int main(int argc, char *argv[]) {
             step_count++;
         }
 
+        if (logging_config.telemetry_enabled && has_state && has_control &&
+            now - last_telemetry_time >= telemetry_period) {
+            const double actual_control_hz = elapsed > 1.0e-9 ? 1.0 / elapsed : 0.0;
+            RecordControlTelemetry(latest_state, latest_control, bm.CurrentState(),
+                bm.CurrentPolicyName(), hmi_connected, cmd, actual_control_hz,
+                bm.GetRlFreq(), joint_names);
+            last_telemetry_time = now;
+        }
+
         // 真实 FSM、策略和 control 采用速度定频回传给 HMI。
         if (std::chrono::duration<double>(now - last_status_time).count()
             >= 1.0 / status_hz) {
             robot_base::ControlStatus status;
-            status.mode = static_cast<robot_base::ControlMode>(bm.CurrentState());
+            status.mode = ToControlMode(bm.CurrentState());
             status.zero_ready = bm.IsZeroReady();
             status.hmi_connected = hmi_connected;
             status.vx = cmd.vx;
@@ -230,6 +338,8 @@ int main(int argc, char *argv[]) {
         std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 
+    runtime_logging::Log(
+        runtime_logging::Level::kInfo, "control runtime stopped", false);
     std::cout << "\n[control_demo] 退出\n";
     return 0;
 }

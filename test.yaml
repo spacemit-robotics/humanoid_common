@@ -3,24 +3,25 @@ module: application/native/humanoid_common
 tests:
   - name: humanoid-common-functional
     description: >
-      robot_base / behavior_manager / transport_executor 三个内部模块各自从 example 配置
-      实例化并跑通核心流程，校验维度一致性、FSM 状态切换、transport 收发，全部通过内部断言。
+      robot_base / behavior_manager / transport_executor 从 example 配置跑通离线流程，
+      driver_runtime 校验 YAML 后端解析、factory 分派，以及 whole_body 关节、IMU
+      状态和控制命令的数据转换。
     category: functional
     scopes: [pr]
     timeout_s: 120
     requires:
-      commands: [test_robot_base, test_behavior, test_transport_executor]
+      commands: [test_robot_base, test_behavior, test_transport_executor, test_driver_runtime]
     command: |
       bash tests/functional.sh
 
   - name: humanoid-common-error-path
     description: >
-      坏/缺配置时三个内部模块必须快速失败（非 0 退出、不 hang、不崩溃），
+      坏/缺配置时各示例程序必须快速失败（非 0 退出、不 hang、不崩溃），
       验证错误处理与参数校验。
     category: functional
     scopes: [pr]
     timeout_s: 90
     requires:
-      commands: [test_robot_base, test_behavior, test_transport_executor]
+      commands: [test_robot_base, test_behavior, test_transport_executor, test_driver_runtime]
     command: |
       bash tests/error_path.sh

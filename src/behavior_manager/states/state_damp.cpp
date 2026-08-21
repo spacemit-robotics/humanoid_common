@@ -24,6 +24,7 @@ public:
         std::cout << "[StateDamp] 进入阻尼状态 (kp=0, kd=damp_kd)" << std::endl;
         if (output_ && sensor_) {
             int ndof = static_cast<int>(sensor_->joint_pos.size());
+            output_->actuation_mode = robot_base::ActuationMode::HYBRID;
             // kp=0：无位置刚度，可手动推动
             output_->kp.assign(ndof, 0.0);
             // kd=damp_kd：阻尼力，抵抗速度，防止完全瘫软
@@ -34,6 +35,7 @@ public:
             }
             output_->target_pos = sensor_->joint_pos;
             output_->target_vel.assign(ndof, 0.0);
+            output_->target_torque.assign(ndof, 0.0);
             output_->enable = true;
         }
     }
@@ -47,10 +49,10 @@ public:
     }
 
     StateName CheckTransition() override {
-        // key=2 → 回零位
-        if (command_ && command_->key == 2) {
+        // key=4 → 机型默认姿态
+        if (command_ && command_->key == 4) {
             command_->key = 0;
-            return StateName::ZERO;
+            return StateName::HOME;
         }
         // key=-1 → 完全失力
         if (command_ && command_->key == -1) {

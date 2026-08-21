@@ -19,9 +19,11 @@ public:
         // 输出零力矩
         if (output_ && sensor_) {
             output_->enable = false;
+            output_->actuation_mode = robot_base::ActuationMode::HYBRID;
             std::size_t ndof = sensor_->joint_pos.size();
             output_->target_pos.assign(ndof, 0.0);
             output_->target_vel.assign(ndof, 0.0);
+            output_->target_torque.assign(ndof, 0.0);
             output_->kp.assign(ndof, 0.0);
             output_->kd.assign(ndof, 0.0);
         }

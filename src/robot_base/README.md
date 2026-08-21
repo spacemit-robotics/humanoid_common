@@ -73,15 +73,15 @@ robot_base:
 
 ### 1.4 机器人固有物理属性
 
-`robot_base` 节点下还可声明机型自带的默认 PD 增益与站立姿态，由 `driver_runtime` 启动时读取传给 MuJoCo：
+`robot_base` 节点声明机型默认 PD 增益与复位姿态，供 MuJoCo 初始化和 FSM HOME 状态共用：
 
 | 字段 | 类型 | 说明 |
 | :--- | :--- | :--- |
-| `kp` | `vector<double>`（长度 = num_dof） | MuJoCo 启动初始 PD 比例增益；进入 RL 后由 control 端每帧通过 `ControlCmd.kp` 覆盖 |
-| `kd` | `vector<double>`（长度 = num_dof） | MuJoCo 启动初始 PD 微分增益；进入 RL 后由 `ControlCmd.kd` 覆盖 |
-| `default_joint_pos` | `vector<double>`（长度 = num_dof） | 机器人自然站立姿态，MuJoCo 仿真初始关节角 |
+| `kp` | `vector<double>`（长度 = num_dof） | 机型默认比例增益；供 MuJoCo 初始化及 HOME/ZERO 无独立配置时回退 |
+| `kd` | `vector<double>`（长度 = num_dof） | 机型默认微分增益；供 MuJoCo 初始化及 HOME/ZERO 无独立配置时回退 |
+| `default_joint_pos` | `vector<double>`（长度 = num_dof） | MuJoCo 仿真初始关节角，也是实机 HOME 的目标复位姿态 |
 
-`kp/kd` 缺省时由 MuJoCo 内部默认值兜底，`default_joint_pos` 必填（driver_runtime 用 `.value()` 强制读取）。
+三项均由 `behavior_manager` 做维度和有限值校验；使用通用 FSM 时必须完整配置。
 
 ### 1.5 数据契约与工具函数
 
@@ -90,9 +90,11 @@ robot_base:
 | 字段 | 类型 | 说明 |
 | :--- | :--- | :--- |
 | `enable` | `bool` | 使能标志，`false` 时驱动器失力 |
-| `mode` | `ControlMode` | 通用控制模式（`POWER_OFF/DAMP/ZERO/RL/SAFETY`），driver 自主解释（mujoco 据此调悬挂、实机据此调阈值/恢复） |
+| `mode` | `ControlMode` | 通用控制模式（`POWER_OFF/DAMP/HOME/ZERO/RL/SAFETY`），driver backend 自主解释 |
+| `actuation_mode` | `ActuationMode` | 位置、速度、力矩或 HYBRID 命令语义 |
 | `target_pos` | `std::vector<double>` | 目标关节位置 (rad)，大小 = num_dof |
 | `target_vel` | `std::vector<double>` | 目标关节速度 (rad/s)，大小 = num_dof |
+| `target_torque` | `std::vector<double>` | HYBRID 前馈力矩或 TORQUE 直接目标力矩 (Nm)，大小 = num_dof |
 | `kp` | `std::vector<double>` | PD 控制比例增益，大小 = num_dof |
 | `kd` | `std::vector<double>` | PD 控制微分增益，大小 = num_dof |
 
@@ -100,7 +102,7 @@ robot_base:
 
 | 字段 | 类型 | 说明 |
 | :--- | :--- | :--- |
-| `key` | `int` | 状态切换指令（1=DAMP, 2=ZERO, 3=RL, -1=POWER_OFF） |
+| `key` | `int` | 状态切换指令（1=DAMP, 2=ZERO, 3=RL, 4=HOME, -1=POWER_OFF） |
 | `vx` | `float` | 前进速度指令 (m/s) |
 | `vy` | `float` | 横向速度指令 (m/s) |
 | `wz` | `float` | 旋转角速度指令 (rad/s) |

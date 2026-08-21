@@ -1,6 +1,6 @@
 # behavior_manager — FSM 行为管理
 
-有限状态机（FSM）的人形机器人行为控制模块。支持 5 种状态（POWER_OFF、DAMP、ZERO、RL、SAFETY），完全由 YAML 配置驱动，与机器人型号解耦。StateRL 集成 ONNX 推理，在独立线程中执行策略。
+有限状态机（FSM）的人形机器人行为控制模块。支持 6 种状态（POWER_OFF、DAMP、HOME、ZERO、RL、SAFETY），完全由 YAML 配置驱动，与机器人型号解耦。StateRL 集成 ONNX 推理，在独立线程中执行策略。
 
 ## 接口说明
 
@@ -12,7 +12,8 @@
 |------|------|
 | `POWER_OFF` | 完全失力（关节零力矩）|
 | `DAMP` | 阻尼保持（kp=0, kd=配置值）|
-| `ZERO` | 回零位（平滑到初始位置）|
+| `HOME` | 平滑恢复 `robot_base.default_joint_pos` |
+| `ZERO` | 平滑到当前 RL 策略的准备姿态 |
 | `RL` | RL 控制（异步 ONNX 推理）|
 | `SAFETY` | 安全保护（IMU 超限触发）|
 
@@ -38,8 +39,10 @@
 
 | 成员 | 类型 | 说明 |
 |------|------|------|
+| `actuation_mode` | `robot_base::ActuationMode` | 执行器命令语义，当前 FSM 默认使用 `HYBRID` |
 | `target_pos` | `vector<double>` | 目标关节位置 (rad) |
 | `target_vel` | `vector<double>` | 目标关节速度 (rad/s) |
+| `target_torque` | `vector<double>` | `HYBRID` 下为前馈力矩，`TORQUE` 下为直接目标力矩 (Nm) |
 | `kp`, `kd` | `vector<double>` | PD 参数（每帧由当前 RL 策略提供）|
 | `enable` | `bool` | 使能标志 |
 
@@ -62,8 +65,9 @@
 
 | key | 转移状态 | 说明 |
 |-----|---------|------|
-| `1` | POWER_OFF/ZERO/RL → DAMP | 进入/退回阻尼 |
-| `2` | DAMP → ZERO | 开始回零 |
+| `1` | POWER_OFF/HOME/ZERO/RL → DAMP | 进入/退回阻尼 |
+| `4` | DAMP → HOME | 恢复机型默认姿态 |
+| `2` | HOME → ZERO | 切到策略准备姿态（需 HOME 完成） |
 | `3` | ZERO → RL | 进入 RL（需插值完成）|
 | `-1` | 任意 → POWER_OFF | 完全失力（ESC）|
 
@@ -103,31 +107,35 @@ cd ~/spacemit_robot
 
 **关键参数：**
 - `rl_policy.policies.<name>.kp/kd`：各策略训练时的 PD 增益（每帧随控制命令下发）
+- `rl_policy.policies.<name>.entry_target_transition_duration`（可选）：进入 RL 后按推理周期从上一目标位置过渡到策略原始目标；默认 `0`，不改变已有策略行为
 - `rl_policy.policies.<name>.prerequisite.policy / .duration`（可选）：前置策略链——切到本策略前先自动跑前置策略 `duration` 秒
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter`（可选）：参考动作和特殊模型输入适配；支持 `mjlab`、`protomotions`
 - `rl_policy.onnx_infer.policies.<name>.command.limits`（可选）：应用层声明该策略接受的 `max_vx/max_vy/max_wz`；未配置时 HMI 和 Control 均拒绝速度命令
 - `behavior_manager.damp_kd`：阻尼状态 kd（≈ policy kd / 5）
+- `behavior_manager.home.gain_ramp_duration / move_duration`：HOME 建立增益和移动时长
+- `behavior_manager.home.kp/kd`（可选）：HOME 增益；未配置时使用 `robot_base.kp/kd`
 - `behavior_manager.zero_pos`：回零位置（无 rl_policy 时的 fallback；完整 FSM 用 `rl_policy.policies.<name>.rl_default_pos`）
-- `behavior_manager.zero_duration`：回零时间（秒）
+- `behavior_manager.zero.move_duration / kp / kd`：ZERO 移动时长和独立安全增益；kp/kd 必须同时配置，未配置时保留原有策略增益行为
 
 **路径解析：** `robot_base.robot_dir` 相对于 YAML 文件；`model_path` 相对于 `robot_dir`。
 
 ### 状态机流程
 
 ```
-POWER_OFF ──key=1──→ DAMP ──key=2──→ ZERO ──key=3(插值完成)──→ RL
-    ↑                                                           │
-    └─────────────────── key=-1(ESC) ─────────────────────────┘
-                                                                │
-                                          RL ──IMU超限──→ SAFETY
+POWER_OFF ─key=1→ DAMP ─key=4→ HOME ─key=2(完成)→ ZERO ─key=3(完成)→ RL
+    ↑                                                                  │
+    └────────────────────── key=-1(ESC) ───────────────────────────────┘
+                                                                       │
+                                                 RL ──IMU超限──→ SAFETY
 ```
 
 ### 关键设计
 
 - **异步推理：** StateRL 在独立线程执行 ONNX 推理，不阻塞主循环
+- **策略入场过渡：** 可按策略配置目标位置过渡；RL 增益立即生效，推理与 recurrent state 正常更新，仅在新推理结果到达时平滑目标位置
 - **通用模型 I/O：** `PolicyExecutorConfig` 整体透传给 RL 组件；多输入输出、feedback、external 等拓扑由策略 YAML `model_io` 声明，common 无需复制底层字段
 - **策略协议适配：** `policy_adapter` 是 behavior_manager 的私有子模块；机器人自由度、关节映射和自定义观测维度由机型 YAML 透传，common 不固定具体机型维度
-- **动态策略切换：** 仅在 `POWER_OFF` / `DAMP` 状态接受 `Command.switch_policy`；进入 `ZERO` 后策略锁定（ZERO 的目标位置/kp/kd 取自当前策略，切换会同步重建 ZERO 状态）
+- **动态策略切换：** 仅在 `POWER_OFF` / `DAMP` 状态接受 `Command.switch_policy`；进入 `ZERO` 后策略锁定（ZERO 目标位置取自当前策略，增益使用独立安全配置）
 - **前置策略链调度：** 目标策略可在 yaml 配置 `prerequisite: { policy, duration }`，behavior_manager 收到切换请求后自动先切前置策略，在 RL 状态运行 `duration` 秒后再切目标策略；用户感知层面只发一次切换命令。典型场景：`dance` / `kungfu` 配 `prerequisite: stand`，先用 LocoMode 站稳并预热 LSTM，再进 dance/kungfu，避免直接从 PD 锁位的 ZERO 切动态动作时摔倒
 - **安全保护：** IMU 倾角/关节限位自动触发安全状态
 - **状态回传：** `CurrentState()`、`IsZeroReady()`、当前策略和 RL 频率由 control_runtime 组装为 `ControlStatus` 发给 HMI

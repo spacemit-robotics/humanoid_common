@@ -190,6 +190,9 @@ void RobotData::InitJointVectors() {
     if (num_dof > 0) {
         joint_pos.assign(num_dof, 0.0);
         joint_vel.assign(num_dof, 0.0);
+        joint_torque.assign(num_dof, 0.0);
+        joint_temperature.assign(num_dof, 0.0);
+        joint_error.assign(num_dof, 0U);
     }
 }
 
@@ -214,10 +217,14 @@ void RobotData::Reset() {
     // 重置 IMU 数据
     rpy = {0, 0, 0};
     gyro = {0, 0, 0};
+    acceleration = {0, 0, 0};
 
     // 重置关节状态
     std::fill(joint_pos.begin(), joint_pos.end(), 0.0);
     std::fill(joint_vel.begin(), joint_vel.end(), 0.0);
+    std::fill(joint_torque.begin(), joint_torque.end(), 0.0);
+    std::fill(joint_temperature.begin(), joint_temperature.end(), 0.0);
+    std::fill(joint_error.begin(), joint_error.end(), 0U);
 
     // 重置时间戳
     time = 0.0;

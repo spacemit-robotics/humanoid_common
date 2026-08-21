@@ -27,7 +27,8 @@ enum class StateName {
     DAMP,       ///< 阻尼保持：kp=0, kd=配置值，软性支撑防硬倒
     ZERO,       ///< 回零位：平滑到 RL 训练初始位置
     RL,         ///< RL 控制：异步推理输出动作
-    SAFETY      ///< 安全保护：IMU 倾角/关节限位触发
+    SAFETY,     ///< 安全保护：IMU 倾角/关节限位触发
+    HOME        ///< 机型复位：平滑到 robot_base.default_joint_pos
 };
 
 /**
@@ -41,8 +42,10 @@ const char *StateNameStr(StateName s);
  * @brief 控制输出
  */
 struct ControlOutput {
+    robot_base::ActuationMode actuation_mode = robot_base::ActuationMode::HYBRID;
     std::vector<double> target_pos;  ///< 目标关节位置 (rad)
     std::vector<double> target_vel;  ///< 目标关节速度 (rad/s)
+    std::vector<double> target_torque;  ///< HYBRID: 前馈力矩；TORQUE: 直接目标力矩 (Nm)
     std::vector<double> kp, kd;      ///< PD 参数
     bool enable = false;             ///< 使能标志
 };

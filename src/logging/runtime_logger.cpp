@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <deque>
 #include <filesystem>  // NOLINT(build/c++17)
@@ -30,7 +31,7 @@
 #include <map>
 #include <mutex>
 #include <sstream>
-#include <cstring>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <thread>
@@ -163,11 +164,13 @@ void PrepareDirectory(const std::filesystem::path &path) {
     }
 }
 
-void PrepareLogFile(const std::filesystem::path &path) {
+bool PrepareLogFile(const std::filesystem::path &path) {
+    bool prepared = true;
     if (geteuid() == 0 &&
         chown(path.c_str(), static_cast<uid_t>(-1), RuntimeLogGroup()) != 0) {
         std::cerr << "[runtime_logger] failed to set log file group: "
             << path << ": " << std::strerror(errno) << "\n";
+        prepared = false;
     }
     std::error_code error;
     std::filesystem::permissions(path,
@@ -177,7 +180,9 @@ void PrepareLogFile(const std::filesystem::path &path) {
     if (error) {
         std::cerr << "[runtime_logger] failed to set log file permissions: "
             << path << ": " << error.message() << "\n";
+        prepared = false;
     }
+    return prepared;
 }
 
 uint64_t HashFile(const std::string &path) {
@@ -414,7 +419,12 @@ private:
         file->stream.open(path, std::ios::out | std::ios::trunc);
         file->bytes = 0;
         file->last_flush = std::chrono::steady_clock::now();
-        if (file->stream.is_open()) PrepareLogFile(path);
+        if (file->stream.is_open() && !PrepareLogFile(path)) {
+            file->stream.close();
+            std::error_code error;
+            std::filesystem::remove(path, error);
+            return;
+        }
         if (file->stream.is_open() && file->csv && !file->header.empty()) {
             file->stream << file->header << "\n";
             file->bytes = file->header.size() + 1;
@@ -446,7 +456,15 @@ private:
         const std::filesystem::path path =
             std::filesystem::path(session_directory_) / "metadata.json";
         std::ofstream output(path);
-        if (output.is_open()) PrepareLogFile(path);
+        if (!output.is_open()) {
+            throw std::runtime_error("failed to create log metadata file");
+        }
+        if (!PrepareLogFile(path)) {
+            output.close();
+            std::error_code error;
+            std::filesystem::remove(path, error);
+            throw std::runtime_error("failed to secure log metadata file");
+        }
         output << "{\n"
             << "  \"robot\": \"" << JsonEscape(robot) << "\",\n"
             << "  \"component\": \"" << JsonEscape(component_) << "\",\n"

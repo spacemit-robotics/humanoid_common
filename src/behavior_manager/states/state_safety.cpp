@@ -29,6 +29,8 @@ public:
 
         // 保存初始 kp/kd 副本（用于线性衰减）
         if (output_) {
+            output_->actuation_mode = robot_base::ActuationMode::HYBRID;
+            output_->target_torque.assign(hold_pos_.size(), 0.0);
             kp_init_ = output_->kp;
             kd_init_ = output_->kd;
         }

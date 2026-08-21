@@ -85,12 +85,16 @@ struct RobotData {
     std::array<double, 6> base_vel = {0};            // 线速度+角速度 (m/s, rad/s)
 
     // ==================== IMU 数据（控制算法输入）====================
-    std::array<double, 3> rpy = {0, 0, 0};   // 欧拉角 (roll, pitch, yaw) (rad)
-    std::array<double, 3> gyro = {0, 0, 0};  // 角速度 (rad/s)
+    std::array<double, 3> rpy = {0, 0, 0};           // 欧拉角 (roll, pitch, yaw) (rad)
+    std::array<double, 3> gyro = {0, 0, 0};          // 角速度 (rad/s)
+    std::array<double, 3> acceleration = {0, 0, 0};  // 线加速度 (m/s^2)
 
     // ==================== 关节状态 ====================
-    std::vector<double> joint_pos;  // 关节位置 (rad)，大小 = num_dof
-    std::vector<double> joint_vel;  // 关节速度 (rad/s)，大小 = num_dof
+    std::vector<double> joint_pos;          // 关节位置 (rad)，大小 = num_dof
+    std::vector<double> joint_vel;          // 关节速度 (rad/s)，大小 = num_dof
+    std::vector<double> joint_torque;       // 关节力矩 (Nm)，大小 = num_dof
+    std::vector<double> joint_temperature;  // 电机温度 (C)，大小 = num_dof
+    std::vector<uint32_t> joint_error;      // 电机错误标志，大小 = num_dof
 
     // ==================== 时间戳 ====================
     double time = 0.0;  // 时间戳 (s)
@@ -175,18 +179,13 @@ void NormalizeQuat(std::array<double, 4> &quat);
  * 统一的行为控制指令，用于 HMI → control → behavior_manager 全链路传递。
  */
 struct Command {
-    int key = 0;                ///< 状态切换指令（1=DAMP, 2=ZERO, 3=RL, -1=POWER_OFF）
+    int key = 0;  ///< 状态切换指令（1=DAMP, 2=ZERO, 3=RL, 4=HOME, -1=POWER_OFF）
     float vx = 0.0f;            ///< 前进速度 (m/s)
     float vy = 0.0f;            ///< 横向速度 (m/s)
     float wz = 0.0f;            ///< 旋转角速度 (rad/s)
     std::string switch_policy;  ///< 策略切换请求，空字符串表示无切换
 };
 
-/**
- * @brief 控制命令
- *
- * 用于控制器输出的目标关节状态和 PD 参数。
- */
 /**
  * @brief 控制模式（通用语义，独立于 behavior_manager FSM）
  *
@@ -198,7 +197,8 @@ enum class ControlMode : int8_t {
     DAMP = 1,       ///< 阻尼保持
     ZERO = 2,       ///< PD 锁位（回零或保持训练初始位）
     RL = 3,         ///< RL 策略动态控制
-    SAFETY = 4      ///< 安全保护
+    SAFETY = 4,     ///< 安全保护
+    HOME = 5        ///< 机型默认姿态复位
 };
 
 /**
@@ -218,11 +218,35 @@ struct ControlStatus {
     std::string active_policy;                  ///< 当前实际生效策略
 };
 
+/**
+ * @brief 关节命令的执行器控制语义，独立于上层 FSM 状态
+ *
+ * ControlMode 描述机器人当前处于 POWER_OFF、DAMP、HOME、ZERO、RL 或 SAFETY 状态；
+ * ActuationMode 描述 position/velocity/target_torque/kp/kd 应如何被执行器解释。
+ */
+enum class ActuationMode : int8_t {
+    HYBRID = 0,    ///< 阻抗控制：PD 反馈项与 target_torque 前馈项叠加
+    POSITION = 1,  ///< 位置闭环：主要使用 target_pos/target_vel
+    VELOCITY = 2,  ///< 速度闭环：主要使用 target_vel
+    TORQUE = 3     ///< 力矩控制：target_torque 是直接目标力矩
+};
+
+constexpr bool IsValidActuationMode(ActuationMode mode) {
+    return mode >= ActuationMode::HYBRID && mode <= ActuationMode::TORQUE;
+}
+
+/**
+ * @brief 控制命令
+ *
+ * 用于控制器输出目标关节状态、前馈力矩和阻抗增益。
+ */
 struct ControlCmd {
     bool enable = false;             ///< 使能标志
-    ControlMode mode = ControlMode::POWER_OFF;  ///< 控制模式（通用）
+    ControlMode mode = ControlMode::POWER_OFF;  ///< FSM 行为与安全状态
+    ActuationMode actuation_mode = ActuationMode::HYBRID;  ///< 整条关节命令的执行语义
     std::vector<double> target_pos;  ///< 目标关节位置 (rad)
     std::vector<double> target_vel;  ///< 目标关节速度 (rad/s)
+    std::vector<double> target_torque;  ///< HYBRID: 前馈力矩；TORQUE: 直接目标力矩 (Nm)
     std::vector<double> kp;          ///< 比例增益
     std::vector<double> kd;          ///< 微分增益
 };

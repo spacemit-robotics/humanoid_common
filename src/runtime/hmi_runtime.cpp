@@ -21,11 +21,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "policy_command_limits.h"
 #include "robot_base.h"
+#include "runtime_logger.h"
 #include "transport_executor.h"
 
 namespace {
@@ -269,6 +271,8 @@ const char *ModeName(ControlMode mode) {
         return "POWER_OFF";
     case ControlMode::DAMP:
         return "DAMP";
+    case ControlMode::HOME:
+        return "HOME";
     case ControlMode::ZERO:
         return "ZERO";
     case ControlMode::RL:
@@ -285,6 +289,8 @@ Color ModeColor(ControlMode mode) {
         return Color::BRIGHT_RED;
     case ControlMode::DAMP:
         return Color::BRIGHT_YELLOW;
+    case ControlMode::HOME:
+        return Color::BLUE;
     case ControlMode::ZERO:
         return Color::BRIGHT_CYAN;
     case ControlMode::RL:
@@ -367,6 +373,8 @@ void RenderMainPage(const UiState &state) {
     printf(" ⇄ ");
     PrintModeToken(ControlMode::DAMP, state);
     printf(" ⇄ ");
+    PrintModeToken(ControlMode::HOME, state);
+    printf(" → ");
     PrintModeToken(ControlMode::ZERO, state);
     printf(" → ");
     PrintModeToken(ControlMode::RL, state);
@@ -671,6 +679,9 @@ bool RequestByArrow(UiState *state, bool forward,
             return RequestTransition(state, ControlMode::DAMP, 1, now);
         }
         if (current == ControlMode::DAMP) {
+            return RequestTransition(state, ControlMode::HOME, 4, now);
+        }
+        if (current == ControlMode::HOME) {
             return RequestTransition(state, ControlMode::ZERO, 2, now);
         }
         if (current == ControlMode::ZERO) {
@@ -687,6 +698,9 @@ bool RequestByArrow(UiState *state, bool forward,
 
     if (current == ControlMode::DAMP) {
         return RequestTransition(state, ControlMode::POWER_OFF, -1, now);
+    }
+    if (current == ControlMode::HOME) {
+        return RequestTransition(state, ControlMode::DAMP, 1, now);
     }
     if (current == ControlMode::ZERO || current == ControlMode::RL) {
         return RequestTransition(state, ControlMode::DAMP, 1, now);
@@ -705,11 +719,13 @@ bool RequestShortcut(UiState *state, int key,
         return RequestTransition(state, ControlMode::POWER_OFF, -1, now);
     }
     if (key == 'o') {
-        if (current == ControlMode::POWER_OFF || current == ControlMode::ZERO ||
-            current == ControlMode::RL) {
+        if (current == ControlMode::POWER_OFF || current == ControlMode::HOME ||
+            current == ControlMode::ZERO || current == ControlMode::RL) {
             return RequestTransition(state, ControlMode::DAMP, 1, now);
         }
-    } else if (key == 'z' && current == ControlMode::DAMP) {
+    } else if (key == 'h' && current == ControlMode::DAMP) {
+        return RequestTransition(state, ControlMode::HOME, 4, now);
+    } else if (key == 'z' && current == ControlMode::HOME) {
         return RequestTransition(state, ControlMode::ZERO, 2, now);
     } else if (key == 'r' && current == ControlMode::ZERO) {
         if (!state->status.zero_ready) {
@@ -812,8 +828,12 @@ int main(int argc, char *argv[]) {
     const std::string yaml_path = argv[1];
 
     UiConfig config;
+    std::unique_ptr<runtime_logging::Session> logging_session;
     try {
         config = LoadUiConfig(yaml_path);
+        const auto yaml_file = robot_base::YamlFile::Load(yaml_path);
+        logging_session = std::make_unique<runtime_logging::Session>(
+            yaml_file, yaml_path, "hmi", false);
     } catch (const std::exception &e) {
         fprintf(stderr, "%s\n用法: %s <config.yaml>\n", e.what(), argv[0]);
         return 1;
@@ -821,9 +841,12 @@ int main(int argc, char *argv[]) {
 
     auto transport = transport::Create(yaml_path);
     if (!transport->Init(yaml_path, transport::Role::HMI)) {
+        runtime_logging::Log(
+            runtime_logging::Level::kError, "HMI transport initialization failed", false);
         fprintf(stderr, "[hmi_runtime] 传输初始化失败\n");
         return 1;
     }
+    runtime_logging::Log(runtime_logging::Level::kInfo, "HMI runtime started", false);
 
     g_color_enabled = isatty(STDOUT_FILENO) && std::getenv("NO_COLOR") == nullptr;
     Terminal terminal;
@@ -839,6 +862,7 @@ int main(int argc, char *argv[]) {
         std::chrono::duration_cast<Clock::duration>(
             std::chrono::duration<double>(heartbeat_period));
     bool dirty = true;
+    std::string last_logged_action;
 
     while (g_running) {
         const auto now = Clock::now();
@@ -1029,7 +1053,8 @@ int main(int argc, char *argv[]) {
                         state.last_action =
                             "速度页仅在真实 FSM=RL 且心跳正常时开放";
                     }
-                } else if (key == 'o' || key == 'z' || key == 'r') {
+                } else if (key == 'o' || key == 'h' || key == 'z' ||
+                    key == 'r') {
                     send_immediately = RequestShortcut(&state, key, now) ||
                         send_immediately;
                 } else if (key == ' ') {
@@ -1041,6 +1066,12 @@ int main(int argc, char *argv[]) {
                     state.last_action = "请按 V 或 Enter 进入速度控制页";
                 }
             }
+        }
+
+        if (!state.last_action.empty() && state.last_action != last_logged_action) {
+            runtime_logging::Log(
+                runtime_logging::Level::kInfo, state.last_action, false);
+            last_logged_action = state.last_action;
         }
 
         if (send_immediately ||
@@ -1063,5 +1094,7 @@ int main(int argc, char *argv[]) {
     state.pending_policy.clear();
     ZeroVelocity(&state);
     SendCommand(transport.get(), state);
+    runtime_logging::Log(runtime_logging::Level::kInfo,
+        "HMI runtime stopped after requesting POWER_OFF", false);
     return 0;
 }

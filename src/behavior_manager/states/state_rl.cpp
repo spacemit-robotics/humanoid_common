@@ -11,14 +11,16 @@
  */
 
 #include <Eigen/Dense>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <iostream>
-#include <mutex>
-#include <vector>
 #include <memory>
+#include <mutex>
 #include <utility>
+#include <vector>
 
 #include "behavior_state.h"
 #include "policy_adapter/policy_adapter.h"
@@ -33,8 +35,9 @@ public:
     void OnEnter() override {
         std::cout << "[StateRL] 进入 RL 控制状态（异步推理）" << std::endl;
 
-        // 恢复 kp/kd（从 POWER_OFF 清零状态恢复）
         if (output_) {
+            output_->actuation_mode = robot_base::ActuationMode::HYBRID;
+            output_->target_torque.assign(output_->target_pos.size(), 0.0);
             output_->kp = config_.kp;
             output_->kd = config_.kd;
         }
@@ -45,6 +48,9 @@ public:
 
         safety_triggered_ = false;
         has_action_ = false;
+        action_sequence_ = 0;
+        applied_action_sequence_ = 0;
+        entry_target_transition_elapsed_ = 0.0;
         infer_count_window_ = 0;
         infer_window_start_ = std::chrono::steady_clock::now();
         if (config_.rl_freq_hz) {
@@ -123,10 +129,16 @@ public:
         // 2) 读取最新推理结果，映射到关节目标
         {
             std::lock_guard<std::mutex> lock(mutex_action_);
-            if (has_action_) {
+            const bool transition_enabled =
+                config_.entry_target_transition_duration > 0.0;
+            if (has_action_ && (!transition_enabled ||
+                                action_sequence_ != applied_action_sequence_)) {
                 std::vector<double> target_pos;
                 policy_.MapActionToTargetPos(cached_action_, target_pos);
-                output_->target_pos = std::move(target_pos);
+                ApplyEntryTargetTransition(
+                    target_pos, rl_dt,
+                    action_sequence_ - applied_action_sequence_);
+                applied_action_sequence_ = action_sequence_;
                 int ndof = static_cast<int>(output_->target_pos.size());
                 output_->target_vel.assign(ndof, 0.0);
                 output_->enable = true;
@@ -163,6 +175,26 @@ public:
     }
 
 private:
+    void ApplyEntryTargetTransition(const std::vector<double> &raw_target,
+                                    float rl_dt,
+                                    std::uint64_t inference_steps) {
+        const double duration = config_.entry_target_transition_duration;
+        if (duration <= 0.0 || output_->target_pos.size() != raw_target.size()) {
+            output_->target_pos = raw_target;
+            return;
+        }
+
+        entry_target_transition_elapsed_ = std::min(duration,
+            entry_target_transition_elapsed_ +
+                std::max(0.0, static_cast<double>(rl_dt)) * inference_steps);
+        const double progress = entry_target_transition_elapsed_ / duration;
+        const double alpha = progress * progress;
+        for (std::size_t i = 0; i < raw_target.size(); ++i) {
+            output_->target_pos[i] =
+                (1.0 - alpha) * output_->target_pos[i] + alpha * raw_target[i];
+        }
+    }
+
     // ==================== 推理线程回调 ====================
 
     bool InferStep() {
@@ -239,6 +271,7 @@ private:
             std::lock_guard<std::mutex> lock(mutex_action_);
             cached_action_ = std::move(action);
             has_action_ = true;
+            ++action_sequence_;
         }
 
         return true;  // 继续循环
@@ -288,6 +321,9 @@ private:
     std::mutex mutex_action_;
     std::vector<double> cached_action_;
     bool has_action_ = false;
+    std::uint64_t action_sequence_ = 0;
+    std::uint64_t applied_action_sequence_ = 0;
+    double entry_target_transition_elapsed_ = 0.0;
 
     void UpdateRlFreq() {
         ++infer_count_window_;

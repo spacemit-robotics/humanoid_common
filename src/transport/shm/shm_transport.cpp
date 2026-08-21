@@ -13,10 +13,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <iostream>
-#include <algorithm>
+
 namespace transport_shm {
 
 // ==================== 共享内存布局 ====================
@@ -66,16 +68,47 @@ bool Shm::Impl::Init(const ShmConfig& cfg) {
         flags |= O_CREAT;
     }
 
-    shm_fd_ = shm_open(cfg.channel_name.c_str(), flags, 0666);
+    shm_fd_ = shm_open(cfg.channel_name.c_str(), flags, 0660);
     if (shm_fd_ < 0) {
-        std::cerr << "[shm] shm_open 失败: " << cfg.channel_name << "\n";
+        std::cerr << "[shm] shm_open 失败: " << cfg.channel_name
+            << ": " << std::strerror(errno) << "\n";
         return false;
     }
 
-    // 设置大小（首次创建时需要，已存在时 ftruncate 不会缩小）
+    // shm_open 的 mode 会受进程 umask 影响。硬件 driver 以 root 运行时，
+    // 仍需允许同组的 control/HMI 进程读写，但不能开放给其他本机用户。
+    struct stat shm_stat {};
+    constexpr mode_t kSharedMode =
+        S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP;
+    if (fstat(shm_fd_, &shm_stat) < 0) {
+        std::cerr << "[shm] fstat 失败: " << cfg.channel_name
+            << ": " << std::strerror(errno) << "\n";
+        ::close(shm_fd_);
+        shm_fd_ = -1;
+        return false;
+    }
+    if (geteuid() == 0 && shm_stat.st_gid != getegid() &&
+        fchown(shm_fd_, static_cast<uid_t>(-1), getegid()) < 0) {
+        std::cerr << "[shm] fchown 失败: " << cfg.channel_name
+            << ": " << std::strerror(errno) << "\n";
+        ::close(shm_fd_);
+        shm_fd_ = -1;
+        return false;
+    }
+    if ((shm_stat.st_mode & 0777) != kSharedMode &&
+        fchmod(shm_fd_, kSharedMode) < 0) {
+        std::cerr << "[shm] fchmod 失败: " << cfg.channel_name
+            << ": " << std::strerror(errno) << "\n";
+        ::close(shm_fd_);
+        shm_fd_ = -1;
+        return false;
+    }
+
+    // 设置共享内存大小；各端配置一致时，重复设置不改变布局。
     if (cfg.create_if_not_exist) {
         if (ftruncate(shm_fd_, shm_size_) < 0) {
-            std::cerr << "[shm] ftruncate 失败\n";
+            std::cerr << "[shm] ftruncate 失败: " << cfg.channel_name
+                << ": " << std::strerror(errno) << "\n";
             ::close(shm_fd_);
             shm_fd_ = -1;
             return false;
@@ -85,7 +118,8 @@ bool Shm::Impl::Init(const ShmConfig& cfg) {
     // 映射到进程地址空间
     shm_ptr_ = mmap(nullptr, shm_size_, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd_, 0);
     if (shm_ptr_ == MAP_FAILED) {
-        std::cerr << "[shm] mmap 失败\n";
+        std::cerr << "[shm] mmap 失败: " << cfg.channel_name
+            << ": " << std::strerror(errno) << "\n";
         ::close(shm_fd_);
         shm_fd_ = -1;
         shm_ptr_ = nullptr;
@@ -107,6 +141,24 @@ bool Shm::Impl::Init(const ShmConfig& cfg) {
         header_->read_index.store(0, std::memory_order_relaxed);
         header_->capacity = cfg.capacity;
         header_->slot_size = cfg.slot_size;
+    } else {
+        if (header_->capacity != cfg.capacity || header_->slot_size != cfg.slot_size) {
+            std::cerr << "[shm] channel configuration mismatch: "
+                << cfg.channel_name << "\n";
+            Close();
+            return false;
+        }
+
+        // A new reader session must not consume commands left by an old process.
+        const uint32_t write_index =
+            header_->write_index.load(std::memory_order_acquire);
+        if (write_index >= header_->capacity) {
+            std::cerr << "[shm] corrupted channel header: "
+                << cfg.channel_name << "\n";
+            Close();
+            return false;
+        }
+        header_->read_index.store(write_index, std::memory_order_release);
     }
 
     return true;

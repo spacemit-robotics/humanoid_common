@@ -187,7 +187,7 @@ bool PrepareLogFile(const std::filesystem::path &path) {
 
 uint64_t HashFile(const std::string &path) {
     std::ifstream input(path, std::ios::binary);
-    uint64_t hash = 1469598103934665603ULL;
+    uint64_t hash = 14695981039346656037ULL;
     char buffer[4096];
     while (input.read(buffer, sizeof(buffer)) || input.gcount() > 0) {
         for (std::streamsize i = 0; i < input.gcount(); ++i) {

@@ -109,7 +109,7 @@ cd ~/spacemit_robot
 - `rl_policy.policies.<name>.kp/kd`：各策略训练时的 PD 增益（每帧随控制命令下发）
 - `rl_policy.policies.<name>.entry_target_transition_duration`（可选）：进入 RL 后按推理周期从上一目标位置过渡到策略原始目标；默认 `0`，不改变已有策略行为
 - `rl_policy.policies.<name>.prerequisite.policy / .duration`（可选）：前置策略链——切到本策略前先自动跑前置策略 `duration` 秒
-- `rl_policy.onnx_infer.policies.<name>.policy_adapter`（可选）：参考动作和特殊模型输入适配；支持 `mjlab`、`protomotions`
+- `rl_policy.onnx_infer.policies.<name>.policy_adapter`（可选）：参考动作和特殊模型输入适配；支持 `mjlab`、`protomotions`、`sonic`
 - `policy_adapter.reference_action`（MJLab 可选）：用 YAML 指定部分机器人关节采用“参考角 + 有界残差”输出合成；未配置时保持标准 action 映射
 - `rl_policy.onnx_infer.policies.<name>.command.limits`（可选）：应用层声明该策略接受的 `max_vx/max_vy/max_wz`；未配置时 HMI 和 Control 均拒绝速度命令
 - `behavior_manager.damp_kd`：阻尼状态 kd（≈ policy kd / 5）

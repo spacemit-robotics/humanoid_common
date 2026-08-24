@@ -48,6 +48,8 @@ struct Config {
     std::vector<int> anchor_waist_joint_indices;
     bool anchor_yaw_align = true;
 
+    int future_frames = 0;
+    int future_step = 1;
     std::vector<int> future_steps;
 
     ReferenceActionConfig reference_action;

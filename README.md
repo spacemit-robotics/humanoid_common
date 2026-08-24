@@ -219,12 +219,22 @@ policy_adapter:
   anchor_body_index: 0
   anchor_waist_joint_indices: []
   anchor_yaw_align: true
+  # 可选：与 MJLab 的 reference + residual action 定义保持一致。
+  reference_action:
+    joint_indices: [0, 1]  # 示例；按应用层的机器人关节顺序配置
+    residual_scale: 0.0
+    residual_clip: 1.0
 ```
 
 MJLab 使用 NPZ 参考动作；HoloMotion 和 ProtoMotions 使用各自预处理后的
 CSV，并可追加 `future_frames/context_length` 或 `future_steps`。策略若配置
 `zero_target_pos`，ZERO 阶段先过渡到参考动作起始姿态。非循环动作播放完成后
 保持末帧，状态切换仍由 HMI/control 负责。
+
+MJLab 的 `reference_action` 未配置时保持标准策略行为。配置后，仅列出的机器人
+关节使用 `参考关节角 + residual_scale * clip(原始模型 action)`；其余关节仍按
+通用 `rl_default_pos + action_scale * action` 映射。关节列表属于应用层机型参数，
+common 不固定自由度或手臂索引。
 
 ### ControlMode 数据流（control → driver）
 

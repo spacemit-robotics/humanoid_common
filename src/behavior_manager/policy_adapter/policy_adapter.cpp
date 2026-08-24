@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file policy_adapter.cpp
- * @brief MJLab、HoloMotion 和 ProtoMotions 策略输入适配
+ * @brief MJLab、HoloMotion、ProtoMotions 和 SONIC 策略输入适配
  */
 
 #include "policy_adapter.h"
@@ -145,6 +145,10 @@ void AppendQuaternionXyzw(
     output.push_back(quat.y());
     output.push_back(quat.z());
     output.push_back(quat.w());
+}
+
+void AppendZeros(int count, std::vector<float> &output) {
+    output.insert(output.end(), count, 0.0F);
 }
 
 class MjlabPolicyAdapter final : public PolicyAdapter {
@@ -915,6 +919,266 @@ private:
     std::vector<float> last_holomotion_action_;
 };
 
+struct SonicFrame {
+    std::vector<float> dof_pos;
+    std::vector<float> dof_vel;
+    Eigen::Quaternionf root_quat = Eigen::Quaternionf::Identity();
+};
+
+/**
+ * @brief SONIC 机器人关节参考动作编码适配器
+ *
+ * 未来窗口和模型关节数由机型 YAML/策略配置提供；本类只实现 SONIC
+ * reference encoder 的字段排列和 masking。机器人关节映射和 PD 参数仍全部
+ * 由机型 YAML 提供。
+ */
+class SonicPolicyAdapter final : public PolicyAdapter {
+public:
+    SonicPolicyAdapter(const Config &config,
+        const rl_policy::PolicyExecutorConfig &policy_config)
+        : config_(config) {
+        model_dof_count_ = policy_config.action_joint_index.empty()
+            ? static_cast<int>(policy_config.rl_default_pos.size())
+            : static_cast<int>(policy_config.action_joint_index.size());
+        ValidateConfig();
+        LoadReference();
+    }
+
+    const char *Type() const override { return "sonic"; }
+
+    void Reset(const robot_base::RobotData &robot) override {
+        heading_offset_ = YawQuaternion(
+            QuaternionYaw(RobotQuaternion(robot)) -
+            QuaternionYaw(motion_[0].root_quat));
+        heading_offset_.normalize();
+    }
+
+    void PrepareInputs(const robot_base::RobotData &robot,
+        double elapsed_s,
+        rl_policy::PolicyExecutor &policy) override {
+        const PlaybackSample sample = SamplePlayback(
+            elapsed_s, static_cast<int>(motion_.size()), config_);
+
+        std::vector<float> values;
+        const std::size_t reference_obs_dim = ReferenceObsDim();
+        values.reserve(reference_obs_dim);
+
+        // encoder_mode_4：G1 mode_id=0，其余三维为 padding。
+        AppendZeros(kEncoderModeDim, values);
+        AppendFutureDof(sample, false, values);
+        AppendFutureDof(sample, true, values);
+
+        // 以下字段属于其他 encoder mode，在 G1 mode 下按官方 masking 置零。
+        AppendZeros(config_.future_frames, values);  // future root z
+        AppendZeros(1, values);    // motion_root_z_position
+        AppendZeros(kOrientationDim, values);  // motion_anchor_orientation
+        AppendFutureOrientation(robot, sample, values);
+        AppendZeros(kLowerBodyDofCount * config_.future_frames, values);
+        AppendZeros(kLowerBodyDofCount * config_.future_frames, values);
+        AppendZeros(kVrPositionDim, values);
+        AppendZeros(kVrOrientationDim, values);
+        AppendZeros(kSmplJointCount * kPositionDim * config_.future_frames,
+            values);
+        AppendZeros(kOrientationDim * config_.future_frames, values);
+        AppendZeros(kWristPositionDim * config_.future_frames, values);
+
+        if (values.size() != reference_obs_dim) {
+            throw std::runtime_error(
+                "[policy_adapter] SONIC reference_obs 维度错误: 实际=" +
+                std::to_string(values.size()) + ", 期望=" +
+                std::to_string(reference_obs_dim));
+        }
+        policy.SetModelInput(
+            "reference_obs", values.data(), values.size());
+    }
+
+private:
+    static constexpr int kEncoderModeDim = 4;
+    static constexpr int kPositionDim = 3;
+    static constexpr int kOrientationDim = 6;
+    static constexpr int kLowerBodyDofCount = 12;
+    static constexpr int kVrPositionDim = 9;
+    static constexpr int kVrOrientationDim = 12;
+    static constexpr int kSmplJointCount = 24;
+    static constexpr int kWristPositionDim = 6;
+
+    void ValidateConfig() const {
+        if (model_dof_count_ <= 0) {
+            throw std::runtime_error(
+                "[policy_adapter] SONIC 模型关节数必须大于 0");
+        }
+        if (config_.future_frames <= 0 || config_.future_step <= 0) {
+            throw std::runtime_error(
+                "[policy_adapter] SONIC future_frames 和 future_step "
+                "必须大于 0");
+        }
+    }
+
+    std::size_t ReferenceObsDim() const {
+        const std::size_t future_frames =
+            static_cast<std::size_t>(config_.future_frames);
+        const std::size_t model_dof_count =
+            static_cast<std::size_t>(model_dof_count_);
+        return kEncoderModeDim +
+            2 * future_frames * model_dof_count +
+            future_frames + 1 + kOrientationDim +
+            kOrientationDim * future_frames +
+            2 * kLowerBodyDofCount * future_frames +
+            kVrPositionDim + kVrOrientationDim +
+            kSmplJointCount * kPositionDim * future_frames +
+            kOrientationDim * future_frames +
+            kWristPositionDim * future_frames;
+    }
+
+    std::vector<std::vector<double>> LoadCsv(
+        const fs::path &path,
+        int minimum_columns,
+        bool exact_columns) const {
+        std::ifstream input(path);
+        if (!input) {
+            throw std::runtime_error(
+                "[policy_adapter] 无法打开 SONIC 参考 CSV: " +
+                path.string());
+        }
+
+        std::string line;
+        if (!std::getline(input, line)) {
+            throw std::runtime_error(
+                "[policy_adapter] SONIC 参考 CSV 为空: " + path.string());
+        }
+
+        std::vector<std::vector<double>> rows;
+        int line_number = 1;
+        while (std::getline(input, line)) {
+            ++line_number;
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+            std::vector<double> values = ParseCsvRow(line);
+            const bool valid_columns = exact_columns
+                ? static_cast<int>(values.size()) == minimum_columns
+                : static_cast<int>(values.size()) >= minimum_columns;
+            if (!valid_columns) {
+                throw std::runtime_error(
+                    "[policy_adapter] SONIC 参考 CSV " + path.string() +
+                    " 第 " + std::to_string(line_number) +
+                    " 行列数错误: 实际=" +
+                    std::to_string(values.size()) +
+                    (exact_columns ? ", 期望=" : ", 至少需要=") +
+                    std::to_string(minimum_columns));
+            }
+            rows.push_back(std::move(values));
+        }
+        if (rows.empty()) {
+            throw std::runtime_error(
+                "[policy_adapter] SONIC 参考 CSV 没有数据帧: " +
+                path.string());
+        }
+        return rows;
+    }
+
+    void LoadReference() {
+        const fs::path reference_dir(config_.reference_file);
+        const auto joint_pos = LoadCsv(
+            reference_dir / "joint_pos.csv", model_dof_count_, true);
+        const auto joint_vel = LoadCsv(
+            reference_dir / "joint_vel.csv", model_dof_count_, true);
+        const auto body_quat = LoadCsv(
+            reference_dir / "body_quat.csv", 4, false);
+        if (joint_pos.size() != joint_vel.size() ||
+            joint_pos.size() != body_quat.size()) {
+            throw std::runtime_error(
+                "[policy_adapter] SONIC joint_pos、joint_vel 和 body_quat "
+                "帧数不一致");
+        }
+
+        motion_.reserve(joint_pos.size());
+        for (std::size_t frame_index = 0;
+            frame_index < joint_pos.size(); ++frame_index) {
+            SonicFrame frame;
+            frame.dof_pos.reserve(model_dof_count_);
+            frame.dof_vel.reserve(model_dof_count_);
+            for (int joint = 0; joint < model_dof_count_; ++joint) {
+                frame.dof_pos.push_back(static_cast<float>(
+                    joint_pos[frame_index][joint]));
+                frame.dof_vel.push_back(static_cast<float>(
+                    joint_vel[frame_index][joint]));
+            }
+            const auto &quat = body_quat[frame_index];
+            frame.root_quat = Eigen::Quaternionf(
+                static_cast<float>(quat[0]),
+                static_cast<float>(quat[1]),
+                static_cast<float>(quat[2]),
+                static_cast<float>(quat[3]));
+            if (frame.root_quat.norm() < 1.0e-6F) {
+                throw std::runtime_error(
+                    "[policy_adapter] SONIC body_quat 包含零四元数");
+            }
+            frame.root_quat.normalize();
+            motion_.push_back(std::move(frame));
+        }
+        std::cout << "[policy_adapter] SONIC: " << motion_.size()
+            << " 帧, model_dof=" << model_dof_count_
+            << ", reference=" << config_.reference_file << std::endl;
+    }
+
+    const SonicFrame &FrameAt(int index) const {
+        return motion_[std::clamp(
+            index, 0, static_cast<int>(motion_.size()) - 1)];
+    }
+
+    void AppendFutureDof(const PlaybackSample &sample,
+        bool velocity,
+        std::vector<float> &output) const {
+        for (int future = 0; future < config_.future_frames; ++future) {
+            const int offset = future * config_.future_step;
+            const auto &frame0 = FrameAt(sample.frame0 + offset);
+            const auto &frame1 = FrameAt(sample.frame1 + offset);
+            const auto &value0 = velocity ? frame0.dof_vel : frame0.dof_pos;
+            const auto &value1 = velocity ? frame1.dof_vel : frame1.dof_pos;
+            for (int joint = 0; joint < model_dof_count_; ++joint) {
+                float value = (1.0F - sample.alpha) * value0[joint] +
+                    sample.alpha * value1[joint];
+                if (velocity) {
+                    value = sample.hold_last_frame
+                        ? 0.0F
+                        : value * static_cast<float>(config_.playback_speed);
+                }
+                output.push_back(value);
+            }
+        }
+    }
+
+    void AppendFutureOrientation(const robot_base::RobotData &robot,
+        const PlaybackSample &sample,
+        std::vector<float> &output) const {
+        const Eigen::Quaternionf robot_quat = RobotQuaternion(robot);
+        for (int future = 0; future < config_.future_frames; ++future) {
+            const int offset = future * config_.future_step;
+            Eigen::Quaternionf reference =
+                FrameAt(sample.frame0 + offset).root_quat.slerp(
+                    sample.alpha,
+                    FrameAt(sample.frame1 + offset).root_quat);
+            reference = (heading_offset_ * reference).normalized();
+            const Eigen::Matrix3f rotation =
+                (robot_quat.conjugate() * reference)
+                    .normalized()
+                    .toRotationMatrix();
+            output.push_back(rotation(0, 0));
+            output.push_back(rotation(0, 1));
+            output.push_back(rotation(1, 0));
+            output.push_back(rotation(1, 1));
+            output.push_back(rotation(2, 0));
+            output.push_back(rotation(2, 1));
+        }
+    }
+
+    Config config_;
+    int model_dof_count_ = 0;
+    std::vector<SonicFrame> motion_;
+    Eigen::Quaternionf heading_offset_ = Eigen::Quaternionf::Identity();
+};
+
 std::string ReadReferenceField(const robot_base::YamlFile &yaml,
     const std::string &base,
     const std::string &robot_dir) {
@@ -964,6 +1228,8 @@ Config LoadConfig(const std::string &yaml_path,
             adapter_base + ".anchor_yaw_align").value_or(true);
         config.future_frames = yaml.Read<int>(
             adapter_base + ".future_frames").value_or(0);
+        config.future_step = yaml.Read<int>(
+            adapter_base + ".future_step").value_or(1);
         config.context_length = yaml.Read<int>(
             adapter_base + ".context_length").value_or(0);
         config.future_steps = yaml.Read<std::vector<int>>(
@@ -1027,6 +1293,9 @@ std::unique_ptr<PolicyAdapter> Create(
     if (config.type == "protomotions") {
         return std::make_unique<GeneralMotionPolicyAdapter>(
             GeneralTrackerKind::PROTOMOTIONS, config, policy_config);
+    }
+    if (config.type == "sonic") {
+        return std::make_unique<SonicPolicyAdapter>(config, policy_config);
     }
     throw std::runtime_error(
         "[policy_adapter] 不支持的 type: " + config.type);

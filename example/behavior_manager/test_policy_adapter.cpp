@@ -137,6 +137,64 @@ private:
     fs::path path_;
 };
 
+class TempSonicReference {
+public:
+    explicit TempSonicReference(int joint_count)
+        : joint_count_(joint_count) {
+        const auto nonce = std::chrono::steady_clock::now()
+            .time_since_epoch().count();
+        path_ = fs::temp_directory_path() /
+            ("sonic_reference_" + std::to_string(nonce));
+        fs::create_directories(path_);
+        WriteJointCsv(path_ / "joint_pos.csv", "joint_", 0.01);
+        WriteJointCsv(path_ / "joint_vel.csv", "joint_vel_", 0.02);
+
+        std::ofstream body_quat(path_ / "body_quat.csv");
+        if (!body_quat) {
+            throw std::runtime_error("无法创建 SONIC 四元数参考动作");
+        }
+        body_quat << "body_0_w,body_0_x,body_0_y,body_0_z\n"
+                << "1,0,0,0\n"
+                << "1,0,0,0\n";
+    }
+
+    ~TempSonicReference() {
+        std::error_code error;
+        fs::remove_all(path_, error);
+    }
+
+    const fs::path &Path() const { return path_; }
+
+private:
+    void WriteJointCsv(const fs::path &path,
+        const std::string &prefix,
+        double scale) {
+        std::ofstream output(path);
+        if (!output) {
+            throw std::runtime_error("无法创建 SONIC 关节参考动作");
+        }
+        for (int joint = 0; joint < joint_count_; ++joint) {
+            if (joint > 0) {
+                output << ',';
+            }
+            output << prefix << joint;
+        }
+        output << '\n';
+        for (int frame = 0; frame < 2; ++frame) {
+            for (int joint = 0; joint < joint_count_; ++joint) {
+                if (joint > 0) {
+                    output << ',';
+                }
+                output << scale * (frame + joint);
+            }
+            output << '\n';
+        }
+    }
+
+    int joint_count_ = 0;
+    fs::path path_;
+};
+
 void Require(bool condition, const std::string &message) {
     if (!condition) {
         throw std::runtime_error(message);
@@ -158,6 +216,15 @@ robot_base::RobotData MakeTwoDofRobot() {
     robot.joint_pos = {0.1, -0.2};
     robot.joint_vel = {0.3, -0.4};
     return robot;
+}
+
+rl_policy::PolicyExecutorConfig MakeSonicPolicyConfig(int joint_count) {
+    rl_policy::PolicyExecutorConfig config;
+    config.rl_default_pos.assign(joint_count, 0.0);
+    for (int joint = 0; joint < joint_count; ++joint) {
+        config.action_joint_index.push_back(joint);
+    }
+    return config;
 }
 
 void TestHolomotionDynamicDimensions() {
@@ -306,6 +373,54 @@ void TestMjlabReferenceActionYaml() {
         "未加载 reference_action.residual_clip");
 }
 
+void TestSonicReferenceAndConfig() {
+    constexpr int kTestJointCount = 7;
+    const TempSonicReference reference(kTestJointCount);
+    Config config;
+    config.type = "sonic";
+    config.reference_file = reference.Path().string();
+    config.future_frames = 3;
+    config.future_step = 2;
+
+    auto adapter = Create(config, MakeSonicPolicyConfig(kTestJointCount));
+    Require(adapter && std::string(adapter->Type()) == "sonic",
+        "未创建 SONIC adapter");
+
+    robot_base::RobotData robot;
+    robot.num_dof = kTestJointCount;
+    robot.base_quat = {1.0, 0.0, 0.0, 0.0};
+    robot.joint_pos.assign(kTestJointCount, 0.0);
+    robot.joint_vel.assign(kTestJointCount, 0.0);
+    adapter->Reset(robot);
+
+    Config invalid = config;
+    invalid.future_step = 0;
+    bool rejected_wrong_window = false;
+    try {
+        static_cast<void>(Create(
+            invalid, MakeSonicPolicyConfig(kTestJointCount)));
+    } catch (const std::runtime_error &) {
+        rejected_wrong_window = true;
+    }
+    Require(rejected_wrong_window,
+        "SONIC 未拒绝非法的未来窗口");
+
+    const TempReference yaml("sonic_adapter_yaml",
+        "rl_policy:\n"
+        "  onnx_infer:\n"
+        "    policies:\n"
+        "      sonic:\n"
+        "        policy_adapter:\n"
+        "          type: sonic\n"
+        "          reference_file: " + reference.Path().string() + "\n"
+        "          future_frames: 10\n"
+        "          future_step: 5\n");
+    const auto loaded = LoadConfig(yaml.Path().string(), "sonic",
+        fs::temp_directory_path().string());
+    Require(loaded.future_frames == 10 && loaded.future_step == 5,
+        "未加载 SONIC future window 配置");
+}
+
 void TestConfiguredPolicy(const std::string &yaml_path,
     const std::string &robot_dir,
     const std::string &policy_name) {
@@ -403,6 +518,7 @@ int main(int argc, char **argv) {
         TestMjlabZip64AndUnicodeMetadata();
         TestMjlabReferenceResidualAction();
         TestMjlabReferenceActionYaml();
+        TestSonicReferenceAndConfig();
         if (argc == 4) {
             TestConfiguredPolicy(argv[1], argv[2], argv[3]);
         }

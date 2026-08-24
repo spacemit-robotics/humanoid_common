@@ -201,7 +201,7 @@ rl_policy:
 `behavior_manager` 平级的新 common 模块：
 
 1. `model_zoo/rl` 只负责通用 ONNX I/O、feedback tensor 和观测项组装。
-2. [`policy_adapter`](src/behavior_manager/policy_adapter/) 负责参考动作读取、时间轴、朝向对齐，以及 HoloMotion / ProtoMotions 的输入协议。
+2. [`policy_adapter`](src/behavior_manager/policy_adapter/) 负责参考动作读取、时间轴、朝向对齐，以及 HoloMotion / ProtoMotions / SONIC 的输入协议。
 3. 应用层机型仓库只提供模型、参考动作和 YAML 参数，不放 tracker C++ 代码。
 
 机器人自由度取自策略 `rl_default_pos`，模型关节顺序取自
@@ -210,7 +210,7 @@ rl_policy:
 
 ```yaml
 policy_adapter:
-  type: mjlab                 # mjlab / holomotion / protomotions
+  type: mjlab                 # mjlab / holomotion / protomotions / sonic
   reference_file: policy/example/motion.npz
   motion_fps: 50
   playback_speed: 1.0
@@ -226,8 +226,9 @@ policy_adapter:
     residual_clip: 1.0
 ```
 
-MJLab 使用 NPZ 参考动作；HoloMotion 和 ProtoMotions 使用各自预处理后的
-CSV，并可追加 `future_frames/context_length` 或 `future_steps`。策略若配置
+MJLab 使用 NPZ 参考动作；HoloMotion、ProtoMotions 和 SONIC 使用各自
+预处理后的 CSV，并可追加 `future_frames/context_length`、`future_step`
+或 `future_steps`。策略若配置
 `zero_target_pos`，ZERO 阶段先过渡到参考动作起始姿态。非循环动作播放完成后
 保持末帧，状态切换仍由 HMI/control 负责。
 

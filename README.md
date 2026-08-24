@@ -226,9 +226,18 @@ policy_adapter:
     residual_clip: 1.0
 ```
 
-MJLab 使用 NPZ 参考动作；HoloMotion、ProtoMotions 和 SONIC 使用各自
-预处理后的 CSV，并可追加 `future_frames/context_length`、`future_step`
-或 `future_steps`。策略若配置
+各类 adapter 的参考输入和未来窗口参数分别为：
+
+- MJLab：`reference_file` 指向单个 NPZ；
+- HoloMotion：`reference_file` 指向单个预处理 CSV，使用
+  `future_frames` 和 `context_length`；
+- ProtoMotions：`reference_file` 指向单个预处理 CSV，使用
+  `future_steps`；
+- SONIC：`reference_file` 指向参考动作目录；目录内必须包含
+  `joint_pos.csv`、`joint_vel.csv` 和 `body_quat.csv`，使用
+  `future_frames` 和 `future_step`。
+
+策略若配置
 `zero_target_pos`，ZERO 阶段先过渡到参考动作起始姿态。非循环动作播放完成后
 保持末帧，状态切换仍由 HMI/control 负责。
 

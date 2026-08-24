@@ -59,6 +59,15 @@ const char kZip64UnicodeNpz[] =
     "c193Lm5weVBLAQIUAxQAAAAAAAAAIQDn07pjoAAAAKAAAAAPAAAAAAAAAAAAAACAAUcDAABi"
     "b2R5X3F1YXRfdy5ucHlQSwUGAAAAAAUABQAsAQAAKAQAAAAA";
 
+// 输入为 SONIC G1 的 1762 维 reference_obs；Gather 输出跨越 joint_pos、
+// joint_vel、future orientation 和末尾 padding 的 29 个探针值。
+const char kSonicReferenceProbeOnnx[] =
+    "CAg66gEKNQoNcmVmZXJlbmNlX29icwoHaW5kaWNlcxIGYWN0aW9uIgZHYXRoZXIqCwoEYXhp"
+    "cxgBoAECEhVzb25pY19yZWZlcmVuY2VfcHJvYmUqRwgdEAc6OCAhwgLDAtkE3AThDeEN4Q3h"
+    "DeEN4Q3hDeEN4Q3hDeEN4Q3hDeEN4Q3hDeEN4Q3hDeEN4Q3hDeENQgdpbmRpY2VzWiAKDXJl"
+    "ZmVyZW5jZV9vYnMSDwoNCAESCQoCCAEKAwjiDVoVCgNvYnMSDgoMCAESCAoCCAEKAggDYhgK"
+    "BmFjdGlvbhIOCgwIARIICgIIAQoCCB1CBAoAEA0";
+
 std::vector<unsigned char> DecodeBase64(const std::string &encoded) {
     static const char kAlphabet[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -192,6 +201,36 @@ private:
     }
 
     int joint_count_ = 0;
+    fs::path path_;
+};
+
+class TempSonicOnnx {
+public:
+    TempSonicOnnx() {
+        const auto nonce = std::chrono::steady_clock::now()
+            .time_since_epoch().count();
+        path_ = fs::temp_directory_path() /
+            ("sonic_reference_probe_" + std::to_string(nonce) + ".onnx");
+        std::ofstream output(path_, std::ios::binary);
+        if (!output) {
+            throw std::runtime_error("无法创建 SONIC 测试 ONNX");
+        }
+        const auto bytes = DecodeBase64(kSonicReferenceProbeOnnx);
+        output.write(reinterpret_cast<const char *>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+        if (!output) {
+            throw std::runtime_error("无法写入 SONIC 测试 ONNX");
+        }
+    }
+
+    ~TempSonicOnnx() {
+        std::error_code error;
+        fs::remove(path_, error);
+    }
+
+    const fs::path &Path() const { return path_; }
+
+private:
     fs::path path_;
 };
 
@@ -421,6 +460,68 @@ void TestSonicReferenceAndConfig() {
         "未加载 SONIC future window 配置");
 }
 
+void TestSonicPrepareInputs() {
+    constexpr int kG1JointCount = 29;
+    const TempSonicReference reference(kG1JointCount);
+    const TempSonicOnnx model;
+
+    Config config;
+    config.type = "sonic";
+    config.reference_file = reference.Path().string();
+    config.future_frames = 10;
+    config.future_step = 5;
+
+    auto policy_config = MakeSonicPolicyConfig(kG1JointCount);
+    policy_config.model_path = model.Path().string();
+    policy_config.action_scale = {1.0};
+    policy_config.strict_obs_dim_check = true;
+    policy_config.obs_segments.emplace_back();
+    policy_config.obs_segments.back().terms = {"gravity"};
+
+    rl_policy::ModelInputBindingConfig input;
+    input.name = "reference_obs";
+    input.source = rl_policy::ModelInputSource::EXTERNAL;
+    policy_config.model_io.inputs.push_back(input);
+
+    input.name = "obs";
+    input.source = rl_policy::ModelInputSource::OBSERVATION;
+    policy_config.model_io.inputs.push_back(input);
+
+    rl_policy::ModelOutputBindingConfig output;
+    output.name = "action";
+    output.target = rl_policy::ModelOutputTarget::ACTION;
+    policy_config.model_io.outputs.push_back(output);
+
+    auto adapter = Create(config, policy_config);
+    robot_base::RobotData robot;
+    robot.num_dof = kG1JointCount;
+    robot.base_quat = {1.0, 0.0, 0.0, 0.0};
+    robot.joint_pos.assign(kG1JointCount, 0.0);
+    robot.joint_vel.assign(kG1JointCount, 0.0);
+    adapter->Reset(robot);
+
+    rl_policy::PolicyExecutor policy;
+    policy.Init(policy_config);
+    adapter->PrepareInputs(robot, 0.0, policy);
+
+    Eigen::VectorXf observation = Eigen::VectorXf::Zero(policy.ObsDim());
+    std::vector<double> action;
+    policy.Infer(observation, action);
+    const std::vector<double> expected = {
+        0.28, 0.01, 0.56, 0.02, 1.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    };
+    Require(action.size() == expected.size(),
+        "SONIC PrepareInputs 未生成 1762 维模型所需输入");
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        Require(std::abs(action[index] - expected[index]) < 1.0e-6,
+            "SONIC reference_obs 字段拼接顺序错误: index=" +
+            std::to_string(index));
+    }
+}
+
 void TestConfiguredPolicy(const std::string &yaml_path,
     const std::string &robot_dir,
     const std::string &policy_name) {
@@ -519,6 +620,7 @@ int main(int argc, char **argv) {
         TestMjlabReferenceResidualAction();
         TestMjlabReferenceActionYaml();
         TestSonicReferenceAndConfig();
+        TestSonicPrepareInputs();
         if (argc == 4) {
             TestConfiguredPolicy(argv[1], argv[2], argv[3]);
         }

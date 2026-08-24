@@ -330,6 +330,6 @@ if(BUILD_RL)
         ${RL_INCLUDE_DIR}
     )
     target_link_libraries(test_policy_adapter PRIVATE
-        behavior_manager robot_base Eigen3::Eigen ${RL_LIB})
+        behavior_manager robot_base Eigen3::Eigen ${RL_LIB} cnpy)
     install(TARGETS test_policy_adapter RUNTIME DESTINATION bin)
 endif()

@@ -18,6 +18,7 @@
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -148,13 +149,17 @@ void AppendQuaternionXyzw(
 
 class MjlabPolicyAdapter final : public PolicyAdapter {
 public:
-    explicit MjlabPolicyAdapter(const Config &config) : config_(config) {
+    MjlabPolicyAdapter(const Config &config,
+        const rl_policy::PolicyExecutorConfig &policy_config)
+        : config_(config) {
         LoadReference();
+        ConfigureReferenceAction(policy_config);
     }
 
     const char *Type() const override { return "mjlab"; }
 
     void Reset(const robot_base::RobotData &robot) override {
+        reference_sample_ready_ = false;
         if (!config_.anchor_yaw_align) {
             heading_offset_ = Eigen::Quaternionf::Identity();
             return;
@@ -220,9 +225,143 @@ public:
             static_cast<int>(motion_command_.size()));
         policy.SetCustomArray("motion_anchor_pos_b", anchor_pos_body_.data(), 3);
         policy.SetCustomArray("motion_anchor_ori_b", anchor_ori_body_.data(), 6);
+        reference_sample_ready_ = true;
+    }
+
+    void OnAction(std::vector<double> &action) override {
+        if (reference_action_bindings_.empty()) {
+            return;
+        }
+        if (!reference_sample_ready_) {
+            throw std::runtime_error(
+                "[policy_adapter] MJLab 参考 action 尚未采样");
+        }
+        if (action.size() != static_cast<std::size_t>(action_dim_)) {
+            throw std::runtime_error(
+                "[policy_adapter] MJLab action 维度错误: 实际=" +
+                std::to_string(action.size()) + ", 期望=" +
+                std::to_string(action_dim_));
+        }
+
+        for (const auto &binding : reference_action_bindings_) {
+            const double raw_action = action[binding.action_index];
+            if (!std::isfinite(raw_action)) {
+                throw std::runtime_error(
+                    "[policy_adapter] MJLab action 包含非有限值");
+            }
+            const double residual = std::clamp(raw_action,
+                -config_.reference_action.residual_clip,
+                config_.reference_action.residual_clip) *
+                config_.reference_action.residual_scale;
+            const double reference =
+                static_cast<double>(motion_command_[binding.joint_index]);
+            const double target = reference + residual;
+            action[binding.action_index] =
+                (target - binding.default_position) / binding.action_scale;
+        }
     }
 
 private:
+    struct ReferenceActionBinding {
+        int action_index = 0;
+        int joint_index = 0;
+        double action_scale = 1.0;
+        double default_position = 0.0;
+    };
+
+    void ConfigureReferenceAction(
+        const rl_policy::PolicyExecutorConfig &policy_config) {
+        if (!config_.reference_action.Enabled()) {
+            return;
+        }
+        if (!std::isfinite(config_.reference_action.residual_scale) ||
+            config_.reference_action.residual_scale < 0.0) {
+            throw std::runtime_error(
+                "[policy_adapter] reference_action.residual_scale "
+                "必须为非负有限值");
+        }
+        if (!std::isfinite(config_.reference_action.residual_clip) ||
+            config_.reference_action.residual_clip <= 0.0) {
+            throw std::runtime_error(
+                "[policy_adapter] reference_action.residual_clip "
+                "必须为正有限值");
+        }
+
+        const int robot_dof =
+            static_cast<int>(policy_config.rl_default_pos.size());
+        if (robot_dof <= 0) {
+            throw std::runtime_error(
+                "[policy_adapter] reference_action 需要非空 rl_default_pos");
+        }
+        action_dim_ = policy_config.action_joint_index.empty()
+            ? robot_dof
+            : static_cast<int>(policy_config.action_joint_index.size());
+        if (policy_config.action_scale.empty() ||
+            (policy_config.action_scale.size() != 1 &&
+                policy_config.action_scale.size() !=
+                    static_cast<std::size_t>(action_dim_))) {
+            throw std::runtime_error(
+                "[policy_adapter] reference_action 的 action_scale "
+                "维度必须为 1 或 action 维度");
+        }
+
+        std::vector<bool> used_actions(action_dim_, false);
+        for (const int joint_index :
+                config_.reference_action.joint_indices) {
+            if (joint_index < 0 || joint_index >= robot_dof ||
+                joint_index >= joint_dim_) {
+                throw std::runtime_error(
+                    "[policy_adapter] reference_action.joint_indices "
+                    "越界: " + std::to_string(joint_index));
+            }
+
+            int action_index = joint_index;
+            if (!policy_config.action_joint_index.empty()) {
+                const auto position = std::find(
+                    policy_config.action_joint_index.begin(),
+                    policy_config.action_joint_index.end(), joint_index);
+                if (position == policy_config.action_joint_index.end()) {
+                    throw std::runtime_error(
+                        "[policy_adapter] reference_action 关节未被模型 "
+                        "action_joint_index 控制: " +
+                        std::to_string(joint_index));
+                }
+                action_index = static_cast<int>(std::distance(
+                    policy_config.action_joint_index.begin(), position));
+            }
+            if (used_actions[action_index]) {
+                throw std::runtime_error(
+                    "[policy_adapter] reference_action.joint_indices 重复: " +
+                    std::to_string(joint_index));
+            }
+            used_actions[action_index] = true;
+
+            const double action_scale =
+                policy_config.action_scale.size() == 1
+                    ? policy_config.action_scale[0]
+                    : policy_config.action_scale[action_index];
+            if (!std::isfinite(action_scale) ||
+                std::abs(action_scale) <= 1.0e-12) {
+                throw std::runtime_error(
+                    "[policy_adapter] reference_action 对应的 "
+                    "action_scale 必须为非零有限值");
+            }
+            const double default_position =
+                policy_config.rl_default_pos[joint_index];
+            if (!std::isfinite(default_position)) {
+                throw std::runtime_error(
+                    "[policy_adapter] reference_action 对应的 "
+                    "rl_default_pos 必须为有限值");
+            }
+            reference_action_bindings_.push_back({
+                action_index,
+                joint_index,
+                action_scale,
+                default_position,
+            });
+        }
+    }
+
     void LoadReference() {
         std::cout << "[policy_adapter] 加载 MJLab NPZ: "
             << config_.reference_file << std::endl;
@@ -304,7 +443,9 @@ private:
         motion_command_.assign(joint_dim_ * 2, 0.0F);
         std::cout << "[policy_adapter] MJLab: " << num_frames_
             << " 帧, " << joint_dim_ << " 关节, speed="
-            << config_.playback_speed << "x" << std::endl;
+            << config_.playback_speed << "x, reference_action="
+            << config_.reference_action.joint_indices.size()
+            << " 关节" << std::endl;
     }
 
     Config config_;
@@ -318,6 +459,9 @@ private:
     std::vector<float> motion_command_;
     std::array<float, 3> anchor_pos_body_ = {};
     std::array<float, 6> anchor_ori_body_ = {};
+    int action_dim_ = 0;
+    bool reference_sample_ready_ = false;
+    std::vector<ReferenceActionBinding> reference_action_bindings_;
 };
 
 enum class GeneralTrackerKind {
@@ -416,7 +560,7 @@ public:
         }
     }
 
-    void OnAction(const std::vector<double> &action) override {
+    void OnAction(std::vector<double> &action) override {
         if (kind_ != GeneralTrackerKind::HOLOMOTION) {
             return;
         }
@@ -824,6 +968,16 @@ Config LoadConfig(const std::string &yaml_path,
             adapter_base + ".context_length").value_or(0);
         config.future_steps = yaml.Read<std::vector<int>>(
             adapter_base + ".future_steps").value_or(std::vector<int>{});
+        config.reference_action.joint_indices =
+            yaml.Read<std::vector<int>>(
+                adapter_base + ".reference_action.joint_indices")
+                .value_or(std::vector<int>{});
+        config.reference_action.residual_scale = yaml.Read<double>(
+            adapter_base + ".reference_action.residual_scale")
+                .value_or(0.0);
+        config.reference_action.residual_clip = yaml.Read<double>(
+            adapter_base + ".reference_action.residual_clip")
+                .value_or(1.0);
         return config;
     }
 
@@ -860,7 +1014,11 @@ std::unique_ptr<PolicyAdapter> Create(
         return nullptr;
     }
     if (config.type == "mjlab" || config.type == "mjlab_tracking") {
-        return std::make_unique<MjlabPolicyAdapter>(config);
+        return std::make_unique<MjlabPolicyAdapter>(config, policy_config);
+    }
+    if (config.reference_action.Enabled()) {
+        throw std::runtime_error(
+            "[policy_adapter] reference_action 仅适用于 MJLab adapter");
     }
     if (config.type == "holomotion") {
         return std::make_unique<GeneralMotionPolicyAdapter>(

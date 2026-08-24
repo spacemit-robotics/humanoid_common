@@ -20,6 +20,17 @@ namespace behavior_manager {
 namespace policy_adapter {
 
 /**
+ * @brief MJLab 参考动作输出合成配置
+ */
+struct ReferenceActionConfig {
+    std::vector<int> joint_indices;
+    double residual_scale = 0.0;
+    double residual_clip = 1.0;
+
+    bool Enabled() const { return !joint_indices.empty(); }
+};
+
+/**
  * @brief 单个策略的适配器配置
  *
  * 该结构仅在 behavior_manager 内部使用。机型仓库通过 YAML 提供参数，
@@ -40,6 +51,8 @@ struct Config {
     int future_frames = 0;
     int context_length = 0;
     std::vector<int> future_steps;
+
+    ReferenceActionConfig reference_action;
 
     bool Enabled() const { return !type.empty(); }
 };
@@ -66,8 +79,13 @@ public:
         double elapsed_s,
         rl_policy::PolicyExecutor &policy) = 0;
 
-    /** @brief 推理后接收原始模型 action，供下一帧观测使用 */
-    virtual void OnAction(const std::vector<double> &action) {}
+    /**
+     * @brief 推理后按策略协议处理 action 副本
+     *
+     * 适配器可以保存模型输出供下一帧使用，也可以改写送往通用关节目标映射的
+     * action。PolicyExecutor 内部状态不受改写影响。
+     */
+    virtual void OnAction(std::vector<double> &action) {}
 
     /** @brief 适配器类型，用于日志 */
     virtual const char *Type() const = 0;

@@ -49,6 +49,7 @@ struct Config {
     bool anchor_yaw_align = true;
 
     int future_frames = 0;
+    int future_step = 1;
     int context_length = 0;
     std::vector<int> future_steps;
 

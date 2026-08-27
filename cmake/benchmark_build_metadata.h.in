@@ -1,0 +1,15 @@
+/**
+ * Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * @file benchmark_build_metadata.h
+ * @brief CMake-generated build metadata for the StateRL benchmark
+ */
+
+#ifndef BENCHMARK_BUILD_METADATA_H
+#define BENCHMARK_BUILD_METADATA_H
+
+#define RL_BENCHMARK_BUILD_TYPE "@_common_benchmark_build_type@"
+#define RL_BENCHMARK_CXX_FLAGS "@_common_benchmark_flags@"
+
+#endif  // BENCHMARK_BUILD_METADATA_H

@@ -5,6 +5,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# mm 默认不传 CMAKE_BUILD_TYPE。StateRL runtime benchmark 会执行本包中的
+# 控制与推理路径，因此必须与 Release 构建的 RL 库保持一致，不能混入 O0。
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "humanoid_common build type" FORCE)
+endif()
+message(STATUS "humanoid_common build type: ${CMAKE_BUILD_TYPE}")
+
 set(CMAKE_INSTALL_RPATH "\$ORIGIN/../lib:\$ORIGIN")
 set(CMAKE_BUILD_RPATH_USE_ORIGIN ON)
 
@@ -135,6 +143,7 @@ if(BUILD_RL)
     add_library(behavior_manager SHARED
         src/behavior_manager/behavior_fsm.cpp
         src/behavior_manager/behavior_manager.cpp
+        src/behavior_manager/rl_state_config.cpp
         src/behavior_manager/policy_adapter/policy_adapter.cpp
         src/behavior_manager/states/state_power_off.cpp
         src/behavior_manager/states/state_damp.cpp
@@ -332,4 +341,50 @@ if(BUILD_RL)
     target_link_libraries(test_policy_adapter PRIVATE
         behavior_manager robot_base Eigen3::Eigen ${RL_LIB} cnpy)
     install(TARGETS test_policy_adapter RUNTIME DESTINATION bin)
+
+    # StateRL 异步运行时：复用生产 FSM/StateRL/ThreadLoop，以 synthetic
+    # 传感器驱动；不包含 transport、关节总线或执行器闭环。
+    add_executable(benchmark_humanoid_policy
+        example/behavior_manager/benchmark_humanoid_policy.cpp)
+    target_include_directories(benchmark_humanoid_policy PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager
+        ${CMAKE_CURRENT_BINARY_DIR}/generated
+        ${RL_INCLUDE_DIR}
+    )
+    target_link_libraries(benchmark_humanoid_policy PRIVATE
+        behavior_manager robot_base Eigen3::Eigen ${RL_LIB} cnpy)
+    set_target_properties(benchmark_humanoid_policy PROPERTIES
+        BUILD_RPATH_USE_ORIGIN ON
+    )
+
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" _common_build_type_upper)
+    get_directory_property(_common_compile_options COMPILE_OPTIONS)
+    string(JOIN " " _common_directory_flags ${_common_compile_options})
+    set(_common_benchmark_flags
+        "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_common_build_type_upper}} ${_common_directory_flags}")
+    string(STRIP "${_common_benchmark_flags}" _common_benchmark_flags)
+
+    # Build metadata may contain quotes, backslashes, semicolons or newlines.
+    # Generate a header instead of passing arbitrary text through -D, where it
+    # could be re-tokenized by CMake, the build tool or the compiler driver.
+    set(_common_benchmark_build_type "${CMAKE_BUILD_TYPE}")
+    foreach(_metadata_var
+            _common_benchmark_build_type
+            _common_benchmark_flags)
+        string(REPLACE "\\" "\\\\" ${_metadata_var} "${${_metadata_var}}")
+        string(REPLACE "\"" "\\\"" ${_metadata_var} "${${_metadata_var}}")
+        string(REPLACE "\n" "\\n" ${_metadata_var} "${${_metadata_var}}")
+        string(REPLACE "\r" "\\r" ${_metadata_var} "${${_metadata_var}}")
+        string(REPLACE "\t" "\\t" ${_metadata_var} "${${_metadata_var}}")
+    endforeach()
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    configure_file(
+        cmake/benchmark_build_metadata.h.in
+        generated/benchmark_build_metadata.h
+        @ONLY
+    )
+    install(TARGETS benchmark_humanoid_policy RUNTIME DESTINATION bin)
+    install(PROGRAMS scripts/run_benchmark_humanoid_policy.sh
+        DESTINATION bin)
 endif()

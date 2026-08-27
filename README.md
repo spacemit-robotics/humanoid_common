@@ -46,6 +46,11 @@ mm
 编译产物安装到 `output/staging/`：
 - `lib/`：`librobot_base.so`、`libbehavior_manager.so`、`libtransport_executor.so`
 - `bin/`：`driver_runtime`、`control_runtime`、`hmi_runtime`、`control_sim2sim_runtime`
+- benchmark：`benchmark_humanoid_policy`、`run_benchmark_humanoid_policy.sh`
+
+单配置生成器未指定 `CMAKE_BUILD_TYPE` 时默认使用 `Release`。StateRL runtime
+benchmark 会执行本包中的控制、adapter 和异步推理路径；若本包是 O0 而 RL 库
+是 O3，结果不能代表部署性能。
 
 **独立 cmake 编译**（需确保 rl 和所需 driver backend 已安装到 `output/staging/`）：
 
@@ -74,6 +79,53 @@ run_hmi_g1.sh       # 终端3（K3 板卡）
 run_driver_g1.sh    # 终端1（PC）
 run_sim2sim_g1.sh   # 终端2（K3 板卡）
 ```
+
+### StateRL 异步运行时 benchmark
+
+`run_benchmark_humanoid_policy.sh` 使用机型 YAML 中真实的模型、参考动作、
+`policy_adapter`、custom/external/feedback I/O，并直接运行生产
+`FSM + StateRL + ThreadLoop`：
+
+```text
+控制周期写入传感器快照并 notify
+  → 推理线程唤醒
+  → PrepareInputs → AssembleObs → Infer → OnAction
+  → 写入 action cache
+  → 后续控制周期 MapActionToTargetPos 并应用新动作
+```
+
+benchmark 不复制上述调用顺序，而是通过 production `StateRL::Run()` 和
+`StateRL::InferStep()` 执行真实的双线程、condition variable、传感器快照、动作
+缓存和关节目标映射。传感器状态仍由工具生成，因此不包含 transport、CAN/关节
+总线或执行器闭环。
+
+它按 `behavior_manager.control_dt` 驱动控制周期，并按 YAML `rl_policy.rl_dt`
+触发推理。默认即为 `periodic`；不支持 throughput，也不提供可配置的 overrun
+策略。推理过载时完全沿用 StateRL 当前的 latest-snapshot 行为，并报告 release
+合并、未应用动作、旧动作复用周期和最大 release lag。
+
+```bash
+cd ~/spacemit_robot/output/staging/bin
+./run_benchmark_humanoid_policy.sh g1 sonic \
+  --provider cpu --threads 2 --affinity 0,1 \
+  --ort-spinning off \
+  --hz 50 --rounds 1000 \
+  --csv /tmp/g1_sonic_state_rl.csv
+```
+
+默认按 YAML 的参考动作播放规则运行。短动作做长尾采样时可加
+`--reference-loop`，它只在 benchmark 内存配置中启用循环，不修改 YAML；输出和
+CSV 会明确记录该覆盖。
+
+主要指标包括控制周期误差、RL release 间隔抖动、推理线程唤醒时间、推理 service
+time、release-to-publish、publish-to-apply、action age、动作更新间隔、deadline
+miss、coalesced release 和未应用动作。`action age` 从 StateRL 接收传感器快照的
+release 时刻开始，到控制线程第一次使用对应动作结束；它仍不包含传感器进入
+transport 前和关节命令离开 transport 后的时间。
+
+`--ort-spinning on|off` 显式控制 ONNX Runtime intra-op worker 的 busy-spin，默认
+`on` 保持原有行为。`off` 适合与 `on` 做 50 Hz 周期负载对照，但可能引入线程
+唤醒延迟；它不控制 SpaceMIT EP 内部线程。stdout 与 CSV 会记录实际值。
 
 ### CI 测试
 

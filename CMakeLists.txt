@@ -349,6 +349,7 @@ if(BUILD_RL)
     target_include_directories(benchmark_humanoid_policy PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager
+        ${CMAKE_CURRENT_BINARY_DIR}/generated
         ${RL_INCLUDE_DIR}
     )
     target_link_libraries(benchmark_humanoid_policy PRIVATE
@@ -363,9 +364,25 @@ if(BUILD_RL)
     set(_common_benchmark_flags
         "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_common_build_type_upper}} ${_common_directory_flags}")
     string(STRIP "${_common_benchmark_flags}" _common_benchmark_flags)
-    target_compile_definitions(benchmark_humanoid_policy PRIVATE
-        RL_BENCHMARK_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
-        RL_BENCHMARK_CXX_FLAGS="${_common_benchmark_flags}"
+
+    # Build metadata may contain quotes, backslashes, semicolons or newlines.
+    # Generate a header instead of passing arbitrary text through -D, where it
+    # could be re-tokenized by CMake, the build tool or the compiler driver.
+    set(_common_benchmark_build_type "${CMAKE_BUILD_TYPE}")
+    foreach(_metadata_var
+            _common_benchmark_build_type
+            _common_benchmark_flags)
+        string(REPLACE "\\" "\\\\" ${_metadata_var} "${${_metadata_var}}")
+        string(REPLACE "\"" "\\\"" ${_metadata_var} "${${_metadata_var}}")
+        string(REPLACE "\n" "\\n" ${_metadata_var} "${${_metadata_var}}")
+        string(REPLACE "\r" "\\r" ${_metadata_var} "${${_metadata_var}}")
+        string(REPLACE "\t" "\\t" ${_metadata_var} "${${_metadata_var}}")
+    endforeach()
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    configure_file(
+        cmake/benchmark_build_metadata.h.in
+        generated/benchmark_build_metadata.h
+        @ONLY
     )
     install(TARGETS benchmark_humanoid_policy RUNTIME DESTINATION bin)
     install(PROGRAMS scripts/run_benchmark_humanoid_policy.sh

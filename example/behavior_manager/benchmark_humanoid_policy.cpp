@@ -24,6 +24,7 @@
 #include <thread>
 #include <vector>
 
+#include "benchmark_build_metadata.h"
 #include "behavior_fsm.h"
 #include "rl_benchmark/benchmark_common.h"
 #include "robot_base.h"

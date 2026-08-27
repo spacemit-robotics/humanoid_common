@@ -16,7 +16,6 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
-#include <filesystem>  // NOLINT(build/c++17)
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -69,37 +68,6 @@ void ValidateGainVector(const std::vector<double> &values,
     ValidateJointVector(values, num_dof, path);
     if (std::any_of(values.begin(), values.end(), [](double value) { return value < 0.0; })) {
         throw std::runtime_error("[BehaviorManager] " + path + " 包含负增益");
-    }
-}
-
-RLConfig ToRLConfig(const rl_policy::LoadedPolicyConfig &loaded_cfg) {
-    RLConfig rc;
-    rc.policy = loaded_cfg.exec_cfg;
-    rc.infer_decimation = loaded_cfg.infer_decimation > 0 ? loaded_cfg.infer_decimation : 1;
-    rc.max_roll = loaded_cfg.max_roll;
-    rc.max_pitch = loaded_cfg.max_pitch;
-    rc.kp = loaded_cfg.kp;
-    rc.kd = loaded_cfg.kd;
-    return rc;
-}
-
-// 解析 behavior_manager 私有策略配置，rl 层保持 tracker-agnostic。
-void LoadBehaviorPolicyFields(const std::string &yaml_path,
-    const std::string &policy_name,
-    const std::string &robot_dir,
-    RLConfig &rc) {
-    const auto yaml = robot_base::YamlFile::Load(yaml_path);
-    const std::string base = "rl_policy.onnx_infer.policies." + policy_name;
-    rc.policy_adapter =
-        policy_adapter::LoadConfig(yaml_path, policy_name, robot_dir);
-    rc.zero_target_pos =
-        yaml.Read<std::vector<double>>(base + ".zero_target_pos").value_or(std::vector<double>{});
-    rc.entry_target_transition_duration =
-        yaml.Read<double>(base + ".entry_target_transition_duration").value_or(0.0);
-    if (!std::isfinite(rc.entry_target_transition_duration) ||
-        rc.entry_target_transition_duration < 0.0) {
-        throw std::runtime_error(
-            "[BehaviorManager] " + base + ".entry_target_transition_duration 配置无效");
     }
 }
 
@@ -250,18 +218,16 @@ public:
                 yaml_file.Read<std::string>("rl_policy.onnx_infer.default_policy").value_or("");
             pending_policy = active_policy;
 
-            const rl_policy::LoadedPolicyConfig loaded_cfg =
-                rl_policy::LoadPolicyConfigFromYaml(path, active_policy, robot_dir);
-            RLConfig rc = ToRLConfig(loaded_cfg);
-            LoadBehaviorPolicyFields(path, active_policy, robot_dir, rc);
+            RLConfig rc =
+                LoadRLStateConfig(path, active_policy, robot_dir);
             rc.infer_thread_cfg = infer_thread_cfg;
             rc.rl_freq_hz = &rl_freq_hz;
 
             // ZERO 状态目标位姿：优先用 zero_target_pos（如果配了），否则用 rl_default_pos
             const auto &effective_zero_pos = rc.zero_target_pos.empty()
-                ? loaded_cfg.exec_cfg.rl_default_pos : rc.zero_target_pos;
-            const auto &effective_zero_kp = zero_kp.empty() ? loaded_cfg.kp : zero_kp;
-            const auto &effective_zero_kd = zero_kd.empty() ? loaded_cfg.kd : zero_kd;
+                ? rc.policy.rl_default_pos : rc.zero_target_pos;
+            const auto &effective_zero_kp = zero_kp.empty() ? rc.kp : zero_kp;
+            const auto &effective_zero_kd = zero_kd.empty() ? rc.kd : zero_kd;
             fsm.AddState(StateName::ZERO,
                 CreateStateZero(effective_zero_pos, zero_duration,
                                 effective_zero_kp, effective_zero_kd));
@@ -322,22 +288,19 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
     // 策略切换：pending_policy 由 SetCommand（POWER_OFF/DAMP 直切）或前置链调度（RL 中到期自动切）触发
     if (impl_->has_rl && impl_->pending_policy != impl_->active_policy) {
         try {
-            const rl_policy::LoadedPolicyConfig loaded_cfg = rl_policy::LoadPolicyConfigFromYaml(
+            RLConfig rc = LoadRLStateConfig(
                 impl_->config_path, impl_->pending_policy, impl_->robot_dir);
-            RLConfig rc = ToRLConfig(loaded_cfg);
-            LoadBehaviorPolicyFields(
-                impl_->config_path, impl_->pending_policy, impl_->robot_dir, rc);
             rc.infer_thread_cfg = impl_->infer_thread_cfg;
             rc.rl_freq_hz = &impl_->rl_freq_hz;
 
             // 用 ReplaceState 替换 ZERO + RL，安全处理"替换正在运行的当前状态"场景
             // （前置链到期后会在 RL 状态触发 RL→RL 重建，需走 OnExit/OnEnter 重置 LSTM 隐状态）
             const auto &effective_zero_pos = rc.zero_target_pos.empty()
-                ? loaded_cfg.exec_cfg.rl_default_pos : rc.zero_target_pos;
+                ? rc.policy.rl_default_pos : rc.zero_target_pos;
             const auto &effective_zero_kp =
-                impl_->zero_kp.empty() ? loaded_cfg.kp : impl_->zero_kp;
+                impl_->zero_kp.empty() ? rc.kp : impl_->zero_kp;
             const auto &effective_zero_kd =
-                impl_->zero_kd.empty() ? loaded_cfg.kd : impl_->zero_kd;
+                impl_->zero_kd.empty() ? rc.kd : impl_->zero_kd;
             impl_->fsm.ReplaceState(StateName::ZERO,
                 CreateStateZero(effective_zero_pos, impl_->zero_duration,
                                 effective_zero_kp, effective_zero_kd));

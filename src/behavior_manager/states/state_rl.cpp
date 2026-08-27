@@ -45,11 +45,18 @@ public:
         // 每次进入都重新初始化策略运行时（支持策略切换后重新加载模型）。
         // PolicyExecutorConfig 整体透传，新增底层配置项无需在 common 逐字段同步。
         policy_.Init(config_.policy);
+        if (config_.runtime_observer) {
+            config_.runtime_observer->OnRuntimeInitialized(
+                policy_.GetRuntimeInfo());
+        }
 
         safety_triggered_ = false;
         has_action_ = false;
         action_sequence_ = 0;
         applied_action_sequence_ = 0;
+        release_sequence_ = 0;
+        sample_release_sequence_ = 0;
+        cached_release_sequence_ = 0;
         entry_target_transition_elapsed_ = 0.0;
         infer_count_window_ = 0;
         infer_window_start_ = std::chrono::steady_clock::now();
@@ -105,9 +112,14 @@ public:
             // 保留调度余量，避免控制循环频率不能整除 rl_dt 时长期降频。
             time_since_last_infer_ -= rl_dt;
 
+            const auto release_time = RLRuntimeClock::now();
+            std::uint64_t release_sequence = 0;
+
             // 1) 写入最新传感器数据和命令到共享区（供推理线程读取）
             {
                 std::lock_guard<std::mutex> lock(mutex_sensor_);
+                release_sequence = ++release_sequence_;
+                sample_release_sequence_ = release_sequence;
                 sample_gyro_ = sensor_->gyro;
                 sample_rpy_ = sensor_->rpy;
                 sample_joint_pos_ = sensor_->joint_pos;
@@ -124,15 +136,22 @@ public:
             }
             // 通知推理线程有新数据到达
             cv_sensor_.notify_one();
+            NotifyRuntimeEvent(
+                RLRuntimeEventType::RELEASE, release_sequence, release_time);
         }
 
         // 2) 读取最新推理结果，映射到关节目标
+        bool action_applied = false;
+        std::uint64_t applied_release_sequence = 0;
+        RLRuntimeClock::time_point action_applied_time;
         {
             std::lock_guard<std::mutex> lock(mutex_action_);
             const bool transition_enabled =
                 config_.entry_target_transition_duration > 0.0;
+            const bool has_new_action =
+                action_sequence_ != applied_action_sequence_;
             if (has_action_ && (!transition_enabled ||
-                                action_sequence_ != applied_action_sequence_)) {
+                                has_new_action)) {
                 std::vector<double> target_pos;
                 policy_.MapActionToTargetPos(cached_action_, target_pos);
                 ApplyEntryTargetTransition(
@@ -142,7 +161,16 @@ public:
                 int ndof = static_cast<int>(output_->target_pos.size());
                 output_->target_vel.assign(ndof, 0.0);
                 output_->enable = true;
+                if (has_new_action) {
+                    applied_release_sequence = cached_release_sequence_;
+                    action_applied_time = RLRuntimeClock::now();
+                    action_applied = true;
+                }
             }
+        }
+        if (action_applied) {
+            NotifyRuntimeEvent(RLRuntimeEventType::ACTION_APPLIED,
+                applied_release_sequence, action_applied_time);
         }
     }
 
@@ -203,6 +231,8 @@ private:
         std::vector<double> joint_pos, joint_vel;
         double cmd_vx, cmd_vy, cmd_wz;
         float rl_dt;
+        std::uint64_t release_sequence = 0;
+        RLRuntimeClock::time_point inference_start;
 
         // 等待控制循环的主线程发来通知（严格同步到 control_dt 驱动的时钟）
         {
@@ -211,7 +241,9 @@ private:
             if (!running_) {
                 return false;  // 退出线程
             }
+            inference_start = RLRuntimeClock::now();
             new_data_ready_ = false;
+            release_sequence = sample_release_sequence_;
 
             // 拷贝传感器快照
             gyro = sample_gyro_;
@@ -226,6 +258,8 @@ private:
             cmd_wz = sample_cmd_wz_;
             rl_dt = sample_rl_dt_;
         }
+        NotifyRuntimeEvent(RLRuntimeEventType::INFERENCE_START,
+            release_sequence, inference_start);
 
         // 在 AssembleObs 前注入 tracker-specific 输入。
         if (policy_adapter_) {
@@ -264,6 +298,9 @@ private:
         if (policy_adapter_) {
             policy_adapter_->OnAction(action);
         }
+        const auto inference_finish = RLRuntimeClock::now();
+        NotifyRuntimeEvent(RLRuntimeEventType::INFERENCE_FINISH,
+            release_sequence, inference_finish);
         UpdateRlFreq();
 
         // 写入动作缓存
@@ -271,8 +308,11 @@ private:
             std::lock_guard<std::mutex> lock(mutex_action_);
             cached_action_ = std::move(action);
             has_action_ = true;
+            cached_release_sequence_ = release_sequence;
             ++action_sequence_;
         }
+        NotifyRuntimeEvent(RLRuntimeEventType::ACTION_PUBLISHED,
+            release_sequence, RLRuntimeClock::now());
 
         return true;  // 继续循环
     }
@@ -323,7 +363,20 @@ private:
     bool has_action_ = false;
     std::uint64_t action_sequence_ = 0;
     std::uint64_t applied_action_sequence_ = 0;
+    std::uint64_t release_sequence_ = 0;
+    std::uint64_t sample_release_sequence_ = 0;
+    std::uint64_t cached_release_sequence_ = 0;
     double entry_target_transition_elapsed_ = 0.0;
+
+    void NotifyRuntimeEvent(RLRuntimeEventType type,
+        std::uint64_t release_sequence,
+        RLRuntimeClock::time_point timestamp) noexcept {
+        if (!config_.runtime_observer) {
+            return;
+        }
+        config_.runtime_observer->OnRuntimeEvent(
+            {type, release_sequence, timestamp});
+    }
 
     void UpdateRlFreq() {
         ++infer_count_window_;

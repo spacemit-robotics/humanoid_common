@@ -27,6 +27,13 @@ namespace behavior_manager {
 
 using RLRuntimeClock = std::chrono::steady_clock;
 
+struct ZeroTransitionConfig {
+    double move_duration = 3.0;
+    double position_tolerance = 0.15;
+    double velocity_tolerance = 0.10;
+    double settle_duration = 0.20;
+};
+
 enum class RLRuntimeEventType {
     RELEASE,
     INFERENCE_START,
@@ -97,7 +104,7 @@ std::unique_ptr<State> CreateStateHome(const std::vector<double> &default_pos,
         const std::vector<double> &kp,
         const std::vector<double> &kd);
 std::unique_ptr<State> CreateStateZero(const std::vector<double> &default_pos,
-                                        double duration,
+                                        const ZeroTransitionConfig &transition_config,
                                         const std::vector<double> &kp,
                                         const std::vector<double> &kd);
 std::unique_ptr<State> CreateStateRl(const RLConfig &cfg);

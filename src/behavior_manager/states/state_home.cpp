@@ -112,7 +112,7 @@ private:
     std::vector<double> kp_;
     std::vector<double> kd_;
     double gain_ramp_duration_ = 1.0;
-    double move_duration_ = 5.0;
+    double move_duration_ = 3.0;
     double timer_ = 0.0;
     bool finished_ = false;
 };

@@ -28,9 +28,22 @@ int main(int argc, char **argv) {
     const auto *walk = runtime_config::FindPolicyCommandLimits(
         limits_by_policy, "walk");
     assert(walk != nullptr);
+    assert(std::abs(walk->min_vx + 1.5f) < 1.0e-6f);
     assert(std::abs(walk->max_vx - 1.5f) < 1.0e-6f);
+    assert(std::abs(walk->min_vy + 0.5f) < 1.0e-6f);
     assert(std::abs(walk->max_vy - 0.5f) < 1.0e-6f);
+    assert(std::abs(walk->min_wz + 2.2f) < 1.0e-6f);
     assert(std::abs(walk->max_wz - 2.2f) < 1.0e-6f);
+
+    const auto *asymmetric = runtime_config::FindPolicyCommandLimits(
+        limits_by_policy, "walk_asymmetric");
+    assert(asymmetric != nullptr);
+    assert(std::abs(asymmetric->min_vx + 0.3f) < 1.0e-6f);
+    assert(std::abs(asymmetric->max_vx - 1.0f) < 1.0e-6f);
+    assert(std::abs(asymmetric->min_vy + 0.25f) < 1.0e-6f);
+    assert(std::abs(asymmetric->max_vy - 0.25f) < 1.0e-6f);
+    assert(std::abs(asymmetric->min_wz + 0.5f) < 1.0e-6f);
+    assert(std::abs(asymmetric->max_wz - 0.6f) < 1.0e-6f);
     assert(runtime_config::FindPolicyCommandLimits(
         limits_by_policy, "wave") == nullptr);
 
@@ -42,6 +55,14 @@ int main(int argc, char **argv) {
     assert(std::abs(command.vx - 1.5f) < 1.0e-6f);
     assert(std::abs(command.vy + 0.5f) < 1.0e-6f);
     assert(command.wz == 0.0f);
+
+    command.vx = -1.0f;
+    command.vy = 0.5f;
+    command.wz = -0.8f;
+    runtime_config::ApplyPolicyCommandLimits(asymmetric, &command);
+    assert(std::abs(command.vx + 0.3f) < 1.0e-6f);
+    assert(std::abs(command.vy - 0.25f) < 1.0e-6f);
+    assert(std::abs(command.wz + 0.5f) < 1.0e-6f);
 
     command.vx = 0.3f;
     command.vy = 0.2f;

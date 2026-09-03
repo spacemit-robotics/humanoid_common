@@ -381,7 +381,8 @@ void RenderMainPage(const UiState &state) {
     MoveTo(7, layout.content_left);
     if (state.status_online && state.status.mode == ControlMode::ZERO) {
         SetFg(state.status.zero_ready ? Color::BRIGHT_GREEN : Color::BRIGHT_YELLOW);
-        printf("回零: %s", state.status.zero_ready ? "READY，可按 → 进入 RL" : "进行中");
+        printf("回零: %s", state.status.zero_ready ?
+            "READY，可按 → 进入 RL" : "进行中，可按 → 排队进入 RL");
     } else if (state.status_online && state.status.mode == ControlMode::SAFETY) {
         SetFg(Color::BRIGHT_RED);
         SetBold();
@@ -685,10 +686,6 @@ bool RequestByArrow(UiState *state, bool forward,
             return RequestTransition(state, ControlMode::ZERO, 2, now);
         }
         if (current == ControlMode::ZERO) {
-            if (!state->status.zero_ready) {
-                state->last_action = "ZERO 尚未完成，请等待 READY 后再按 →";
-                return false;
-            }
             return RequestTransition(state, ControlMode::RL, 3, now);
         }
         state->last_action = current == ControlMode::RL
@@ -728,10 +725,6 @@ bool RequestShortcut(UiState *state, int key,
     } else if (key == 'z' && current == ControlMode::HOME) {
         return RequestTransition(state, ControlMode::ZERO, 2, now);
     } else if (key == 'r' && current == ControlMode::ZERO) {
-        if (!state->status.zero_ready) {
-            state->last_action = "ZERO 尚未完成，RL 请求未发送";
-            return false;
-        }
         return RequestTransition(state, ControlMode::RL, 3, now);
     }
     state->last_action = "当前真实 FSM 不接受该快捷键";
@@ -979,37 +972,37 @@ int main(int argc, char *argv[]) {
                 } else if (key == 'w') {
                     state.target_command.vx = std::clamp(
                         state.target_command.vx + config.hmi.step_vx,
-                        -limits->max_vx, limits->max_vx);
+                        limits->min_vx, limits->max_vx);
                     state.last_action = "W：增加前进速度";
                     send_immediately = true;
                 } else if (key == 's') {
                     state.target_command.vx = std::clamp(
                         state.target_command.vx - config.hmi.step_vx,
-                        -limits->max_vx, limits->max_vx);
+                        limits->min_vx, limits->max_vx);
                     state.last_action = "S：增加后退速度";
                     send_immediately = true;
                 } else if (key == 'a') {
                     state.target_command.vy = std::clamp(
                         state.target_command.vy + config.hmi.step_vy,
-                        -limits->max_vy, limits->max_vy);
+                        limits->min_vy, limits->max_vy);
                     state.last_action = "A：增加左移速度";
                     send_immediately = true;
                 } else if (key == 'd') {
                     state.target_command.vy = std::clamp(
                         state.target_command.vy - config.hmi.step_vy,
-                        -limits->max_vy, limits->max_vy);
+                        limits->min_vy, limits->max_vy);
                     state.last_action = "D：增加右移速度";
                     send_immediately = true;
                 } else if (key == 'q') {
                     state.target_command.wz = std::clamp(
                         state.target_command.wz + config.hmi.step_wz,
-                        -limits->max_wz, limits->max_wz);
+                        limits->min_wz, limits->max_wz);
                     state.last_action = "Q：增加左转角速度";
                     send_immediately = true;
                 } else if (key == 'e') {
                     state.target_command.wz = std::clamp(
                         state.target_command.wz - config.hmi.step_wz,
-                        -limits->max_wz, limits->max_wz);
+                        limits->min_wz, limits->max_wz);
                     state.last_action = "E：增加右转角速度";
                     send_immediately = true;
                 } else if (key == ' ') {

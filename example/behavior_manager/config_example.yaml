@@ -61,7 +61,8 @@ behavior_manager:
     move_duration: 0.02
 
   # 回零位置（无 rl_policy 时 ZERO 状态的目标位置 fallback）
-  # 完整 FSM（含 rl_policy）会改用 rl_policy.policies.<name>.rl_default_pos
+  # 完整 FSM（含 rl_policy）会改用
+  # rl_policy.onnx_infer.policies.<name>.zero_target_pos 或 rl_default_pos
   zero_pos: [-0.1, 0.0, 0.0, 0.3, -0.2, 0.0,
              -0.1, 0.0, 0.0, 0.3, -0.2, 0.0,
              0.0, 0.0, 0.0,
@@ -71,6 +72,9 @@ behavior_manager:
   zero:
     # 回零时间（秒），ZERO 状态使用五次多项式插值
     move_duration: 0.02
+    position_tolerance: 0.15
+    velocity_tolerance: 0.10
+    settle_duration: 0.01
     # kp/kd 可选；未配置时回退到 HOME 增益
 
   # 控制周期（秒），主控制循环频率

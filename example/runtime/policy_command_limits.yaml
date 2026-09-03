@@ -1,6 +1,6 @@
 rl_policy:
   onnx_infer:
-    policy_names: [walk, wave]
+    policy_names: [walk, walk_asymmetric, wave]
     policies:
       walk:
         command:
@@ -8,6 +8,14 @@ rl_policy:
             max_vx: 1.5
             max_vy: 0.5
             max_wz: 2.2
+      walk_asymmetric:
+        command:
+          limits:
+            min_vx: -0.3
+            max_vx: 1.0
+            max_vy: 0.25
+            min_wz: -0.5
+            max_wz: 0.6
       wave:
         command:
           init: [0.0, 0.0, 0.0]

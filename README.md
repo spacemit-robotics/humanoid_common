@@ -224,9 +224,9 @@ CSV；control 记录控制状态以及关节目标/反馈 CSV。driver 终端以
 kp/kd 在不同阶段由不同来源提供，配置上分散在两个 yaml 节点：
 
 - **MuJoCo 启动期**：MuJoCo backend 读取 `robot_base.kp/kd/default_joint_pos`，作为仿真的初始 PD 增益与默认站立姿态。
-- **HOME 阶段**：从当前实机关节位置先平滑建立增益，再恢复到 `robot_base.default_joint_pos`；可用 `behavior_manager.home` 单独配置时长和 kp/kd。
-- **RL 控制期**：进入 RL 状态后，control 端每帧通过 `ControlCmd.kp/kd` 下发当前策略训练时的真实增益（来自 `rl_policy.policies.<name>.kp/kd`），driver backend 转发给实际执行组件。
-- **ZERO/DAMP 阶段**：ZERO 优先用当前策略的可选 `zero_target_pos`，未配置时用 `rl_default_pos`；机型可配置独立 ZERO 安全增益，进入 RL 后立即使用当前策略增益。未配置 ZERO 增益的已有机型保持原有策略增益行为；DAMP 使用 `behavior_manager.damp_kd`。
+- **HOME 阶段**：从当前实机关节位置先平滑建立增益，再恢复到 `robot_base.default_joint_pos`；可用 `behavior_manager.home` 配置时长和 kp/kd。
+- **RL 控制期**：进入 RL 状态后，control 端每帧通过 `ControlCmd.kp/kd` 下发 `rl_policy.onnx_infer.policies.<name>.kp/kd`，driver backend 转发给执行组件。
+- **ZERO/DAMP 阶段**：ZERO 优先用当前策略的可选 `zero_target_pos`，未配置时用 `rl_default_pos`；满足 `behavior_manager.zero` 的关节收敛条件后才允许进入 RL。DAMP 使用 `behavior_manager.damp_kd`。
 
 ### 策略链调度（prerequisite chain）
 
@@ -328,7 +328,8 @@ RL 频率均来自 control 端回传，不在 HMI 本地预判。主界面用左
 `o/h/z/r` 保留为兼容快捷键，但合法性仍由 control 端 FSM 校验。HMI 以配置频率发送
 心跳；退出速度页、离开 RL、HMI 退出或心跳超时都会清零速度。按键步长和通信超时在
 YAML 的 `hmi` 节点配置；速度范围由应用层在每个策略的
-`command.limits.{max_vx,max_vy,max_wz}` 中声明。未声明范围的策略不接受速度命令。
+`command.limits.{min_vx,max_vx,min_vy,max_vy,min_wz,max_wz}` 中声明；未配置
+`min_*` 时默认为对应的 `-max_*`。未声明范围的策略不接受速度命令。
 
 ### 通信配置
 

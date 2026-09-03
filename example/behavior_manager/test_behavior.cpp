@@ -64,9 +64,11 @@ int main(int argc, char *argv[]) {
             yaml.Read<double>("rl_policy.rl_dt").value_or(0.02));
         const double home_duration =
             yaml.Read<double>("behavior_manager.home.gain_ramp_duration").value_or(1.0) +
-            yaml.Read<double>("behavior_manager.home.move_duration").value_or(5.0);
+            yaml.Read<double>("behavior_manager.home.move_duration").value_or(3.0);
         const double zero_duration = yaml.Read<double>("behavior_manager.zero.move_duration")
-            .value_or(yaml.Read<double>("behavior_manager.zero_duration").value_or(2.0));
+            .value_or(yaml.Read<double>("behavior_manager.zero_duration").value_or(3.0));
+        const double zero_settle_duration = yaml.Read<double>(
+            "behavior_manager.zero.settle_duration").value_or(0.20);
         const auto default_joint_pos =
             yaml.Read<std::vector<double>>("robot_base.default_joint_pos").value();
         const auto robot_kp = yaml.Read<std::vector<double>>("robot_base.kp").value();
@@ -95,8 +97,14 @@ int main(int argc, char *argv[]) {
         // joint_pos 和 joint_vel 已在 FromYaml() 中初始化大小
 
         Command cmd;
-        auto run_steps = [&](int count) {
+        auto run_steps = [&](int count, bool follow_target) {
             for (int i = 0; i < count; ++i) {
+                const auto &current_output = bm.GetOutput();
+                if (follow_target &&
+                    current_output.target_pos.size() == sensor.joint_pos.size()) {
+                    sensor.joint_pos = current_output.target_pos;
+                    sensor.joint_vel = current_output.target_vel;
+                }
                 sensor.time += control_dt;
                 bm.SetSensorData(sensor);
                 bm.SetCommand(cmd);
@@ -106,7 +114,7 @@ int main(int argc, char *argv[]) {
 
         // ========== 阶段1: POWER_OFF ==========
         std::cout << "\n--- 阶段1: POWER_OFF ---" << std::endl;
-        run_steps(10);
+        run_steps(10, true);
         std::cout << "当前状态: " << StateNameStr(bm.CurrentState()) << std::endl;
         const auto &out1 = bm.GetOutput();
         std::cout << "使能: " << (out1.enable ? "是" : "否") << std::endl;
@@ -125,7 +133,7 @@ int main(int argc, char *argv[]) {
         assert(bm.CurrentState() == behavior_manager::StateName::DAMP);
         assert(out2.enable);
 
-        run_steps(10);
+        run_steps(10, true);
 
         // ZERO 不能绕过 HOME 直接进入。
         cmd.key = 2;
@@ -142,7 +150,9 @@ int main(int argc, char *argv[]) {
         cmd.key = 0;
         assert(bm.CurrentState() == behavior_manager::StateName::HOME);
 
-        run_steps(static_cast<int>(std::ceil(home_duration / control_dt)) + 2);
+        // HOME 按配置时长完成，不依赖关节到位阈值。
+        run_steps(static_cast<int>(std::ceil(home_duration / control_dt)) + 2,
+                    true);
         const auto &home_output = bm.GetOutput();
         assert(home_output.enable);
         assert(home_output.kp.size() == static_cast<size_t>(sensor.num_dof));
@@ -167,7 +177,18 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        run_steps(static_cast<int>(std::ceil(zero_duration / control_dt)) + 2);
+        // ZERO 需要实际关节反馈满足到位条件。
+        sensor.joint_pos[0] += 0.20;
+        sensor.joint_vel.assign(sensor.joint_vel.size(), 0.0);
+        run_steps(static_cast<int>(std::ceil(zero_duration / control_dt)) + 2,
+                    false);
+        if (bm.IsZeroReady()) {
+            std::cerr << "[错误] ZERO 实际关节未到位时不应报告 READY"
+                << std::endl;
+            return 1;
+        }
+        run_steps(static_cast<int>(
+            std::ceil(zero_settle_duration / control_dt)) + 2, true);
         if (!bm.IsZeroReady()) {
             std::cerr << "[错误] ZERO 完成后未报告 READY" << std::endl;
             return 1;

@@ -71,6 +71,32 @@ void ValidateGainVector(const std::vector<double> &values,
     }
 }
 
+ZeroTransitionConfig LoadZeroTransitionConfig(
+        const robot_base::YamlFile &yaml, double move_duration_fallback) {
+    const std::string base = "behavior_manager.zero";
+    ZeroTransitionConfig config;
+    config.move_duration = yaml.Read<double>(base + ".move_duration")
+        .value_or(move_duration_fallback);
+    config.position_tolerance = yaml.Read<double>(
+        base + ".position_tolerance").value_or(0.15);
+    config.velocity_tolerance = yaml.Read<double>(
+        base + ".velocity_tolerance").value_or(0.10);
+    config.settle_duration = yaml.Read<double>(
+        base + ".settle_duration").value_or(0.20);
+
+    const auto positive_finite = [](double value) {
+        return std::isfinite(value) && value > 0.0;
+    };
+    if (!positive_finite(config.move_duration) ||
+        !positive_finite(config.position_tolerance) ||
+        !positive_finite(config.velocity_tolerance) ||
+        !positive_finite(config.settle_duration)) {
+        throw std::runtime_error(
+            "[BehaviorManager] " + base + " 到位参数无效");
+    }
+    return config;
+}
+
 }  // namespace
 
 class BehaviorManagerClass::Impl {
@@ -81,7 +107,7 @@ public:
     ControlOutput output;
     std::string config_path;
     std::string robot_dir;  // 机器人资源根目录（绝对路径）
-    double zero_duration = 2.0;               // 回零时长（秒），策略切换时重建 ZERO 需要
+    ZeroTransitionConfig zero_transition_config;
     std::vector<double> zero_kp;
     std::vector<double> zero_kd;
     bool initialized = false;
@@ -149,17 +175,18 @@ public:
 
         // 缓存状态参数，供初始注册和运行时策略切换共同使用。
         const double legacy_zero_duration =
-            yaml_file.Read<double>("behavior_manager.zero_duration").value_or(2.0);
-        zero_duration = yaml_file.Read<double>("behavior_manager.zero.move_duration")
-            .value_or(legacy_zero_duration);
+            yaml_file.Read<double>("behavior_manager.zero_duration").value_or(3.0);
+        zero_transition_config = LoadZeroTransitionConfig(
+            yaml_file, legacy_zero_duration);
         const double home_gain_ramp_duration =
             yaml_file.Read<double>("behavior_manager.home.gain_ramp_duration").value_or(1.0);
         const double home_move_duration =
-            yaml_file.Read<double>("behavior_manager.home.move_duration").value_or(5.0);
-        if (!std::isfinite(zero_duration) || zero_duration <= 0.0 ||
-            !std::isfinite(home_gain_ramp_duration) || home_gain_ramp_duration <= 0.0 ||
+            yaml_file.Read<double>("behavior_manager.home.move_duration").value_or(3.0);
+        if (!std::isfinite(home_gain_ramp_duration) ||
+            home_gain_ramp_duration <= 0.0 ||
             !std::isfinite(home_move_duration) || home_move_duration <= 0.0) {
-            throw std::runtime_error("[BehaviorManager] HOME/ZERO 切换时长配置无效");
+            throw std::runtime_error(
+                "[BehaviorManager] HOME 切换时长配置无效");
         }
 
         const auto home_kp =
@@ -229,7 +256,7 @@ public:
             const auto &effective_zero_kp = zero_kp.empty() ? rc.kp : zero_kp;
             const auto &effective_zero_kd = zero_kd.empty() ? rc.kd : zero_kd;
             fsm.AddState(StateName::ZERO,
-                CreateStateZero(effective_zero_pos, zero_duration,
+                CreateStateZero(effective_zero_pos, zero_transition_config,
                                 effective_zero_kp, effective_zero_kd));
 
             fsm.AddState(StateName::RL, CreateStateRl(rc));
@@ -257,7 +284,8 @@ public:
             const auto &effective_zero_kd = zero_kd.empty() ? home_kd : zero_kd;
             fsm.AddState(StateName::ZERO,
                 CreateStateZero(
-                    zero_pos, zero_duration, effective_zero_kp, effective_zero_kd));
+                    zero_pos, zero_transition_config,
+                    effective_zero_kp, effective_zero_kd));
             std::cout << "[BehaviorManager] RL 状态: 未配置" << std::endl;
         }
 
@@ -302,7 +330,8 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
             const auto &effective_zero_kd =
                 impl_->zero_kd.empty() ? rc.kd : impl_->zero_kd;
             impl_->fsm.ReplaceState(StateName::ZERO,
-                CreateStateZero(effective_zero_pos, impl_->zero_duration,
+                CreateStateZero(effective_zero_pos,
+                                impl_->zero_transition_config,
                                 effective_zero_kp, effective_zero_kd));
             impl_->fsm.ReplaceState(StateName::RL, CreateStateRl(rc));
 

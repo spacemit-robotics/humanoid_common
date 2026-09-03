@@ -68,7 +68,7 @@
 | `1` | POWER_OFF/HOME/ZERO/RL → DAMP | 进入/退回阻尼 |
 | `4` | DAMP → HOME | 恢复机型默认姿态 |
 | `2` | HOME → ZERO | 切到策略准备姿态（需 HOME 完成） |
-| `3` | ZERO → RL | 进入 RL（需插值完成）|
+| `3` | ZERO → RL | 进入 RL（需 ZERO 到位）|
 | `-1` | 任意 → POWER_OFF | 完全失力（ESC）|
 
 ## 依赖
@@ -103,20 +103,23 @@ cd ~/spacemit_robot
 
 ### YAML 配置
 
-模块读取 YAML 的 `behavior_manager` 和 `rl_policy` 节点。参考 `example/config_example.yaml` 了解配置结构和参数含义。
+模块读取 YAML 的 `behavior_manager` 和 `rl_policy` 节点。参考
+[`example/behavior_manager/config_example.yaml`](../../example/behavior_manager/config_example.yaml)
+了解配置结构和参数含义。
 
 **关键参数：**
-- `rl_policy.policies.<name>.kp/kd`：各策略训练时的 PD 增益（每帧随控制命令下发）
-- `rl_policy.policies.<name>.entry_target_transition_duration`（可选）：进入 RL 后按推理周期从上一目标位置过渡到策略原始目标；默认 `0`，不改变已有策略行为
-- `rl_policy.policies.<name>.prerequisite.policy / .duration`（可选）：前置策略链——切到本策略前先自动跑前置策略 `duration` 秒
+- `rl_policy.onnx_infer.policies.<name>.kp/kd`：各策略的 PD 增益
+- `rl_policy.onnx_infer.policies.<name>.entry_target_transition_duration`（可选）：进入 RL 后的目标位置过渡时间，默认 `0`
+- `rl_policy.onnx_infer.policies.<name>.prerequisite.policy / .duration`（可选）：进入目标策略前运行的策略及持续时间
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter`（可选）：参考动作和特殊模型输入适配；支持 `mjlab`、`protomotions`、`sonic`
-- `policy_adapter.reference_action`（MJLab 可选）：用 YAML 指定部分机器人关节采用“参考角 + 有界残差”输出合成；未配置时保持标准 action 映射
-- `rl_policy.onnx_infer.policies.<name>.command.limits`（可选）：应用层声明该策略接受的 `max_vx/max_vy/max_wz`；未配置时 HMI 和 Control 均拒绝速度命令
+- `rl_policy.onnx_infer.policies.<name>.policy_adapter.reference_action`（MJLab 可选）：指定采用参考动作与残差合成的关节
+- `rl_policy.onnx_infer.policies.<name>.command.limits`（可选）：应用层声明该策略接受的 `min_vx/max_vx/min_vy/max_vy/min_wz/max_wz`；未配置 `min_*` 时默认为对应的 `-max_*`，整个 limits 未配置时 HMI 和 Control 均拒绝速度命令
 - `behavior_manager.damp_kd`：阻尼状态 kd（≈ policy kd / 5）
-- `behavior_manager.home.gain_ramp_duration / move_duration`：HOME 建立增益和移动时长
+- `behavior_manager.home.gain_ramp_duration / move_duration`：HOME 建立增益和移动时长，`move_duration` 默认 3 秒
 - `behavior_manager.home.kp/kd`（可选）：HOME 增益；未配置时使用 `robot_base.kp/kd`
-- `behavior_manager.zero_pos`：回零位置（无 rl_policy 时的 fallback；完整 FSM 用 `rl_policy.policies.<name>.rl_default_pos`）
-- `behavior_manager.zero.move_duration / kp / kd`：ZERO 移动时长和独立安全增益；kp/kd 必须同时配置，未配置时保留原有策略增益行为
+- `behavior_manager.zero_pos`：未配置 RL 策略时的 ZERO 目标位置；配置策略后使用 `rl_policy.onnx_infer.policies.<name>.zero_target_pos` 或 `rl_default_pos`
+- `behavior_manager.zero.move_duration / kp / kd`：ZERO 移动时长和独立安全增益，`move_duration` 默认 3 秒；kp/kd 必须同时配置
+- `behavior_manager.zero.position_tolerance / velocity_tolerance / settle_duration`：ZERO 到位条件，默认分别为 0.15 rad、0.10 rad/s、0.20 秒
 
 **路径解析：** `robot_base.robot_dir` 相对于 YAML 文件；`model_path` 相对于 `robot_dir`。
 

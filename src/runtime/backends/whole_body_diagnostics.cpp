@@ -145,13 +145,16 @@ void RenderWholeBodyDiagnostics(
     std::cout << output.str() << std::flush;
 }
 
-void RecordWholeBodyDiagnostics(const whole_body_diagnostics &diagnostics) {
+void RecordWholeBodyDiagnostics(const whole_body_diagnostics &diagnostics,
+    const whole_body_motor_command_diagnostics &command_diagnostics) {
     const double wall_time = WallTimeSeconds();
 
     std::ostringstream motors;
     motors << std::fixed << std::setprecision(9);
     for (uint32_t i = 0; i < diagnostics.motor_count; ++i) {
         const auto &motor = diagnostics.motors[i];
+        const bool has_command = i < command_diagnostics.motor_count;
+        const auto *command = has_command ? &command_diagnostics.motors[i] : nullptr;
         motors << wall_time << "," << diagnostics.timestamp_s << ","
             << motor.name << "," << motor.joint_names << ","
             << motor.driver << "," << motor.model << "," << motor.bus << ","
@@ -161,14 +164,23 @@ void RecordWholeBodyDiagnostics(const whole_body_diagnostics &diagnostics) {
             << motor.calibrated_position << "," << motor.raw_velocity << ","
             << motor.calibrated_velocity << "," << motor.raw_torque << ","
             << motor.calibrated_torque << "," << motor.temperature << ","
-            << motor.error;
+            << motor.error << "," << (command && command->valid) << ","
+            << (command ? command->age_s : 0.0) << ","
+            << (command ? command->mode : 0) << ","
+            << (command ? command->position : 0.0) << ","
+            << (command ? command->velocity : 0.0) << ","
+            << (command ? command->torque : 0.0) << ","
+            << (command ? command->kp : 0.0) << ","
+            << (command ? command->kd : 0.0);
         if (i + 1 < diagnostics.motor_count) motors << "\n";
     }
     runtime_logging::RecordCsv(
         "driver_motor",
         "wall_time_s,device_time_s,motor,joints,driver,model,bus,device,"
         "command_id,feedback_id,received,fresh,age_s,raw_pos,calibrated_pos,"
-        "raw_vel,calibrated_vel,raw_torque,calibrated_torque,temp_c,error",
+        "raw_vel,calibrated_vel,raw_torque,calibrated_torque,temp_c,error,"
+        "command_valid,command_age_s,command_mode,command_pos,command_vel,"
+        "command_torque,command_kp,command_kd",
         motors.str());
 
     std::ostringstream joints;

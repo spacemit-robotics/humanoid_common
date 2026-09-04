@@ -172,7 +172,8 @@ int main(int argc, char *argv[]) {
     const auto logging_config = runtime_logging::GetConfig();
     const auto telemetry_period =
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::duration<double>(1.0 / logging_config.telemetry_rate_hz));
+            std::chrono::duration<double>(
+                1.0 / logging_config.control_telemetry_rate_hz));
 
     auto last_control_time = std::chrono::steady_clock::now();
     auto last_hmi_time = last_control_time;

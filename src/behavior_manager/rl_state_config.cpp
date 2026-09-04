@@ -23,6 +23,7 @@ RLConfig LoadRLStateConfig(const std::string &yaml_path,
 
     RLConfig config;
     config.policy = loaded.exec_cfg;
+    config.policy_name = policy_name;
     config.command_init = loaded.command_init;
     config.rl_dt = loaded.rl_dt;
     config.infer_decimation =

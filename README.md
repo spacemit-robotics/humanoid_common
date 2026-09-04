@@ -190,6 +190,8 @@ logging:
   telemetry:
     enabled: true
     rate_hz: 20
+    control_rate_hz: 50
+    hardware_rate_hz: 100
   driver_monitor:
     enabled: true
     rate_hz: 2
@@ -197,9 +199,17 @@ logging:
 
 未配置时保留原控制行为且不落盘。启用后，每个 runtime 建立独立 session 目录：
 `events.log` 记录生命周期、FSM、策略和错误；driver 记录物理电机、虚拟关节和 IMU
-CSV；control 记录控制状态以及关节目标/反馈 CSV。driver 终端以固定屏限频刷新，
+CSV；control 记录控制状态以及关节目标/反馈 CSV。`control_rate_hz` 和
+`hardware_rate_hz` 可分别提高控制与实机硬件诊断采样率，未配置时继承 `rate_hz`。
+driver 终端以固定屏限频刷新，
 不会按控制频率刷屏。落盘由有界后台队列完成，磁盘跟不上时丢弃日志并记录丢弃数，
 不会阻塞控制循环。
+
+`level: debug` 且启用 telemetry 时，StateRL 还会按每次实际推理记录
+`control_policy_<策略名>.csv`。每行包含组装观测、ONNX 原始 action、策略执行器完成
+裁剪/平滑后的 action，以及 policy adapter 处理后最终用于关节映射的 action；同时记录
+推理发布时序和动作被控制线程采用后的最终关节目标。该流不受 `telemetry.rate_hz`
+降采样，用于复现实机策略发散链路。
 
 ### 执行器模式
 

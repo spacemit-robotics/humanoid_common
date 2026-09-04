@@ -224,6 +224,14 @@ public:
         config.telemetry_rate_hz = std::clamp(
             yaml_file.Read<double>("logging.telemetry.rate_hz").value_or(20.0),
             0.1, 500.0);
+        config.control_telemetry_rate_hz = std::clamp(
+            yaml_file.Read<double>("logging.telemetry.control_rate_hz")
+                .value_or(config.telemetry_rate_hz),
+            0.1, 500.0);
+        config.hardware_telemetry_rate_hz = std::clamp(
+            yaml_file.Read<double>("logging.telemetry.hardware_rate_hz")
+                .value_or(config.telemetry_rate_hz),
+            0.1, 500.0);
         config.driver_monitor_rate_hz = std::clamp(
             yaml_file.Read<double>("logging.driver_monitor.rate_hz").value_or(2.0),
             0.1, 20.0);

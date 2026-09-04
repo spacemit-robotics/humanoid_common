@@ -62,7 +62,8 @@ public:
                     1.0 / logging_config.driver_monitor_rate_hz));
         const auto telemetry_period =
             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                std::chrono::duration<double>(1.0 / logging_config.telemetry_rate_hz));
+                std::chrono::duration<double>(
+                    1.0 / logging_config.hardware_telemetry_rate_hz));
         auto last_monitor = std::chrono::steady_clock::now() - monitor_period;
         auto last_telemetry = std::chrono::steady_clock::now() - telemetry_period;
         if (logging_config.driver_monitor_enabled && !monitor_enabled) {
@@ -135,7 +136,11 @@ public:
                         last_monitor = sample_time;
                     }
                     if (telemetry_due) {
-                        RecordWholeBodyDiagnostics(diagnostics);
+                        whole_body_motor_command_diagnostics command_diagnostics{};
+                        if (whole_body_get_motor_command_diagnostics(
+                                device_, &command_diagnostics) == WHOLE_BODY_OK) {
+                            RecordWholeBodyDiagnostics(diagnostics, command_diagnostics);
+                        }
                         last_telemetry = sample_time;
                     }
                 }

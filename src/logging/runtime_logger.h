@@ -29,6 +29,8 @@ struct Config {
     bool telemetry_enabled = false;
     bool driver_monitor_enabled = false;
     double telemetry_rate_hz = 20.0;
+    double control_telemetry_rate_hz = 20.0;
+    double hardware_telemetry_rate_hz = 20.0;
     double driver_monitor_rate_hz = 2.0;
     int queue_capacity = 4096;
     int max_file_size_mb = 64;

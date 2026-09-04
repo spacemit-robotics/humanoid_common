@@ -16,15 +16,19 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <sstream>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "behavior_state.h"
 #include "policy_adapter/policy_adapter.h"
 #include "rl_service.h"
+#include "runtime_logger.h"
 #include "state_factory.h"
 namespace behavior_manager {
 
@@ -45,6 +49,7 @@ public:
         // 每次进入都重新初始化策略运行时（支持策略切换后重新加载模型）。
         // PolicyExecutorConfig 整体透传，新增底层配置项无需在 common 逐字段同步。
         policy_.Init(config_.policy);
+        ConfigurePolicyTrace();
         if (config_.runtime_observer) {
             config_.runtime_observer->OnRuntimeInitialized(
                 policy_.GetRuntimeInfo());
@@ -120,6 +125,7 @@ public:
                 std::lock_guard<std::mutex> lock(mutex_sensor_);
                 release_sequence = ++release_sequence_;
                 sample_release_sequence_ = release_sequence;
+                sample_release_time_ = release_time;
                 sample_gyro_ = sensor_->gyro;
                 sample_rpy_ = sensor_->rpy;
                 sample_joint_pos_ = sensor_->joint_pos;
@@ -128,6 +134,7 @@ public:
                 sample_base_quat_ = sensor_->base_quat;
                 sample_base_vel_ = {
                     {sensor_->base_vel[0], sensor_->base_vel[1], sensor_->base_vel[2]}};
+                sample_device_time_ = sensor_->time;
                 sample_cmd_vx_ = command_->vx;
                 sample_cmd_vy_ = command_->vy;
                 sample_cmd_wz_ = command_->wz;
@@ -144,6 +151,8 @@ public:
         bool action_applied = false;
         std::uint64_t applied_release_sequence = 0;
         RLRuntimeClock::time_point action_applied_time;
+        PolicyTiming applied_timing;
+        std::vector<double> applied_target_pos;
         {
             std::lock_guard<std::mutex> lock(mutex_action_);
             const bool transition_enabled =
@@ -164,6 +173,9 @@ public:
                 if (has_new_action) {
                     applied_release_sequence = cached_release_sequence_;
                     action_applied_time = RLRuntimeClock::now();
+                    applied_timing = cached_timing_;
+                    if (policy_trace_enabled_)
+                        applied_target_pos = output_->target_pos;
                     action_applied = true;
                 }
             }
@@ -171,6 +183,8 @@ public:
         if (action_applied) {
             NotifyRuntimeEvent(RLRuntimeEventType::ACTION_APPLIED,
                 applied_release_sequence, action_applied_time);
+            RecordPolicyApplyTrace(
+                applied_timing, action_applied_time, applied_target_pos);
         }
     }
 
@@ -230,8 +244,10 @@ private:
         std::array<double, 4> base_quat;
         std::vector<double> joint_pos, joint_vel;
         double cmd_vx, cmd_vy, cmd_wz;
+        double device_time;
         float rl_dt;
         std::uint64_t release_sequence = 0;
+        RLRuntimeClock::time_point release_time;
         RLRuntimeClock::time_point inference_start;
 
         // 等待控制循环的主线程发来通知（严格同步到 control_dt 驱动的时钟）
@@ -244,6 +260,7 @@ private:
             inference_start = RLRuntimeClock::now();
             new_data_ready_ = false;
             release_sequence = sample_release_sequence_;
+            release_time = sample_release_time_;
 
             // 拷贝传感器快照
             gyro = sample_gyro_;
@@ -253,6 +270,7 @@ private:
             base_pos = sample_base_pos_;
             base_quat = sample_base_quat_;
             base_vel = sample_base_vel_;
+            device_time = sample_device_time_;
             cmd_vx = sample_cmd_vx_;
             cmd_vy = sample_cmd_vy_;
             cmd_wz = sample_cmd_wz_;
@@ -293,8 +311,15 @@ private:
                             rl_dt,
                             obs);
 
+        std::vector<double> raw_action;
+        std::vector<double> executor_action;
         std::vector<double> action;
-        policy_.Infer(obs, action);
+        if (policy_trace_enabled_) {
+            policy_.Infer(obs, action, &raw_action);
+            executor_action = action;
+        } else {
+            policy_.Infer(obs, action);
+        }
         if (policy_adapter_) {
             policy_adapter_->OnAction(action);
         }
@@ -304,15 +329,23 @@ private:
         UpdateRlFreq();
 
         // 写入动作缓存
+        RLRuntimeClock::time_point action_published;
+        PolicyTiming timing;
         {
             std::lock_guard<std::mutex> lock(mutex_action_);
-            cached_action_ = std::move(action);
+            cached_action_ = action;
             has_action_ = true;
             cached_release_sequence_ = release_sequence;
+            action_published = RLRuntimeClock::now();
+            timing = {release_sequence, release_time, inference_start,
+                inference_finish, action_published};
+            cached_timing_ = timing;
             ++action_sequence_;
         }
         NotifyRuntimeEvent(RLRuntimeEventType::ACTION_PUBLISHED,
-            release_sequence, RLRuntimeClock::now());
+            release_sequence, action_published);
+        RecordPolicyTrace(obs, raw_action, executor_action, action,
+            device_time, timing, cmd_vx, cmd_vy, cmd_wz);
 
         return true;  // 继续循环
     }
@@ -352,6 +385,7 @@ private:
     std::array<double, 3> sample_base_pos_ = {};
     std::array<double, 4> sample_base_quat_ = {};
     std::array<double, 3> sample_base_vel_ = {};
+    double sample_device_time_ = 0.0;
     double sample_cmd_vx_ = 0;
     double sample_cmd_vy_ = 0;
     double sample_cmd_wz_ = 0;
@@ -365,8 +399,134 @@ private:
     std::uint64_t applied_action_sequence_ = 0;
     std::uint64_t release_sequence_ = 0;
     std::uint64_t sample_release_sequence_ = 0;
+    RLRuntimeClock::time_point sample_release_time_;
     std::uint64_t cached_release_sequence_ = 0;
     double entry_target_transition_elapsed_ = 0.0;
+
+    bool policy_trace_enabled_ = false;
+    std::string policy_trace_stream_;
+    std::string policy_apply_trace_stream_;
+    std::string policy_trace_header_;
+    std::string policy_apply_trace_header_;
+
+    struct PolicyTiming {
+        std::uint64_t release_sequence = 0;
+        RLRuntimeClock::time_point release;
+        RLRuntimeClock::time_point inference_start;
+        RLRuntimeClock::time_point inference_finish;
+        RLRuntimeClock::time_point action_published;
+    };
+
+    PolicyTiming cached_timing_;
+
+    static double ClockSeconds(RLRuntimeClock::time_point timestamp) {
+        return std::chrono::duration<double>(timestamp.time_since_epoch()).count();
+    }
+
+    static double DurationMilliseconds(
+        RLRuntimeClock::time_point finish,
+        RLRuntimeClock::time_point start) {
+        return std::chrono::duration<double, std::milli>(finish - start).count();
+    }
+
+    void ConfigurePolicyTrace() {
+        const auto logging_config = runtime_logging::GetConfig();
+        policy_trace_enabled_ = logging_config.telemetry_enabled &&
+            logging_config.level == runtime_logging::Level::kDebug;
+        if (!policy_trace_enabled_) return;
+
+        policy_trace_stream_ = "control_policy_" +
+            (config_.policy_name.empty() ? std::string("unnamed") : config_.policy_name);
+        policy_apply_trace_stream_ = "control_policy_apply_" +
+            (config_.policy_name.empty() ? std::string("unnamed") : config_.policy_name);
+        std::ostringstream header;
+        header << "wall_time_s,device_time_s,release_sequence,release_time_s,"
+            "inference_start_time_s,inference_finish_time_s,action_published_time_s,"
+            "release_to_start_ms,inference_ms,finish_to_publish_ms,release_to_publish_ms,"
+            "vx,vy,wz";
+        for (int i = 0; i < policy_.ObsDim(); ++i) {
+            header << ",obs_" << i;
+        }
+        for (int i = 0; i < policy_.ActionDim(); ++i) {
+            header << ",raw_action_" << i;
+        }
+        for (int i = 0; i < policy_.ActionDim(); ++i) {
+            header << ",executor_action_" << i;
+        }
+        for (int i = 0; i < policy_.ActionDim(); ++i) {
+            header << ",adapter_action_" << i;
+        }
+        policy_trace_header_ = header.str();
+
+        std::ostringstream apply_header;
+        apply_header << "wall_time_s,release_sequence,action_published_time_s,"
+            "action_applied_time_s,publish_to_apply_ms,release_to_apply_ms";
+        for (size_t i = 0; i < config_.kp.size(); ++i)
+            apply_header << ",target_pos_" << i;
+        policy_apply_trace_header_ = apply_header.str();
+    }
+
+    void RecordPolicyTrace(const Eigen::VectorXf &obs,
+                            const std::vector<double> &raw_action,
+                            const std::vector<double> &executor_action,
+                            const std::vector<double> &adapter_action,
+                            double device_time,
+                            const PolicyTiming &timing,
+                            double cmd_vx,
+                            double cmd_vy,
+                            double cmd_wz) const {
+        if (!policy_trace_enabled_) return;
+
+        const double wall_time = std::chrono::duration<double>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        std::ostringstream row;
+        row << std::fixed << std::setprecision(9)
+            << wall_time << "," << device_time << "," << timing.release_sequence
+            << "," << ClockSeconds(timing.release)
+            << "," << ClockSeconds(timing.inference_start)
+            << "," << ClockSeconds(timing.inference_finish)
+            << "," << ClockSeconds(timing.action_published)
+            << "," << DurationMilliseconds(timing.inference_start, timing.release)
+            << "," << DurationMilliseconds(
+                timing.inference_finish, timing.inference_start)
+            << "," << DurationMilliseconds(
+                timing.action_published, timing.inference_finish)
+            << "," << DurationMilliseconds(timing.action_published, timing.release)
+            << "," << cmd_vx << "," << cmd_vy << "," << cmd_wz;
+        for (int i = 0; i < obs.size(); ++i) {
+            row << "," << obs[i];
+        }
+        for (double value : raw_action) {
+            row << "," << value;
+        }
+        for (double value : executor_action) {
+            row << "," << value;
+        }
+        for (double value : adapter_action) {
+            row << "," << value;
+        }
+        runtime_logging::RecordCsv(
+            policy_trace_stream_, policy_trace_header_, row.str());
+    }
+
+    void RecordPolicyApplyTrace(const PolicyTiming &timing,
+                                RLRuntimeClock::time_point action_applied,
+                                const std::vector<double> &target_pos) const {
+        if (!policy_trace_enabled_) return;
+
+        const double wall_time = std::chrono::duration<double>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        std::ostringstream row;
+        row << std::fixed << std::setprecision(9)
+            << wall_time << "," << timing.release_sequence
+            << "," << ClockSeconds(timing.action_published)
+            << "," << ClockSeconds(action_applied)
+            << "," << DurationMilliseconds(action_applied, timing.action_published)
+            << "," << DurationMilliseconds(action_applied, timing.release);
+        for (double value : target_pos) row << "," << value;
+        runtime_logging::RecordCsv(policy_apply_trace_stream_,
+            policy_apply_trace_header_, row.str());
+    }
 
     void NotifyRuntimeEvent(RLRuntimeEventType type,
         std::uint64_t release_sequence,

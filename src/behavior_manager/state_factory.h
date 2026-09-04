@@ -67,6 +67,7 @@ public:
 struct RLConfig {
     // 完整透传底层执行器配置，避免新增 RL YAML 字段时在 common 层漏传。
     rl_policy::PolicyExecutorConfig policy;
+    std::string policy_name;
     std::array<double, 3> command_init = {0.0, 0.0, 0.0};
     double rl_dt = 0.02;                      // 策略推理周期（秒）
     int infer_decimation = 4;                  // 推理降频

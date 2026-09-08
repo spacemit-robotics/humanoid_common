@@ -22,7 +22,7 @@ namespace transport {
  * 使用 POSIX 共享内存 + 无锁环形缓冲区实现进程间通信。
  * POD 协议定义在 transport_packet.h 中，与 UDP 共享。
  */
-class TransportShmImpl : public TransportBase {
+class TransportShmImpl : public TransportBaseV2 {
 public:
     TransportShmImpl();
     ~TransportShmImpl() override;
@@ -40,6 +40,20 @@ public:
 
     void SendStatus(const robot_base::ControlStatus& status) override;
     bool RecvStatus(robot_base::ControlStatus& status) override;
+
+    bool SendStateV2(const robot_base::RobotData &state,
+        const robot_base::FaultStatus &fault) override;
+    bool RecvStateV2(robot_base::RobotData &state,
+        robot_base::FaultStatus &fault) override;
+    bool SendControlV2(const robot_base::ControlCmd &cmd) override;
+    bool SendCommandV2(const robot_base::Command &cmd,
+        uint64_t acknowledge_fault_sequence) override;
+    bool RecvCommandV2(robot_base::Command &cmd,
+        uint64_t &acknowledge_fault_sequence) override;
+    bool SendStatusV2(const robot_base::ControlStatus &status,
+        const robot_base::FaultStatus &fault) override;
+    bool RecvStatusV2(robot_base::ControlStatus &status,
+        robot_base::FaultStatus &fault) override;
 
 private:
     // ==================== 成员变量 ====================

@@ -26,7 +26,8 @@ namespace {
 
 class StubBackend final : public driver_runtime::DriverBackend {
 public:
-    int Run(const driver_runtime::ExchangeCallback &,
+    int Run(const driver_runtime::PublishStateCallback &,
+        const driver_runtime::ReceiveCommandCallback &,
         const driver_runtime::ContinueCallback &) override {
         return 0;
     }

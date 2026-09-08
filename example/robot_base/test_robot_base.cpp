@@ -226,10 +226,26 @@ int main(int argc, char *argv[]) {
             });
             // 等待线程自然退出后再 join（Stop() 会设 running_=false 并 join）
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (loop.IsRunning()) {
+                std::cerr << "[错误] ThreadLoop 自然退出后仍报告运行中\n";
+                return 1;
+            }
             loop.Stop();
             std::cout << "后台线程执行次数: " << count.load() << "（期望 3）" << std::endl;
             if (count.load() != 3) {
                 std::cerr << "[错误] ThreadLoop 执行次数不符\n";
+                return 1;
+            }
+
+            std::atomic<int> restart_count{0};
+            loop.Start([&restart_count] {
+                restart_count.fetch_add(1);
+                return false;
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            loop.Stop();
+            if (restart_count.load() != 1 || loop.IsRunning()) {
+                std::cerr << "[错误] ThreadLoop 自然退出后无法重新启动\n";
                 return 1;
             }
             std::cout << "ThreadLoop 后台线程 ✓" << std::endl;

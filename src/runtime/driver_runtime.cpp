@@ -55,7 +55,7 @@ int main(int argc, char *argv[]) {
         }
         auto backend = driver_runtime::CreateBackend(backend_kind, yaml_path);
 
-        auto transport = transport::Create(yaml_path);
+        auto transport = transport::CreateV2(yaml_path);
         if (!transport->Init(yaml_path, transport::Role::DRIVER))
             throw std::runtime_error("failed to initialize driver transport");
 
@@ -63,9 +63,11 @@ int main(int argc, char *argv[]) {
         std::signal(SIGTERM, OnSignal);
         runtime_logging::Log(runtime_logging::Level::kInfo, "driver runtime started");
 
-        const auto exchange =
-            [&](const robot_base::RobotData &state) -> std::optional<robot_base::ControlCmd> {
-            transport->SendState(state);
+        const auto publish_state = [&](const robot_base::RobotData &state,
+                const robot_base::FaultStatus &fault) {
+            return transport->SendStateV2(state, fault);
+        };
+        const auto receive_command = [&]() -> std::optional<robot_base::ControlCmd> {
             robot_base::ControlCmd latest;
             robot_base::ControlCmd received;
             bool has_command = false;
@@ -77,7 +79,8 @@ int main(int argc, char *argv[]) {
             return latest;
         };
 
-        const int result = backend->Run(exchange, []() { return g_running != 0; });
+        const int result = backend->Run(
+            publish_state, receive_command, []() { return g_running != 0; });
         runtime_logging::Log(runtime_logging::Level::kInfo, "driver runtime stopped");
         return result;
     } catch (const std::exception &error) {

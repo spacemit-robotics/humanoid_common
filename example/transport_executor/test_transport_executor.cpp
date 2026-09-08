@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <thread>
 
@@ -38,6 +39,7 @@
 #include "robot_base.h"
 #include "shm_transport.h"
 #include "transport_executor.h"
+#include "transport_packet.h"
 
 namespace {
 
@@ -120,6 +122,66 @@ bool TestStaleShmDataDiscard() {
     return true;
 }
 
+bool TestPacketValidation() {
+    transport::HmiCmdPacket hmi{};
+    hmi.header.type = static_cast<uint16_t>(transport::MsgType::HMI_CMD);
+    if (!transport::ValidHmiCmdPacket(hmi)) return false;
+    hmi.vx = std::numeric_limits<float>::quiet_NaN();
+    if (transport::ValidHmiCmdPacket(hmi)) return false;
+
+    transport::RobotStatePacket state{};
+    state.header.type = static_cast<uint16_t>(transport::MsgType::ROBOT_STATE);
+    state.num_dof = 2;
+    if (!transport::ValidRobotStatePacket(state)) return false;
+    state.joint_pos[1] = std::numeric_limits<double>::infinity();
+    if (transport::ValidRobotStatePacket(state)) return false;
+
+    transport::ControlCmdPacket control{};
+    control.header.type = static_cast<uint16_t>(transport::MsgType::CONTROL_CMD);
+    control.num_dof = 2;
+    control.control_mode = static_cast<int8_t>(robot_base::ControlMode::RL);
+    control.actuation_mode = static_cast<int8_t>(robot_base::ActuationMode::HYBRID);
+    if (!transport::ValidControlCmdPacket(control)) return false;
+    control.enable = 2;
+    if (transport::ValidControlCmdPacket(control)) return false;
+    control.enable = 0;
+    control.control_mode = 127;
+    if (transport::ValidControlCmdPacket(control)) return false;
+
+    transport::ControlStatusPacket status{};
+    status.header.type = static_cast<uint16_t>(transport::MsgType::CONTROL_STATUS);
+    if (!transport::ValidControlStatusPacket(status)) return false;
+    status.hmi_connected = 2;
+    if (transport::ValidControlStatusPacket(status)) return false;
+
+    transport::FaultPacket fault{};
+    fault.active = 1;
+    if (transport::ValidFaultPacket(fault)) return false;
+
+    robot_base::FaultStatus long_fault;
+    long_fault.active = true;
+    long_fault.latched = true;
+    long_fault.source = robot_base::FaultSource::MOTOR;
+    long_fault.code = robot_base::FaultCode::FEEDBACK_TIMEOUT;
+    long_fault.sequence = 1;
+    long_fault.timestamp_s = 1.0;
+    long_fault.detail.assign(transport::kFaultDetailLength * 2, 'x');
+    if (!transport::CanEncodeFault(long_fault)) return false;
+    transport::EncodeFault(long_fault, &fault);
+    robot_base::FaultStatus decoded_fault;
+    if (!transport::DecodeFault(fault, &decoded_fault) ||
+        decoded_fault.detail.size() >= transport::kFaultDetailLength ||
+        decoded_fault.detail.find("...[truncated]") == std::string::npos) {
+        return false;
+    }
+
+    long_fault.detail = std::string("invalid\0detail", 14);
+    if (transport::CanEncodeFault(long_fault)) return false;
+
+    std::cout << "[test] V5 packet validation: PASS\n";
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char *argv[]) {
@@ -131,11 +193,12 @@ int main(int argc, char *argv[]) {
     const std::string yaml_path = argv[1];
     bool all_ok = true;
 
+    all_ok = TestPacketValidation() && all_ok;
     all_ok = TestStaleShmDataDiscard() && all_ok;
 
     // ==================== 创建 Driver 端 ====================
 
-    auto driver = transport::Create(yaml_path);
+    auto driver = transport::CreateV2(yaml_path);
     if (!driver->Init(yaml_path, transport::Role::DRIVER)) {
         std::cerr << "[test] Driver 初始化失败\n";
         return 1;
@@ -144,7 +207,7 @@ int main(int argc, char *argv[]) {
 
     // ==================== 创建 Control 端 ====================
 
-    auto control = transport::Create(yaml_path);
+    auto control = transport::CreateV2(yaml_path);
     if (!control->Init(yaml_path, transport::Role::CONTROL)) {
         std::cerr << "[test] Control 初始化失败\n";
         return 1;
@@ -167,12 +230,25 @@ int main(int argc, char *argv[]) {
         state.joint_temperature[i] = 30.0 + i;
         state.joint_error[i] = static_cast<uint32_t>(i);
     }
+    robot_base::FaultStatus state_fault;
+    state_fault.active = true;
+    state_fault.latched = true;
+    state_fault.source = robot_base::FaultSource::IMU;
+    state_fault.code = robot_base::FaultCode::FEEDBACK_TIMEOUT;
+    state_fault.native_code = -7;
+    state_fault.sequence = 42;
+    state_fault.timestamp_s = 1.2;
+    state_fault.detail = "test IMU timeout";
 
-    driver->SendState(state);
+    if (!driver->SendStateV2(state, state_fault)) {
+        std::cerr << "[test] 合法状态发送失败\n";
+        all_ok = false;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     robot_base::RobotData recv_state;
-    if (control->RecvState(recv_state)) {
+    robot_base::FaultStatus recv_state_fault;
+    if (control->RecvStateV2(recv_state, recv_state_fault)) {
         std::cout << "[test] 状态接收成功: num_dof=" << recv_state.num_dof
                 << ", time=" << recv_state.time << ", rpy=(" << recv_state.rpy[0] << ","
                 << recv_state.rpy[1] << "," << recv_state.rpy[2] << ")\n";
@@ -181,13 +257,54 @@ int main(int argc, char *argv[]) {
                 (recv_state.acceleration == state.acceleration) &&
                 (recv_state.joint_torque == state.joint_torque) &&
                 (recv_state.joint_temperature == state.joint_temperature) &&
-                (recv_state.joint_error == state.joint_error);
+                (recv_state.joint_error == state.joint_error) &&
+                recv_state_fault.source == state_fault.source &&
+                recv_state_fault.code == state_fault.code &&
+                recv_state_fault.native_code == state_fault.native_code &&
+                recv_state_fault.sequence == state_fault.sequence &&
+                recv_state_fault.detail == state_fault.detail;
         all_ok = all_ok && ok;
         std::cout << "[test] 状态数据验证: " << (ok ? "通过" : "失败") << "\n";
     } else {
         std::cerr << "[test] 状态接收失败\n";
         all_ok = false;
     }
+
+    robot_base::RobotData invalid_state = state;
+    invalid_state.num_dof = transport::kMaxDof + 1;
+    invalid_state.InitJointVectors();
+    bool invalid_state_rejected = !driver->SendStateV2(invalid_state, state_fault);
+    invalid_state = state;
+    invalid_state.joint_vel.pop_back();
+    invalid_state_rejected = !driver->SendStateV2(invalid_state, state_fault) &&
+        invalid_state_rejected;
+    invalid_state = state;
+    invalid_state.rpy[0] = std::numeric_limits<double>::quiet_NaN();
+    invalid_state_rejected = !driver->SendStateV2(invalid_state, state_fault) &&
+        invalid_state_rejected;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    robot_base::RobotData unexpected_state;
+    robot_base::FaultStatus unexpected_state_fault;
+    invalid_state_rejected =
+        !control->RecvStateV2(unexpected_state, unexpected_state_fault) &&
+        invalid_state_rejected;
+    all_ok = invalid_state_rejected && all_ok;
+    std::cout << "[test] 非法状态发送拒绝: "
+        << (invalid_state_rejected ? "通过" : "失败") << "\n";
+
+    // 旧 TransportBase 调用仍按原数据结构工作；扩展故障只走 v2 旁路。
+    transport::TransportBase &legacy_driver = *driver;
+    transport::TransportBase &legacy_control = *control;
+    state.time = 2.345;
+    legacy_driver.SendState(state);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    robot_base::RobotData legacy_state;
+    const bool legacy_state_ok = legacy_control.RecvState(legacy_state) &&
+        legacy_state.time == state.time &&
+        legacy_state.joint_pos == state.joint_pos;
+    all_ok = legacy_state_ok && all_ok;
+    std::cout << "[test] 旧状态接口兼容: "
+        << (legacy_state_ok ? "通过" : "失败") << "\n";
 
     // ==================== 测试控制通道 ====================
 
@@ -197,6 +314,7 @@ int main(int argc, char *argv[]) {
     // 此示例只测通信，不执行电机命令。
     robot_base::ControlCmd cmd;
     cmd.enable = true;
+    cmd.mode = robot_base::ControlMode::RL;
     cmd.actuation_mode = robot_base::ActuationMode::TORQUE;
     cmd.target_pos.resize(state.num_dof);
     cmd.target_vel.assign(state.num_dof, 0.0);
@@ -207,7 +325,10 @@ int main(int argc, char *argv[]) {
         cmd.target_pos[i] = 0.5 * i;
     }
 
-    control->SendControl(cmd);
+    if (!control->SendControlV2(cmd)) {
+        std::cerr << "[test] 合法控制命令发送失败\n";
+        all_ok = false;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     robot_base::ControlCmd recv_cmd;
@@ -229,11 +350,39 @@ int main(int argc, char *argv[]) {
         all_ok = false;
     }
 
+    robot_base::ControlCmd invalid_cmd = cmd;
+    invalid_cmd.target_vel.pop_back();
+    bool invalid_control_rejected = !control->SendControlV2(invalid_cmd);
+    invalid_cmd = cmd;
+    invalid_cmd.target_pos[0] = std::numeric_limits<double>::quiet_NaN();
+    invalid_control_rejected = !control->SendControlV2(invalid_cmd) &&
+        invalid_control_rejected;
+    invalid_cmd = cmd;
+    invalid_cmd.kp[0] = -1.0;
+    invalid_control_rejected = !control->SendControlV2(invalid_cmd) &&
+        invalid_control_rejected;
+    invalid_cmd = cmd;
+    const std::size_t oversized_dof = transport::kMaxDof + 1;
+    invalid_cmd.target_pos.assign(oversized_dof, 0.0);
+    invalid_cmd.target_vel.assign(oversized_dof, 0.0);
+    invalid_cmd.target_torque.assign(oversized_dof, 0.0);
+    invalid_cmd.kp.assign(oversized_dof, 0.0);
+    invalid_cmd.kd.assign(oversized_dof, 0.0);
+    invalid_control_rejected = !control->SendControlV2(invalid_cmd) &&
+        invalid_control_rejected;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    robot_base::ControlCmd unexpected_cmd;
+    invalid_control_rejected = !driver->RecvControl(unexpected_cmd) &&
+        invalid_control_rejected;
+    all_ok = invalid_control_rejected && all_ok;
+    std::cout << "[test] 非法控制命令发送拒绝: "
+        << (invalid_control_rejected ? "通过" : "失败") << "\n";
+
     // ==================== 测试命令通道 ====================
 
     std::cout << "\n--- 测试命令通道 (Hmi → Control) ---\n";
 
-    auto hmi = transport::Create(yaml_path);
+    auto hmi = transport::CreateV2(yaml_path);
     if (!hmi->Init(yaml_path, transport::Role::HMI)) {
         std::cerr << "[test] Hmi 初始化失败\n";
         return 1;
@@ -245,20 +394,55 @@ int main(int argc, char *argv[]) {
     hmi_cmd.vy = 0.1f;
     hmi_cmd.wz = 0.2f;
 
-    hmi->SendCommand(hmi_cmd);
+    if (!hmi->SendCommandV2(hmi_cmd, 42)) {
+        std::cerr << "[test] 合法 HMI 命令发送失败\n";
+        all_ok = false;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     robot_base::Command recv_hmi;
-    if (control->RecvCommand(recv_hmi)) {
+    uint64_t recv_fault_ack_sequence = 0;
+    if (control->RecvCommandV2(recv_hmi, recv_fault_ack_sequence)) {
         std::cout << "[test] 命令接收成功: key=" << recv_hmi.key << ", vx=" << recv_hmi.vx
                 << ", vy=" << recv_hmi.vy << ", wz=" << recv_hmi.wz << "\n";
-        bool ok = (recv_hmi.key == 3) && (std::abs(recv_hmi.vx - 0.5f) < 1e-4f);
+        bool ok = (recv_hmi.key == 3) &&
+            (std::abs(recv_hmi.vx - 0.5f) < 1e-4f) &&
+            recv_fault_ack_sequence == 42;
         all_ok = all_ok && ok;
         std::cout << "[test] 命令数据验证: " << (ok ? "通过" : "失败") << "\n";
     } else {
         std::cerr << "[test] 命令接收失败\n";
         all_ok = false;
     }
+
+    robot_base::Command invalid_hmi_cmd = hmi_cmd;
+    invalid_hmi_cmd.vx = std::numeric_limits<float>::quiet_NaN();
+    bool invalid_hmi_rejected = !hmi->SendCommandV2(invalid_hmi_cmd, 0);
+    invalid_hmi_cmd = hmi_cmd;
+    invalid_hmi_cmd.switch_policy.assign(transport::kPolicyNameLength, 'x');
+    invalid_hmi_rejected = !hmi->SendCommandV2(invalid_hmi_cmd, 0) &&
+        invalid_hmi_rejected;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    robot_base::Command unexpected_hmi_cmd;
+    uint64_t unexpected_acknowledgement = 0;
+    invalid_hmi_rejected =
+        !control->RecvCommandV2(unexpected_hmi_cmd, unexpected_acknowledgement) &&
+        invalid_hmi_rejected;
+    all_ok = invalid_hmi_rejected && all_ok;
+    std::cout << "[test] 非法 HMI 命令发送拒绝: "
+        << (invalid_hmi_rejected ? "通过" : "失败") << "\n";
+
+    transport::TransportBase &legacy_hmi = *hmi;
+    hmi_cmd.key = 1;
+    legacy_hmi.SendCommand(hmi_cmd);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    robot_base::Command legacy_command;
+    const bool legacy_command_ok = legacy_control.RecvCommand(legacy_command) &&
+        legacy_command.key == hmi_cmd.key &&
+        legacy_command.switch_policy == hmi_cmd.switch_policy;
+    all_ok = legacy_command_ok && all_ok;
+    std::cout << "[test] 旧命令接口兼容: "
+        << (legacy_command_ok ? "通过" : "失败") << "\n";
 
     // ==================== 测试 Control 状态回传 ====================
 
@@ -273,18 +457,33 @@ int main(int argc, char *argv[]) {
     status.wz = 0.2f;
     status.rl_frequency_hz = 49.8f;
     status.active_policy = "test_policy";
-    control->SendStatus(status);
+    robot_base::FaultStatus status_fault;
+    status_fault.latched = true;
+    status_fault.source = robot_base::FaultSource::POLICY;
+    status_fault.code = robot_base::FaultCode::INFERENCE_TIMEOUT;
+    status_fault.native_code = 9;
+    status_fault.sequence = 11;
+    status_fault.detail = "test policy timeout";
+    if (!control->SendStatusV2(status, status_fault)) {
+        std::cerr << "[test] 合法 Control 状态发送失败\n";
+        all_ok = false;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
     robot_base::ControlStatus recv_status;
-    if (!hmi->RecvStatus(recv_status)) {
+    robot_base::FaultStatus recv_status_fault;
+    if (!hmi->RecvStatusV2(recv_status, recv_status_fault)) {
         std::cerr << "[test] Control 状态接收失败\n";
         return 1;
     }
     const bool status_ok = recv_status.mode == robot_base::ControlMode::RL &&
         recv_status.hmi_connected &&
         std::abs(recv_status.vx - status.vx) < 1e-4f &&
-        recv_status.active_policy == status.active_policy;
+        recv_status.active_policy == status.active_policy &&
+        recv_status_fault.latched &&
+        recv_status_fault.source == status_fault.source &&
+        recv_status_fault.code == status_fault.code &&
+        recv_status_fault.detail == status_fault.detail;
     std::cout << "[test] 状态回传: mode="
         << static_cast<int>(recv_status.mode)
         << ", policy=" << recv_status.active_policy
@@ -292,6 +491,33 @@ int main(int argc, char *argv[]) {
     std::cout << "[test] 状态回传验证: "
         << (status_ok ? "通过" : "失败") << "\n";
     all_ok = all_ok && status_ok;
+
+    robot_base::ControlStatus invalid_status = status;
+    invalid_status.rl_frequency_hz = std::numeric_limits<float>::infinity();
+    bool invalid_status_rejected = !control->SendStatusV2(invalid_status, status_fault);
+    invalid_status = status;
+    invalid_status.active_policy.assign(transport::kPolicyNameLength, 'x');
+    invalid_status_rejected = !control->SendStatusV2(invalid_status, status_fault) &&
+        invalid_status_rejected;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    robot_base::ControlStatus unexpected_status;
+    robot_base::FaultStatus unexpected_status_fault;
+    invalid_status_rejected =
+        !hmi->RecvStatusV2(unexpected_status, unexpected_status_fault) &&
+        invalid_status_rejected;
+    all_ok = invalid_status_rejected && all_ok;
+    std::cout << "[test] 非法 Control 状态发送拒绝: "
+        << (invalid_status_rejected ? "通过" : "失败") << "\n";
+
+    status.active_policy = "legacy_policy";
+    legacy_control.SendStatus(status);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    robot_base::ControlStatus legacy_status;
+    const bool legacy_status_ok = legacy_hmi.RecvStatus(legacy_status) &&
+        legacy_status.active_policy == status.active_policy;
+    all_ok = legacy_status_ok && all_ok;
+    std::cout << "[test] 旧状态回传接口兼容: "
+        << (legacy_status_ok ? "通过" : "失败") << "\n";
 
     if (!all_ok) return 1;
     std::cout << "\n[test] 全部测试完成\n";

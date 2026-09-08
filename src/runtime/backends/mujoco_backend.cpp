@@ -17,6 +17,7 @@
 #include "driver_backend.h"
 #include "mujoco_sim.h"
 #include "robot_base.h"
+#include "runtime_logger.h"
 
 namespace driver_runtime {
 namespace {
@@ -31,6 +32,8 @@ public:
             yaml_file.ToAbsPath(yaml_file.Read<std::string>("robot_base.robot_dir").value());
         const std::string scene =
             yaml_file.Read<std::string>("simulation.mujoco.scene_xml").value_or("scene.xml");
+        const std::string scene_path = robot_dir + "/resources/xml/" + scene;
+        runtime_logging::RecordArtifact("simulation_model", "scene", scene_path);
         const auto default_joint_pos =
             yaml_file.Read<std::vector<double>>("robot_base.default_joint_pos").value();
         const auto kp =
@@ -38,10 +41,12 @@ public:
         const auto kd =
             yaml_file.Read<std::vector<double>>("robot_base.kd").value_or(std::vector<double>{});
         simulator_ = std::make_unique<mujoco_sim::Simulator>(yaml_path, robot_name, num_dof,
-            robot_dir + "/resources/xml/" + scene, default_joint_pos, kp, kd, true);
+            scene_path, default_joint_pos, kp, kd, true);
     }
 
-    int Run(const ExchangeCallback &exchange, const ContinueCallback &should_continue) override {
+    int Run(const PublishStateCallback &publish_state,
+            const ReceiveCommandCallback &receive_command,
+            const ContinueCallback &should_continue) override {
         auto last_mode = robot_base::ControlMode::POWER_OFF;
         simulator_->Run(
             [&](const mujoco_sim::SimState &sim_state) -> std::optional<mujoco_sim::SimControl> {
@@ -55,7 +60,10 @@ public:
                 state.gyro = sim_state.gyro;
                 state.rpy = sim_state.rpy;
                 state.time = sim_state.time;
-                const auto command = exchange(state);
+                if (!publish_state(state, {})) {
+                    throw std::runtime_error("failed to publish MuJoCo state");
+                }
+                const auto command = receive_command();
                 if (!command) return std::nullopt;
 
                 if (command->actuation_mode != robot_base::ActuationMode::HYBRID &&

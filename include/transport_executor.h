@@ -103,6 +103,34 @@ public:
 };
 
 /**
+ * @brief 带运行时故障信息的扩展传输接口
+ *
+ * 旧 TransportBase 和 robot_base 数据结构保持原有 ABI；新 runtime 通过该接口
+ * 在同一协议包中传递故障状态和确认序列。
+ */
+class TransportBaseV2 : public TransportBase {
+public:
+    ~TransportBaseV2() override = default;
+
+    virtual bool SendStateV2(const robot_base::RobotData &state,
+        const robot_base::FaultStatus &fault) = 0;
+    virtual bool RecvStateV2(robot_base::RobotData &state,
+        robot_base::FaultStatus &fault) = 0;
+
+    virtual bool SendControlV2(const robot_base::ControlCmd &cmd) = 0;
+
+    virtual bool SendCommandV2(const robot_base::Command &cmd,
+        uint64_t acknowledge_fault_sequence) = 0;
+    virtual bool RecvCommandV2(robot_base::Command &cmd,
+        uint64_t &acknowledge_fault_sequence) = 0;
+
+    virtual bool SendStatusV2(const robot_base::ControlStatus &status,
+        const robot_base::FaultStatus &fault) = 0;
+    virtual bool RecvStatusV2(robot_base::ControlStatus &status,
+        robot_base::FaultStatus &fault) = 0;
+};
+
+/**
  * @brief 工厂函数：根据 YAML 配置创建传输实例
  *
  * 读取 YAML 中 transport.type 字段，创建对应的传输实现。
@@ -113,6 +141,9 @@ public:
  * @throws std::runtime_error 如果类型不支持或配置错误
  */
 std::unique_ptr<TransportBase> Create(const std::string& yaml_path);
+
+/** @brief 创建支持结构化运行时故障传输的 v2 实例。 */
+std::unique_ptr<TransportBaseV2> CreateV2(const std::string &yaml_path);
 
 }  // namespace transport
 

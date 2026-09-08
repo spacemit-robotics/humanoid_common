@@ -23,14 +23,19 @@ enum class BackendKind {
     WHOLE_BODY,
 };
 
-using ExchangeCallback =
-    std::function<std::optional<robot_base::ControlCmd>(const robot_base::RobotData &)>;
+using PublishStateCallback =
+    std::function<bool(const robot_base::RobotData &,
+        const robot_base::FaultStatus &)>;
+using ReceiveCommandCallback =
+    std::function<std::optional<robot_base::ControlCmd>()>;
 using ContinueCallback = std::function<bool()>;
 
 class DriverBackend {
 public:
     virtual ~DriverBackend() = default;
-    virtual int Run(const ExchangeCallback &exchange, const ContinueCallback &should_continue) = 0;
+    virtual int Run(const PublishStateCallback &publish_state,
+        const ReceiveCommandCallback &receive_command,
+        const ContinueCallback &should_continue) = 0;
 };
 
 BackendKind ParseBackendKind(const robot_base::YamlFile &yaml_file);

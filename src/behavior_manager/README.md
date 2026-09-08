@@ -15,7 +15,7 @@
 | `HOME` | 平滑恢复 `robot_base.default_joint_pos` |
 | `ZERO` | 平滑到当前 RL 策略的准备姿态 |
 | `RL` | RL 控制（异步 ONNX 推理）|
-| `SAFETY` | 安全保护（IMU 超限触发）|
+| `SAFETY` | 安全保护（传感器、策略、传输或执行故障触发）|
 
 #### `robot_base::RobotData` — 传感器输入
 
@@ -54,12 +54,15 @@
 | `Init()` | 初始化（加载配置、注册状态、初始化 FSM）|
 | `Step(control_dt, rl_dt)` | 执行一步控制 |
 | `SetSensorData(data)` | 设置传感器数据 |
+| `SetSensorFault(fault)` | 设置与当前传感器帧关联的 driver/backend 故障 |
 | `SetCommand(cmd)` | 设置命令（状态切换、速度指令、策略切换）|
+| `AcknowledgeFault(sequence)` | 在 POWER_OFF 下确认对应序列的已恢复锁存故障 |
 | `GetOutput()` | 获取控制输出 |
 | `CurrentState()` | 获取当前状态 |
 | `IsZeroReady()` | 查询 ZERO 是否完成、是否可进入 RL |
 | `CurrentPolicyName()` | 获取当前 RL 策略名 |
 | `GetRlFreq()` | 获取 RL 推理频率（Hz）|
+| `CurrentFault()` | 获取当前活动或锁存故障 |
 
 **状态切换指令 (`Command.key`)：**
 
@@ -120,6 +123,10 @@ cd ~/spacemit_robot
 - `behavior_manager.zero_pos`：未配置 RL 策略时的 ZERO 目标位置；配置策略后使用 `rl_policy.onnx_infer.policies.<name>.zero_target_pos` 或 `rl_default_pos`
 - `behavior_manager.zero.move_duration / kp / kd`：ZERO 移动时长和独立安全增益，`move_duration` 默认 3 秒；kp/kd 必须同时配置
 - `behavior_manager.zero.position_tolerance / velocity_tolerance / settle_duration`：ZERO 到位条件，默认分别为 0.15 rad、0.10 rad/s、0.20 秒
+- `behavior_manager.safety.driver_state_timeout_s`：driver 状态最大允许年龄，超时后锁存传输故障
+- `behavior_manager.safety.max_roll / max_pitch / max_angular_velocity`：control 侧姿态和角速度安全门限，`0` 表示不启用对应门限
+- `behavior_manager.safety.release_duration_s`：反馈仍有效时 SAFETY 逐步卸力的时长，默认 1 秒；反馈无效时立即失能
+- `behavior_manager.rl_safety.first_action_timeout_s / max_action_age_s / inference_deadline_s`：RL 首帧等待、已发布 action 年龄和单次推理时限；也可在单个策略的 `runtime_safety` 下覆盖，`0` 表示不启用
 
 **路径解析：** `robot_base.robot_dir` 相对于 YAML 文件；`model_path` 相对于 `robot_dir`。
 
@@ -130,8 +137,13 @@ POWER_OFF ─key=1→ DAMP ─key=4→ HOME ─key=2(完成)→ ZERO ─key=3(�
     ↑                                                                  │
     └────────────────────── key=-1(ESC) ───────────────────────────────┘
                                                                        │
-                                                 RL ──IMU超限──→ SAFETY
+                              传感器/策略/传输/执行故障 ───────→ SAFETY
 ```
+
+故障分为“仍在发生”的 active 状态和“等待人工确认”的 latched 状态。SAFETY 完成安全
+退回后仍保留锁存，阻止再次上电；只有故障条件已经消失且 FSM 位于 `POWER_OFF` 时，
+HMI 的 `x` 才能清除锁存。重复收到同一条已确认的恢复状态不会重新锁存，但该故障再次
+变为 active 时会按新事件重新触发 SAFETY。
 
 ### 关键设计
 
@@ -141,6 +153,6 @@ POWER_OFF ─key=1→ DAMP ─key=4→ HOME ─key=2(完成)→ ZERO ─key=3(�
 - **策略协议适配：** `policy_adapter` 是 behavior_manager 的私有子模块；机器人自由度、关节映射和自定义观测维度由机型 YAML 透传，common 不固定具体机型维度
 - **动态策略切换：** 仅在 `POWER_OFF` / `DAMP` 状态接受 `Command.switch_policy`；进入 `ZERO` 后策略锁定（ZERO 目标位置取自当前策略，增益使用独立安全配置）
 - **前置策略链调度：** 目标策略可在 yaml 配置 `prerequisite: { policy, duration }`，behavior_manager 收到切换请求后自动先切前置策略，在 RL 状态运行 `duration` 秒后再切目标策略；用户感知层面只发一次切换命令。典型场景：`dance` / `kungfu` 配 `prerequisite: stand`，先用 LocoMode 站稳并预热 LSTM，再进 dance/kungfu，避免直接从 PD 锁位的 ZERO 切动态动作时摔倒
-- **安全保护：** IMU 倾角/关节限位自动触发安全状态
+- **安全保护：** driver 故障、状态超时、无效数据、姿态超限和 RL 推理/action 超时统一触发安全状态并跨进程锁存
 - **状态回传：** `CurrentState()`、`IsZeroReady()`、当前策略和 RL 频率由 control_runtime 组装为 `ControlStatus` 发给 HMI
 - **参数隔离：** damp_kd ≈ policy kd / 5（不同阶段刚度需求不同）

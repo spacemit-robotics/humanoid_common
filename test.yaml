@@ -5,12 +5,13 @@ tests:
     description: >
       robot_base / behavior_manager / transport_executor 从 example 配置跑通离线流程，
       driver_runtime 校验 YAML 后端解析、factory 分派，以及 whole_body 关节、IMU
-      状态和控制命令的数据转换。
+      状态和控制命令的数据转换；runtime timing 校验绝对周期调度辅助逻辑。
     category: functional
     scopes: [pr]
     timeout_s: 120
     requires:
-      commands: [test_robot_base, test_behavior, test_transport_executor, test_driver_runtime]
+      commands: [test_robot_base, test_behavior, test_transport_executor, test_driver_runtime,
+                 test_runtime_timing]
     command: |
       bash tests/functional.sh
 

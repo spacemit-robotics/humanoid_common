@@ -22,6 +22,7 @@
 #include <cstring>
 #include <iterator>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -207,12 +208,22 @@ UiConfig LoadUiConfig(const std::string &yaml_path) {
         }
     }
 
-    config.hmi.heartbeat_hz = std::max(1.0,
-        yaml.Read<double>("hmi.command_heartbeat_hz").value_or(20.0));
-    config.hmi.status_timeout = std::max(0.1,
-        yaml.Read<double>("hmi.status_timeout").value_or(0.6));
-    config.hmi.request_timeout = std::max(0.5,
-        yaml.Read<double>("hmi.request_timeout").value_or(15.0));
+    const auto finite_at_least = [](double value, double minimum,
+            const char *path) {
+        if (!std::isfinite(value)) {
+            throw std::runtime_error(std::string(path) + " must be finite");
+        }
+        return std::max(minimum, value);
+    };
+    config.hmi.heartbeat_hz = finite_at_least(
+        yaml.Read<double>("hmi.command_heartbeat_hz").value_or(20.0),
+        1.0, "hmi.command_heartbeat_hz");
+    config.hmi.status_timeout = finite_at_least(
+        yaml.Read<double>("hmi.status_timeout").value_or(0.6),
+        0.1, "hmi.status_timeout");
+    config.hmi.request_timeout = finite_at_least(
+        yaml.Read<double>("hmi.request_timeout").value_or(15.0),
+        0.5, "hmi.request_timeout");
     config.hmi.key_highlight_ms = std::max(0,
         yaml.Read<int>("hmi.key_highlight_ms").value_or(180));
     config.hmi.step_vx = static_cast<float>(std::abs(
@@ -221,6 +232,11 @@ UiConfig LoadUiConfig(const std::string &yaml_path) {
         yaml.Read<double>("hmi.velocity.step_vy").value_or(0.1)));
     config.hmi.step_wz = static_cast<float>(std::abs(
         yaml.Read<double>("hmi.velocity.step_wz").value_or(0.1)));
+    if (!std::isfinite(config.hmi.step_vx) ||
+        !std::isfinite(config.hmi.step_vy) ||
+        !std::isfinite(config.hmi.step_wz)) {
+        throw std::runtime_error("hmi velocity steps must be finite");
+    }
     config.command_limits = runtime_config::LoadPolicyCommandLimits(yaml);
     return config;
 }
@@ -242,6 +258,7 @@ struct PendingTransition {
 struct UiState {
     HmiPage page = HmiPage::MAIN;
     robot_base::ControlStatus status;
+    robot_base::FaultStatus fault;
     bool has_status = false;
     bool status_online = false;
     Clock::time_point last_status_at{};
@@ -252,9 +269,11 @@ struct UiState {
     int active_policy_idx = 0;
     int policy_cursor_idx = 0;
     std::string pending_policy;
+    uint64_t fault_ack_sequence = 0;
     std::string policy_source;
     Clock::time_point policy_requested_at{};
     std::string last_action = "等待 Control 状态回传";
+    bool command_send_failed = false;
     int highlighted_key = -1;
     Clock::time_point highlight_until{};
 };
@@ -379,7 +398,15 @@ void RenderMainPage(const UiState &state) {
     printf(" → ");
     PrintModeToken(ControlMode::RL, state);
     MoveTo(7, layout.content_left);
-    if (state.status_online && state.status.mode == ControlMode::ZERO) {
+    if (state.status_online && state.fault.latched) {
+        SetFg(state.fault.active ? Color::BRIGHT_RED : Color::BRIGHT_YELLOW);
+        SetBold();
+        printf("故障: %s/%s %s%s",
+            robot_base::FaultSourceName(state.fault.source),
+            robot_base::FaultCodeName(state.fault.code),
+            state.fault.active ? "ACTIVE" : "LATCHED",
+            state.fault.active ? "" : "  [X] 确认");
+    } else if (state.status_online && state.status.mode == ControlMode::ZERO) {
         SetFg(state.status.zero_ready ? Color::BRIGHT_GREEN : Color::BRIGHT_YELLOW);
         printf("回零: %s", state.status.zero_ready ?
             "READY，可按 → 进入 RL" : "进行中，可按 → 排队进入 RL");
@@ -440,7 +467,7 @@ void RenderMainPage(const UiState &state) {
     printf(" POWER_OFF    [Space] 速度清零    [Ctrl+C] 退出");
     MoveTo(20, layout.content_left);
     SetDim();
-    printf("兼容快捷键: o=DAMP  z=ZERO  r=RL（仍由 Control 校验）");
+    printf("兼容快捷键: o=DAMP  z=ZERO  r=RL  x=故障确认");
     ResetAttr();
 
     PrintLastAction(layout, 22, state.last_action);
@@ -634,8 +661,27 @@ robot_base::Command BuildCommand(const UiState &state) {
     return command;
 }
 
-void SendCommand(transport::TransportBase *transport, const UiState &state) {
-    transport->SendCommand(BuildCommand(state));
+bool SendCommand(transport::TransportBaseV2 *transport, UiState *state) {
+    if (!transport || !state) return false;
+    const bool sent =
+        transport->SendCommandV2(BuildCommand(*state), state->fault_ack_sequence);
+    if (!sent) {
+        static constexpr const char *kFailure = "HMI 命令校验或发送失败";
+        const bool changed = !state->command_send_failed || state->last_action != kFailure;
+        if (!state->command_send_failed) {
+            runtime_logging::Log(runtime_logging::Level::kError, kFailure, false);
+        }
+        state->command_send_failed = true;
+        state->last_action = kFailure;
+        return changed;
+    }
+    if (!state->command_send_failed) return false;
+
+    state->command_send_failed = false;
+    state->last_action = "HMI 命令通道已恢复";
+    runtime_logging::Log(
+        runtime_logging::Level::kInfo, state->last_action, false);
+    return true;
 }
 
 bool RequestTransition(UiState *state, ControlMode target, int key,
@@ -671,6 +717,12 @@ bool RequestByArrow(UiState *state, bool forward,
     }
     if (state->transition.active) {
         state->last_action = "上一个 FSM 请求仍在等待 Control 确认";
+        return false;
+    }
+    if (forward && state->fault.latched) {
+        state->last_action = state->fault.active
+            ? "故障仍在活动，禁止上电"
+            : "故障已锁存，请在 POWER_OFF 按 X 确认";
         return false;
     }
 
@@ -715,6 +767,12 @@ bool RequestShortcut(UiState *state, int key,
         state->page = HmiPage::MAIN;
         return RequestTransition(state, ControlMode::POWER_OFF, -1, now);
     }
+    if (state->fault.latched) {
+        state->last_action = state->fault.active
+            ? "故障仍在活动，禁止上电"
+            : "故障已锁存，请在 POWER_OFF 按 X 确认";
+        return false;
+    }
     if (key == 'o') {
         if (current == ControlMode::POWER_OFF || current == ControlMode::HOME ||
             current == ControlMode::ZERO || current == ControlMode::RL) {
@@ -731,6 +789,32 @@ bool RequestShortcut(UiState *state, int key,
     return false;
 }
 
+bool RequestFaultAcknowledgement(UiState *state) {
+    if (!state->status_online) {
+        state->last_action = "故障确认未发送：Control 状态已断开";
+        return false;
+    }
+    if (!state->fault.latched) {
+        state->last_action = "当前没有锁存故障";
+        return false;
+    }
+    if (state->status.mode != ControlMode::POWER_OFF) {
+        state->last_action = "故障只能在 POWER_OFF 下确认";
+        return false;
+    }
+    if (state->fault.active) {
+        state->last_action = "故障仍在活动，不能确认";
+        return false;
+    }
+    if (state->fault.sequence == 0) {
+        state->last_action = "故障序列无效，确认未发送";
+        return false;
+    }
+    state->fault_ack_sequence = state->fault.sequence;
+    state->last_action = "已请求 Control 确认故障，等待回传";
+    return true;
+}
+
 void UpdateActivePolicy(UiState *state) {
     const auto it = std::find(state->policies.begin(), state->policies.end(),
         state->status.active_policy);
@@ -741,12 +825,16 @@ void UpdateActivePolicy(UiState *state) {
 }
 
 bool StatusChanged(const UiState &state,
-        const robot_base::ControlStatus &status) {
+        const robot_base::ControlStatus &status,
+        const robot_base::FaultStatus &fault) {
     if (!state.has_status) return true;
     return state.status.mode != status.mode ||
         state.status.zero_ready != status.zero_ready ||
         state.status.hmi_connected != status.hmi_connected ||
         state.status.active_policy != status.active_policy ||
+        state.fault.active != fault.active ||
+        state.fault.latched != fault.latched ||
+        state.fault.sequence != fault.sequence ||
         std::abs(state.status.vx - status.vx) > 0.005f ||
         std::abs(state.status.vy - status.vy) > 0.005f ||
         std::abs(state.status.wz - status.wz) > 0.005f ||
@@ -754,11 +842,32 @@ bool StatusChanged(const UiState &state,
 }
 
 void ProcessStatus(UiState *state, const robot_base::ControlStatus &status,
-        const Clock::time_point &now, bool *send_immediately) {
+        const robot_base::FaultStatus &fault, const Clock::time_point &now,
+        bool *send_immediately) {
+    const uint64_t previous_fault_sequence = state->fault.sequence;
     state->status = status;
+    state->fault = fault;
     state->has_status = true;
     state->last_status_at = now;
     UpdateActivePolicy(state);
+
+    if (fault.latched && fault.sequence != previous_fault_sequence) {
+        state->last_action = std::string("故障: ") +
+            robot_base::FaultSourceName(fault.source) + "/" +
+            robot_base::FaultCodeName(fault.code) + ": " + fault.detail;
+    }
+    const bool fault_ack_is_stale = fault.latched &&
+        state->fault_ack_sequence != 0 &&
+        fault.sequence != state->fault_ack_sequence;
+    if ((fault.active || fault_ack_is_stale) &&
+        state->fault_ack_sequence != 0) {
+        state->fault_ack_sequence = 0;
+        *send_immediately = true;
+    } else if (state->fault_ack_sequence != 0 && !fault.latched) {
+        state->fault_ack_sequence = 0;
+        state->last_action = "Control 已确认并清除故障";
+        *send_immediately = true;
+    }
 
     if (state->transition.active) {
         if (status.mode == state->transition.target) {
@@ -832,7 +941,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    auto transport = transport::Create(yaml_path);
+    auto transport = transport::CreateV2(yaml_path);
     if (!transport->Init(yaml_path, transport::Role::HMI)) {
         runtime_logging::Log(
             runtime_logging::Level::kError, "HMI transport initialization failed", false);
@@ -862,11 +971,14 @@ int main(int argc, char *argv[]) {
         bool send_immediately = false;
 
         robot_base::ControlStatus latest_status;
+        robot_base::FaultStatus latest_fault;
         bool received_status = false;
-        while (transport->RecvStatus(latest_status)) received_status = true;
+        while (transport->RecvStatusV2(latest_status, latest_fault))
+            received_status = true;
         if (received_status) {
-            const bool status_changed = StatusChanged(state, latest_status);
-            ProcessStatus(&state, latest_status, now, &send_immediately);
+            const bool status_changed = StatusChanged(state, latest_status, latest_fault);
+            ProcessStatus(
+                &state, latest_status, latest_fault, now, &send_immediately);
             dirty = dirty || status_changed || send_immediately;
         }
 
@@ -884,6 +996,7 @@ int main(int argc, char *argv[]) {
             if (!online) {
                 state.transition.active = false;
                 state.pending_policy.clear();
+                state.fault_ack_sequence = 0;
                 ZeroVelocity(&state);
                 if (state.page == HmiPage::VELOCITY) state.page = HmiPage::MAIN;
                 state.last_action = "Control 状态回传超时，速度已清零";
@@ -921,6 +1034,9 @@ int main(int argc, char *argv[]) {
             if (key == 'f') {
                 send_immediately = RequestShortcut(&state, key, now) ||
                     send_immediately;
+            } else if (key == 'x') {
+                send_immediately = RequestFaultAcknowledgement(&state) ||
+                    send_immediately;
             } else if (state.page == HmiPage::POLICY_SELECT) {
                 if ((key == kKeyUp || key == 'k') && !state.policies.empty()) {
                     state.policy_cursor_idx = (state.policy_cursor_idx - 1 +
@@ -934,6 +1050,8 @@ int main(int argc, char *argv[]) {
                     !state.policies.empty()) {
                     if (!state.status_online) {
                         state.last_action = "策略未切换：Control 状态已断开";
+                    } else if (state.fault.latched) {
+                        state.last_action = "策略未切换：存在锁存故障";
                     } else if (state.status.mode != ControlMode::POWER_OFF &&
                         state.status.mode != ControlMode::DAMP) {
                         state.last_action =
@@ -1070,7 +1188,10 @@ int main(int argc, char *argv[]) {
         if (send_immediately ||
             std::chrono::duration<double>(now - last_command_at).count()
                 >= heartbeat_period) {
-            SendCommand(transport.get(), state);
+            if (SendCommand(transport.get(), &state)) {
+                dirty = true;
+                last_logged_action = state.last_action;
+            }
             last_command_at = now;
         }
 
@@ -1085,9 +1206,15 @@ int main(int argc, char *argv[]) {
     state.transition.active = true;
     state.transition.key = -1;
     state.pending_policy.clear();
+    state.fault_ack_sequence = 0;
     ZeroVelocity(&state);
-    SendCommand(transport.get(), state);
-    runtime_logging::Log(runtime_logging::Level::kInfo,
-        "HMI runtime stopped after requesting POWER_OFF", false);
+    (void)SendCommand(transport.get(), &state);
+    runtime_logging::Log(
+        state.command_send_failed ? runtime_logging::Level::kWarning
+            : runtime_logging::Level::kInfo,
+        state.command_send_failed
+            ? "HMI runtime stopped; POWER_OFF request send failed, control timeout is fallback"
+            : "HMI runtime stopped after requesting POWER_OFF",
+        false);
     return 0;
 }

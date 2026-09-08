@@ -14,9 +14,14 @@
 #include "behavior_manager.h"  // 对外接口，位于 include/
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -48,6 +53,40 @@ const char *StateNameStr(StateName s) {
 }
 
 namespace {
+
+double MonotonicTimeSeconds() {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+struct SafetyMonitorConfig {
+    double max_roll = 0.0;
+    double max_pitch = 0.0;
+    double max_angular_velocity = 0.0;
+};
+
+enum class SafetyMonitorFault : int32_t {
+    kInvalidState = 1,
+    kBodyAttitude = 2,
+    kAngularVelocity = 3,
+};
+
+bool AllFinite(const std::vector<double> &values) {
+    return std::all_of(values.begin(), values.end(),
+        [](double value) { return std::isfinite(value); });
+}
+
+template <std::size_t Size>
+bool AllFinite(const std::array<double, Size> &values) {
+    return std::all_of(values.begin(), values.end(),
+        [](double value) { return std::isfinite(value); });
+}
+
+double QuaternionNormSquared(const std::array<double, 4> &quaternion) {
+    double norm_squared = 0.0;
+    for (double value : quaternion) norm_squared += value * value;
+    return norm_squared;
+}
 
 void ValidateJointVector(const std::vector<double> &values,
         int num_dof,
@@ -103,6 +142,7 @@ class BehaviorManagerClass::Impl {
 public:
     FSM fsm;
     robot_base::RobotData sensor;
+    robot_base::FaultStatus sensor_fault;
     robot_base::Command command;
     ControlOutput output;
     std::string config_path;
@@ -116,6 +156,20 @@ public:
     bool has_rl = false;                      // 是否配置了 RL 状态
     std::atomic<double> rl_freq_hz{0.0};      // RL 实时推理频率（Hz）
     robot_base::ThreadLoop infer_thread_cfg;  // 推理线程配置（robot_base.threads.rl_infer）
+    SafetyMonitorConfig safety_monitor;
+    double safety_release_duration = 1.0;
+    robot_base::FaultStatus fault;
+    uint64_t fault_sequence = 0;
+    uint64_t previous_fault_ack_sequence = 0;
+    bool fault_block_reported = false;
+    uint64_t observed_fault_sequence = 0;
+    uint64_t acknowledged_sensor_fault_sequence = 0;
+    robot_base::FaultSource acknowledged_sensor_fault_source =
+        robot_base::FaultSource::NONE;
+    robot_base::FaultCode acknowledged_sensor_fault_code =
+        robot_base::FaultCode::NONE;
+    int32_t acknowledged_sensor_fault_native_code = 0;
+    std::vector<robot_base::FaultStatus> fault_observations;
 
     // 策略链调度（prerequisite）
     struct PrerequisiteEntry {
@@ -130,6 +184,201 @@ public:
     // 边沿检测（control_runtime 每帧重发缓存 cmd，需要识别真实的"用户新请求"）
     std::string prev_switch_policy;          // 上一帧 cmd.switch_policy
     StateName prev_fsm_state = StateName::POWER_OFF;  // 上一帧 FSM 状态
+
+    robot_base::FaultStatus MakeFault(robot_base::FaultSource source,
+            robot_base::FaultCode code, const std::string &detail,
+            int32_t native_code = 0) const {
+        robot_base::FaultStatus result;
+        result.active = true;
+        result.latched = true;
+        result.source = source;
+        result.code = code;
+        result.native_code = native_code;
+        result.detail = detail;
+        return result;
+    }
+
+    bool IsAcknowledgedSensorFault(const robot_base::FaultStatus &candidate) const {
+        return candidate.sequence != 0 &&
+            candidate.sequence == acknowledged_sensor_fault_sequence &&
+            candidate.source == acknowledged_sensor_fault_source &&
+            candidate.code == acknowledged_sensor_fault_code &&
+            candidate.native_code == acknowledged_sensor_fault_native_code;
+    }
+
+    void ClearAcknowledgedSensorFault() {
+        acknowledged_sensor_fault_sequence = 0;
+        acknowledged_sensor_fault_source = robot_base::FaultSource::NONE;
+        acknowledged_sensor_fault_code = robot_base::FaultCode::NONE;
+        acknowledged_sensor_fault_native_code = 0;
+    }
+
+    std::optional<robot_base::FaultStatus> EvaluateReportedSensorFault() {
+        if (sensor_fault.active) {
+            if (IsAcknowledgedSensorFault(sensor_fault)) ClearAcknowledgedSensorFault();
+            return sensor_fault;
+        }
+
+        if (sensor_fault.latched && !IsAcknowledgedSensorFault(sensor_fault))
+            return sensor_fault;
+        return std::nullopt;
+    }
+
+    std::optional<robot_base::FaultStatus> EvaluateSafetyMonitorFault() {
+        const bool base_valid = sensor.IsValid() && std::isfinite(sensor.time) &&
+            sensor.time >= 0.0 && AllFinite(sensor.rpy) &&
+            AllFinite(sensor.gyro) && AllFinite(sensor.acceleration) &&
+            AllFinite(sensor.base_pos) && AllFinite(sensor.base_quat) &&
+            QuaternionNormSquared(sensor.base_quat) > 1.0e-12 &&
+            AllFinite(sensor.base_vel) && AllFinite(sensor.joint_pos) &&
+            AllFinite(sensor.joint_vel);
+        const bool optional_vectors_valid =
+            (sensor.joint_torque.empty() ||
+                (sensor.joint_torque.size() == sensor.joint_pos.size() &&
+                    AllFinite(sensor.joint_torque))) &&
+            (sensor.joint_temperature.empty() ||
+                (sensor.joint_temperature.size() == sensor.joint_pos.size() &&
+                    AllFinite(sensor.joint_temperature))) &&
+            (sensor.joint_error.empty() ||
+                sensor.joint_error.size() == sensor.joint_pos.size());
+        if (!base_valid || !optional_vectors_valid) {
+            return MakeFault(robot_base::FaultSource::SAFETY_MONITOR,
+                robot_base::FaultCode::INVALID_DATA,
+                "robot state contains invalid dimensions or non-finite values",
+                static_cast<int32_t>(SafetyMonitorFault::kInvalidState));
+        }
+
+        const StateName state = fsm.CurrentState();
+        if (state != StateName::POWER_OFF) {
+            if ((safety_monitor.max_roll > 0.0 &&
+                    std::abs(sensor.rpy[0]) > safety_monitor.max_roll) ||
+                (safety_monitor.max_pitch > 0.0 &&
+                    std::abs(sensor.rpy[1]) > safety_monitor.max_pitch)) {
+                std::ostringstream detail;
+                detail << "body attitude exceeded limit: roll=" << sensor.rpy[0]
+                    << ", pitch=" << sensor.rpy[1];
+                return MakeFault(robot_base::FaultSource::SAFETY_MONITOR,
+                    robot_base::FaultCode::LIMIT_EXCEEDED, detail.str(),
+                    static_cast<int32_t>(SafetyMonitorFault::kBodyAttitude));
+            }
+            if (safety_monitor.max_angular_velocity > 0.0) {
+                const auto velocity = std::max_element(
+                    sensor.gyro.begin(), sensor.gyro.end(),
+                    [](double lhs, double rhs) {
+                        return std::abs(lhs) < std::abs(rhs);
+                    });
+                if (velocity != sensor.gyro.end() &&
+                    std::abs(*velocity) > safety_monitor.max_angular_velocity) {
+                    std::ostringstream detail;
+                    detail << "body angular velocity exceeded limit: "
+                        << *velocity << " rad/s";
+                    return MakeFault(robot_base::FaultSource::SAFETY_MONITOR,
+                        robot_base::FaultCode::LIMIT_EXCEEDED, detail.str(),
+                        static_cast<int32_t>(SafetyMonitorFault::kAngularVelocity));
+                }
+            }
+        }
+
+        return std::nullopt;
+    }
+
+    void BeginFaultObservationCycle() {
+        fault_observations.clear();
+    }
+
+    void ObserveFault(const std::optional<robot_base::FaultStatus> &condition) {
+        if (!condition || (!condition->active && !condition->latched)) return;
+        fault_observations.push_back(*condition);
+    }
+
+    bool MatchesCurrentFault(const robot_base::FaultStatus &candidate) const {
+        return fault.latched && fault.source == candidate.source &&
+            fault.code == candidate.code &&
+            fault.native_code == candidate.native_code &&
+            observed_fault_sequence == candidate.sequence;
+    }
+
+    void LatchFault(const robot_base::FaultStatus &condition) {
+        observed_fault_sequence = condition.sequence;
+        fault = condition;
+        fault.latched = true;
+        fault.sequence = ++fault_sequence;
+        fault.timestamp_s = MonotonicTimeSeconds();
+        runtime_logging::Log(runtime_logging::Level::kError,
+            std::string("fault latched: source=") +
+                robot_base::FaultSourceName(fault.source) +
+                ", code=" + robot_base::FaultCodeName(fault.code) +
+                ", detail=" + fault.detail,
+            false);
+    }
+
+    void ResolveObservedFaults() {
+        const auto active_root = std::find_if(
+            fault_observations.begin(), fault_observations.end(),
+            [this](const robot_base::FaultStatus &candidate) {
+                return candidate.active && MatchesCurrentFault(candidate);
+            });
+        if (fault.latched && fault.active &&
+            active_root != fault_observations.end()) {
+            return;
+        }
+
+        const auto first_active = std::find_if(
+            fault_observations.begin(), fault_observations.end(),
+            [](const robot_base::FaultStatus &candidate) {
+                return candidate.active;
+            });
+        if (first_active != fault_observations.end()) {
+            LatchFault(*first_active);
+            return;
+        }
+
+        if (fault.latched) {
+            fault.active = false;
+            return;
+        }
+
+        const auto first_latched = std::find_if(
+            fault_observations.begin(), fault_observations.end(),
+            [](const robot_base::FaultStatus &candidate) {
+                return candidate.latched;
+            });
+        if (first_latched != fault_observations.end()) {
+            LatchFault(*first_latched);
+        }
+    }
+
+    void AcknowledgeFault(uint64_t sequence) {
+        if (!fault.latched || fsm.CurrentState() != StateName::POWER_OFF) return;
+        if (sequence == 0 || sequence != fault.sequence) {
+            runtime_logging::Log(runtime_logging::Level::kWarning,
+                "fault acknowledgement rejected because its sequence is stale", false);
+            return;
+        }
+        if (fault.active || sensor_fault.active) {
+            runtime_logging::Log(runtime_logging::Level::kWarning,
+                "fault acknowledgement rejected because the condition is still active",
+                false);
+            return;
+        }
+        runtime_logging::Log(runtime_logging::Level::kInfo,
+            std::string("fault acknowledged: source=") +
+                robot_base::FaultSourceName(fault.source) +
+                ", code=" + robot_base::FaultCodeName(fault.code),
+            false);
+        if (sensor_fault.latched && !sensor_fault.active &&
+            sensor_fault.source == fault.source && sensor_fault.code == fault.code &&
+            sensor_fault.native_code == fault.native_code &&
+            sensor_fault.sequence == observed_fault_sequence) {
+            acknowledged_sensor_fault_sequence = sensor_fault.sequence;
+            acknowledged_sensor_fault_source = sensor_fault.source;
+            acknowledged_sensor_fault_code = sensor_fault.code;
+            acknowledged_sensor_fault_native_code = sensor_fault.native_code;
+        }
+        fault = {};
+        observed_fault_sequence = 0;
+        fault_block_reported = false;
+    }
 
     void LoadConfig(const std::string &path) {
         config_path = path;
@@ -146,6 +395,28 @@ public:
 
         // 读取推理线程配置（robot_base.threads.rl_infer）
         infer_thread_cfg = robot_base::ThreadLoop::FromYaml(yaml_file, "rl_infer");
+
+        safety_monitor.max_roll = yaml_file.Read<double>(
+            "behavior_manager.safety.max_roll").value_or(0.0);
+        safety_monitor.max_pitch = yaml_file.Read<double>(
+            "behavior_manager.safety.max_pitch").value_or(0.0);
+        safety_monitor.max_angular_velocity = yaml_file.Read<double>(
+            "behavior_manager.safety.max_angular_velocity").value_or(0.0);
+        safety_release_duration = yaml_file.Read<double>(
+            "behavior_manager.safety.release_duration_s").value_or(1.0);
+        const std::array<double, 3> safety_limits = {
+            safety_monitor.max_roll, safety_monitor.max_pitch,
+            safety_monitor.max_angular_velocity};
+        if (!AllFinite(safety_limits) ||
+            std::any_of(safety_limits.begin(), safety_limits.end(),
+                [](double value) { return value < 0.0; })) {
+            throw std::runtime_error(
+                "[BehaviorManager] behavior_manager.safety 限值无效");
+        }
+        if (!std::isfinite(safety_release_duration) || safety_release_duration < 0.0) {
+            throw std::runtime_error(
+                "[BehaviorManager] behavior_manager.safety.release_duration_s 无效");
+        }
 
         // 机器人基本信息（用于日志输出，从 robot_base 获取）
         std::cout << "[BehaviorManager] 机器人: " << sensor.name << ", 自由度: " << num_dof
@@ -289,7 +560,8 @@ public:
             std::cout << "[BehaviorManager] RL 状态: 未配置" << std::endl;
         }
 
-        fsm.AddState(StateName::SAFETY, CreateStateSafety());
+        fsm.AddState(StateName::SAFETY,
+            CreateStateSafety(safety_release_duration, &fault));
 
         // 设置共享数据指针
         fsm.SetDataPointers(&sensor, &command, &output);
@@ -312,6 +584,34 @@ void BehaviorManagerClass::Init() {
 void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
     if (!impl_->initialized)
         return;
+
+    impl_->BeginFaultObservationCycle();
+    impl_->ObserveFault(impl_->EvaluateReportedSensorFault());
+    impl_->ObserveFault(impl_->EvaluateSafetyMonitorFault());
+    const auto state_fault_before_step = impl_->fsm.CurrentFault();
+    if (state_fault_before_step.active || state_fault_before_step.latched) {
+        impl_->ObserveFault(state_fault_before_step);
+    }
+    impl_->ResolveObservedFaults();
+
+    StateName current = impl_->fsm.CurrentState();
+    if (impl_->fault.latched && current != StateName::POWER_OFF &&
+        current != StateName::SAFETY) {
+        impl_->fsm.ForceSwitch(StateName::SAFETY,
+            std::string("latched fault: ") +
+                robot_base::FaultSourceName(impl_->fault.source) + "/" +
+                robot_base::FaultCodeName(impl_->fault.code));
+        current = impl_->fsm.CurrentState();
+    }
+    if (impl_->fault.latched && current == StateName::POWER_OFF &&
+        impl_->command.key != 0 && impl_->command.key != -1) {
+        impl_->command.key = 0;
+        if (!impl_->fault_block_reported) {
+            runtime_logging::Log(runtime_logging::Level::kWarning,
+                "FSM power-on request blocked by a latched fault", false);
+            impl_->fault_block_reported = true;
+        }
+    }
 
     // 策略切换：pending_policy 由 SetCommand（POWER_OFF/DAMP 直切）或前置链调度（RL 中到期自动切）触发
     if (impl_->has_rl && impl_->pending_policy != impl_->active_policy) {
@@ -355,6 +655,19 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
 
     impl_->fsm.Step(control_dt, rl_dt);
 
+    const auto state_fault_after_step = impl_->fsm.CurrentFault();
+    if (state_fault_after_step.active || state_fault_after_step.latched) {
+        impl_->ObserveFault(state_fault_after_step);
+        impl_->ResolveObservedFaults();
+        const StateName state = impl_->fsm.CurrentState();
+        if (state != StateName::POWER_OFF && state != StateName::SAFETY) {
+            impl_->fsm.ForceSwitch(StateName::SAFETY,
+                std::string("state fault: ") +
+                    robot_base::FaultSourceName(impl_->fault.source) + "/" +
+                    robot_base::FaultCodeName(impl_->fault.code));
+        }
+    }
+
     // 前置策略链调度：仅在 RL 状态累计时长，到期后设置 pending_policy = final_target
     StateName cur = impl_->fsm.CurrentState();
     if (impl_->waiting_prerequisite && cur == StateName::RL) {
@@ -389,6 +702,10 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
 
 void BehaviorManagerClass::SetSensorData(const robot_base::RobotData &data) {
     impl_->sensor = data;
+}
+
+void BehaviorManagerClass::SetSensorFault(const robot_base::FaultStatus &fault) {
+    impl_->sensor_fault = fault;
 }
 
 void BehaviorManagerClass::SetCommand(const robot_base::Command &cmd) {
@@ -426,6 +743,20 @@ void BehaviorManagerClass::SetCommand(const robot_base::Command &cmd) {
     }
 }
 
+void BehaviorManagerClass::AcknowledgeFault(uint64_t sequence) {
+    if (sequence == 0) {
+        impl_->previous_fault_ack_sequence = 0;
+        return;
+    }
+    const bool can_acknowledge = impl_->fault.latched &&
+        impl_->fsm.CurrentState() == StateName::POWER_OFF &&
+        !impl_->fault.active && !impl_->sensor_fault.active;
+    if (!can_acknowledge || sequence == impl_->previous_fault_ack_sequence) return;
+
+    impl_->previous_fault_ack_sequence = sequence;
+    impl_->AcknowledgeFault(sequence);
+}
+
 const ControlOutput &BehaviorManagerClass::GetOutput() const {
     return impl_->output;
 }
@@ -444,6 +775,10 @@ std::string BehaviorManagerClass::CurrentPolicyName() const {
 
 double BehaviorManagerClass::GetRlFreq() const {
     return impl_->rl_freq_hz.load(std::memory_order_relaxed);
+}
+
+robot_base::FaultStatus BehaviorManagerClass::CurrentFault() const {
+    return impl_->fault;
 }
 
 bool BehaviorManagerClass::IsRunning() const {

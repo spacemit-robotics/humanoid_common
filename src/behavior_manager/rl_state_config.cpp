@@ -8,6 +8,7 @@
 
 #include "state_factory.h"
 
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -36,6 +37,28 @@ RLConfig LoadRLStateConfig(const std::string &yaml_path,
     const auto yaml = robot_base::YamlFile::Load(yaml_path);
     const std::string base =
         "rl_policy.onnx_infer.policies." + policy_name;
+    const std::string safety_base = base + ".runtime_safety";
+    config.first_action_timeout_s = yaml.Read<double>(
+        safety_base + ".first_action_timeout_s").value_or(
+            yaml.Read<double>(
+                "behavior_manager.rl_safety.first_action_timeout_s").value_or(0.0));
+    config.max_action_age_s = yaml.Read<double>(
+        safety_base + ".max_action_age_s").value_or(
+            yaml.Read<double>(
+                "behavior_manager.rl_safety.max_action_age_s").value_or(0.0));
+    config.inference_deadline_s = yaml.Read<double>(
+        safety_base + ".inference_deadline_s").value_or(
+            yaml.Read<double>(
+                "behavior_manager.rl_safety.inference_deadline_s").value_or(0.0));
+    const std::array<double, 3> runtime_limits = {
+        config.first_action_timeout_s, config.max_action_age_s,
+        config.inference_deadline_s};
+    for (double limit : runtime_limits) {
+        if (!std::isfinite(limit) || limit < 0.0) {
+            throw std::runtime_error(
+                "[BehaviorManager] " + safety_base + " 时限配置无效");
+        }
+    }
     config.policy_adapter =
         policy_adapter::LoadConfig(yaml_path, policy_name, robot_dir);
     config.zero_target_pos =

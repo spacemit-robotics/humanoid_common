@@ -14,9 +14,9 @@
 namespace driver_runtime {
 
 void RenderWholeBodyDiagnostics(
-    const whole_body_diagnostics &diagnostics, double cycle_s);
-void RecordWholeBodyDiagnostics(const whole_body_diagnostics &diagnostics,
-    const whole_body_motor_command_diagnostics &command_diagnostics);
+    const whole_body_diagnostics_v2 &diagnostics, double cycle_s);
+void RecordWholeBodyDiagnostics(const whole_body_diagnostics_v2 &diagnostics,
+    const whole_body_motor_command_diagnostics_v2 &command_diagnostics);
 
 }  // namespace driver_runtime
 

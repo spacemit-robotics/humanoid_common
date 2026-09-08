@@ -27,6 +27,56 @@ namespace robot_base {
 // 四元数归一化阈值
 constexpr double kQuatNormEpsilon = 1e-10;
 
+const char *FaultSourceName(FaultSource source) {
+    switch (source) {
+        case FaultSource::NONE:
+            return "none";
+        case FaultSource::TRANSPORT:
+            return "transport";
+        case FaultSource::DRIVER:
+            return "driver";
+        case FaultSource::WHOLE_BODY:
+            return "whole_body";
+        case FaultSource::MOTOR:
+            return "motor";
+        case FaultSource::IMU:
+            return "imu";
+        case FaultSource::CONTROL:
+            return "control";
+        case FaultSource::POLICY:
+            return "policy";
+        case FaultSource::SAFETY_MONITOR:
+            return "safety_monitor";
+    }
+    return "unknown";
+}
+
+const char *FaultCodeName(FaultCode code) {
+    switch (code) {
+        case FaultCode::NONE:
+            return "none";
+        case FaultCode::STATE_TIMEOUT:
+            return "state_timeout";
+        case FaultCode::FEEDBACK_TIMEOUT:
+            return "feedback_timeout";
+        case FaultCode::DEVICE_ERROR:
+            return "device_error";
+        case FaultCode::COMMAND_REJECTED:
+            return "command_rejected";
+        case FaultCode::COMMAND_TIMEOUT:
+            return "command_timeout";
+        case FaultCode::INFERENCE_TIMEOUT:
+            return "inference_timeout";
+        case FaultCode::INVALID_DATA:
+            return "invalid_data";
+        case FaultCode::LIMIT_EXCEEDED:
+            return "limit_exceeded";
+        case FaultCode::INTERNAL_ERROR:
+            return "internal_error";
+    }
+    return "unknown";
+}
+
 namespace {
 
 std::vector<std::string> SplitPath(const std::string &path) {

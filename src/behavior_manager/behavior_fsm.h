@@ -77,6 +77,11 @@ public:
     bool ReadyForRl() const;
 
     /**
+     * @brief 获取当前状态内部产生的故障
+     */
+    robot_base::FaultStatus CurrentFault() const;
+
+    /**
      * @brief 设置共享数据指针（所有状态共享）
      */
     void SetDataPointers(robot_base::RobotData *sensor,

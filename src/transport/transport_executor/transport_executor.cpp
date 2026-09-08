@@ -21,7 +21,7 @@
 
 namespace transport {
 
-std::unique_ptr<TransportBase> Create(const std::string& yaml_path) {
+std::unique_ptr<TransportBaseV2> CreateV2(const std::string &yaml_path) {
     robot_base::YamlFile yaml_file = robot_base::YamlFile::Load(yaml_path);
     std::string type = yaml_file.Read<std::string>("transport.type").value_or("udp");
 
@@ -38,6 +38,10 @@ std::unique_ptr<TransportBase> Create(const std::string& yaml_path) {
 #endif
 
     throw std::runtime_error("[transport_executor] 不支持的传输类型: " + type);
+}
+
+std::unique_ptr<TransportBase> Create(const std::string& yaml_path) {
+    return CreateV2(yaml_path);
 }
 
 }  // namespace transport

@@ -113,6 +113,10 @@ bool FSM::ReadyForRl() const {
     return current_ && current_->ReadyForRl();
 }
 
+robot_base::FaultStatus FSM::CurrentFault() const {
+    return current_ ? current_->CurrentFault() : robot_base::FaultStatus{};
+}
+
 void FSM::SwitchTo(StateName target) {
     auto it = states_.find(target);
     if (it == states_.end()) {

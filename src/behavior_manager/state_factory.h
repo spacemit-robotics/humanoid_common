@@ -74,6 +74,9 @@ struct RLConfig {
     robot_base::ThreadLoop infer_thread_cfg;  // 推理线程配置（robot_base.threads.rl_infer）
     double max_roll = 0.7;                    // 最大翻滚角 (rad)
     double max_pitch = 0.7;                   // 最大俯仰角 (rad)
+    double first_action_timeout_s = 0.0;      // 首帧 action 最长等待时间，0 表示不启用
+    double max_action_age_s = 0.0;            // 已发布 action 最大可用年龄，0 表示不启用
+    double inference_deadline_s = 0.0;        // 单次推理 deadline，0 表示不启用
 
     // ---- 策略输入协议适配（可选；type 为空表示普通 RL 策略）----
     policy_adapter::Config policy_adapter;
@@ -109,7 +112,8 @@ std::unique_ptr<State> CreateStateZero(const std::vector<double> &default_pos,
                                         const std::vector<double> &kp,
                                         const std::vector<double> &kd);
 std::unique_ptr<State> CreateStateRl(const RLConfig &cfg);
-std::unique_ptr<State> CreateStateSafety();
+std::unique_ptr<State> CreateStateSafety(double release_duration,
+    const robot_base::FaultStatus *fault);
 
 }  // namespace behavior_manager
 

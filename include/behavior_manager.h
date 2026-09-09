@@ -89,9 +89,19 @@ public:
     void SetSensorData(const robot_base::RobotData &data);
 
     /**
+     * @brief 设置与当前传感器帧关联的 driver/backend 故障
+     */
+    void SetSensorFault(const robot_base::FaultStatus &fault);
+
+    /**
      * @brief 设置命令
      */
     void SetCommand(const robot_base::Command &cmd);
+
+    /**
+     * @brief 在 POWER_OFF 下确认已经恢复的锁存故障
+     */
+    void AcknowledgeFault(uint64_t sequence);
 
     /**
      * @brief 获取控制输出
@@ -117,6 +127,11 @@ public:
      * @brief 获取 RL 实时推理频率（Hz）
      */
     double GetRlFreq() const;
+
+    /**
+     * @brief 获取当前活动或锁存故障
+     */
+    robot_base::FaultStatus CurrentFault() const;
 
     /**
      * @brief 是否正在运行

@@ -81,33 +81,41 @@ ThreadLoop::~ThreadLoop() {
 }
 
 void ThreadLoop::Start(std::function<bool()> func) {
-    if (running_) {
+    if (running_.load(std::memory_order_acquire)) {
         std::cerr << "[ThreadLoop] 线程 " << name << " 已在运行" << std::endl;
         return;
     }
-    running_ = true;
-
-    thread_ = std::thread([this, func]() {
-        Apply();
-        std::cout << "[ThreadLoop] 线程 " << name << " 启动" << std::endl;
-        while (running_) {
-            if (!func()) {
-                break;
+    if (thread_.joinable()) {
+        thread_.join();
+    }
+    running_.store(true, std::memory_order_release);
+    try {
+        thread_ = std::thread([this, func]() {
+            Apply();
+            std::cout << "[ThreadLoop] 线程 " << name << " 启动" << std::endl;
+            while (running_.load(std::memory_order_acquire)) {
+                if (!func()) {
+                    break;
+                }
             }
-        }
-        std::cout << "[ThreadLoop] 线程 " << name << " 退出" << std::endl;
-    });
+            std::cout << "[ThreadLoop] 线程 " << name << " 退出" << std::endl;
+            running_.store(false, std::memory_order_release);
+        });
+    } catch (...) {
+        running_.store(false, std::memory_order_release);
+        throw;
+    }
 }
 
 void ThreadLoop::Stop() {
-    running_ = false;
+    running_.store(false, std::memory_order_release);
     if (thread_.joinable()) {
         thread_.join();
     }
 }
 
 bool ThreadLoop::IsRunning() const {
-    return running_;
+    return running_.load(std::memory_order_acquire);
 }
 
 }  // namespace robot_base

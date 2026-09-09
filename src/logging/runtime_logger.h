@@ -32,6 +32,7 @@ struct Config {
     double control_telemetry_rate_hz = 20.0;
     double hardware_telemetry_rate_hz = 20.0;
     double driver_monitor_rate_hz = 2.0;
+    double timing_window_s = 5.0;
     int queue_capacity = 4096;
     int max_file_size_mb = 64;
     int max_files = 4;
@@ -54,6 +55,8 @@ private:
 void Log(Level level, const std::string &message, bool emit_console = true);
 void RecordCsv(
     const std::string &stream, const std::string &header, const std::string &row);
+void RecordArtifact(
+    const std::string &kind, const std::string &name, const std::string &path);
 Config GetConfig();
 std::string GetSessionDirectory();
 

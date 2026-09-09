@@ -35,6 +35,7 @@ check test_behavior           "$EX/behavior_manager/config_example.yaml"   "测�
 check test_transport_executor "$EX/transport_executor/config_example.yaml" "全部测试完成"
 check_no_args test_policy_adapter "动态维度测试完成"
 check test_driver_runtime     "$EX/driver_runtime/config_example.yaml"     "测试完成"
+check_no_args test_runtime_timing "runtime timing helpers: PASS"
 
 if [[ "$fail" -ne 0 ]]; then echo "humanoid-common functional: FAILED"; exit 1; fi
 echo "humanoid-common functional: PASS"

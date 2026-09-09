@@ -156,13 +156,17 @@ bool TransportUdpImpl::Init(const std::string& yaml_path, Role role) {
 // ==================== 状态通道 ====================
 
 void TransportUdpImpl::SendState(const robot_base::RobotData& state) {
-    if (!state_sender_)
-        return;
+    (void)SendStateV2(state, {});
+}
+
+bool TransportUdpImpl::SendStateV2(const robot_base::RobotData &state,
+        const robot_base::FaultStatus &fault) {
+    if (!state_sender_ || !CanEncodeRobotState(state, fault)) return false;
 
     RobotStatePacket p{};
     p.header.type = static_cast<uint16_t>(MsgType::ROBOT_STATE);
-    p.header.seq = ++state_seq_;
-    p.num_dof = std::clamp(state.num_dof, 0, kMaxDof);
+    p.header.seq = state_seq_ + 1;
+    p.num_dof = state.num_dof;
     p.time = state.time;
     std::memcpy(p.rpy, state.rpy.data(), sizeof(p.rpy));
     std::memcpy(p.gyro, state.gyro.data(), sizeof(p.gyro));
@@ -182,20 +186,30 @@ void TransportUdpImpl::SendState(const robot_base::RobotData& state) {
         p.joint_error[i] =
             (i < static_cast<int>(state.joint_error.size())) ? state.joint_error[i] : 0U;
     }
+    EncodeFault(fault, &p.fault);
 
-    state_sender_->Send(&p, sizeof(p));
+    if (!ValidRobotStatePacket(p)) return false;
+    if (state_sender_->Send(&p, sizeof(p)) != static_cast<int>(sizeof(p))) return false;
+    state_seq_ = p.header.seq;
+    return true;
 }
 
 bool TransportUdpImpl::RecvState(robot_base::RobotData& state) {
+    robot_base::FaultStatus ignored_fault;
+    return RecvStateV2(state, ignored_fault);
+}
+
+bool TransportUdpImpl::RecvStateV2(robot_base::RobotData &state,
+        robot_base::FaultStatus &fault) {
     if (!state_receiver_)
         return false;
 
     RobotStatePacket p{};
     int n = state_receiver_->Recv(&p, sizeof(p));
-    if (n != static_cast<int>(sizeof(p)) || !ValidHeader(p.header, MsgType::ROBOT_STATE))
+    if (n != static_cast<int>(sizeof(p)) || !ValidRobotStatePacket(p))
         return false;
 
-    state.num_dof = std::clamp(p.num_dof, 0, kMaxDof);
+    state.num_dof = p.num_dof;
     state.InitJointVectors();
     state.time = p.time;
     std::memcpy(state.rpy.data(), p.rpy, sizeof(p.rpy));
@@ -213,34 +227,40 @@ bool TransportUdpImpl::RecvState(robot_base::RobotData& state) {
         state.joint_error[i] = p.joint_error[i];
     }
 
+    if (!DecodeFault(p.fault, &fault)) return false;
+
     return true;
 }
 
 // ==================== 控制通道 ====================
 
 void TransportUdpImpl::SendControl(const robot_base::ControlCmd& cmd) {
-    if (!control_sender_)
-        return;
+    (void)SendControlV2(cmd);
+}
+
+bool TransportUdpImpl::SendControlV2(const robot_base::ControlCmd &cmd) {
+    if (!control_sender_ || !CanEncodeControl(cmd)) return false;
 
     ControlCmdPacket p{};
     p.header.type = static_cast<uint16_t>(MsgType::CONTROL_CMD);
-    p.header.seq = ++control_seq_;
-    p.num_dof = std::clamp(static_cast<int>(cmd.target_pos.size()), 0, kMaxDof);
+    p.header.seq = control_seq_ + 1;
+    p.num_dof = static_cast<int32_t>(cmd.target_pos.size());
     p.enable = cmd.enable ? 1 : 0;
     p.control_mode = static_cast<int8_t>(cmd.mode);
     p.actuation_mode = static_cast<int8_t>(cmd.actuation_mode);
 
     for (int i = 0; i < p.num_dof; ++i) {
         p.target_pos[i] = cmd.target_pos[i];
-        p.target_vel[i] = (i < static_cast<int>(cmd.target_vel.size())) ? cmd.target_vel[i] : 0.0;
-        p.target_torque[i] = (i < static_cast<int>(cmd.target_torque.size()))
-            ? cmd.target_torque[i]
-            : 0.0;
-        p.kp[i] = (i < static_cast<int>(cmd.kp.size())) ? cmd.kp[i] : 0.0;
-        p.kd[i] = (i < static_cast<int>(cmd.kd.size())) ? cmd.kd[i] : 0.0;
+        p.target_vel[i] = cmd.target_vel[i];
+        p.target_torque[i] = cmd.target_torque.empty() ? 0.0 : cmd.target_torque[i];
+        p.kp[i] = cmd.kp[i];
+        p.kd[i] = cmd.kd[i];
     }
 
-    control_sender_->Send(&p, sizeof(p));
+    if (!ValidControlCmdPacket(p)) return false;
+    if (control_sender_->Send(&p, sizeof(p)) != static_cast<int>(sizeof(p))) return false;
+    control_seq_ = p.header.seq;
+    return true;
 }
 
 bool TransportUdpImpl::RecvControl(robot_base::ControlCmd& cmd) {
@@ -249,12 +269,11 @@ bool TransportUdpImpl::RecvControl(robot_base::ControlCmd& cmd) {
 
     ControlCmdPacket p{};
     int n = control_receiver_->Recv(&p, sizeof(p));
-    if (n != static_cast<int>(sizeof(p)) || !ValidHeader(p.header, MsgType::CONTROL_CMD))
+    if (n != static_cast<int>(sizeof(p)) || !ValidControlCmdPacket(p))
         return false;
 
-    int ndof = std::clamp(p.num_dof, 0, kMaxDof);
+    int ndof = p.num_dof;
     const auto actuation_mode = static_cast<robot_base::ActuationMode>(p.actuation_mode);
-    if (!robot_base::IsValidActuationMode(actuation_mode)) return false;
     cmd.enable = (p.enable != 0);
     cmd.mode = static_cast<robot_base::ControlMode>(p.control_mode);
     cmd.actuation_mode = actuation_mode;
@@ -278,35 +297,50 @@ bool TransportUdpImpl::RecvControl(robot_base::ControlCmd& cmd) {
 // ==================== 命令通道 ====================
 
 void TransportUdpImpl::SendCommand(const robot_base::Command& cmd) {
-    if (!hmi_sender_)
-        return;
+    (void)SendCommandV2(cmd, 0);
+}
+
+bool TransportUdpImpl::SendCommandV2(const robot_base::Command &cmd,
+        uint64_t acknowledge_fault_sequence) {
+    if (!hmi_sender_ || !CanEncodeCommand(cmd)) return false;
 
     HmiCmdPacket p{};
     p.header.type = static_cast<uint16_t>(MsgType::HMI_CMD);
-    p.header.seq = ++hmi_seq_;
+    p.header.seq = hmi_seq_ + 1;
     p.key = cmd.key;
     p.vx = cmd.vx;
     p.vy = cmd.vy;
     p.wz = cmd.wz;
+    p.acknowledge_fault_sequence = acknowledge_fault_sequence;
     std::strncpy(p.switch_policy, cmd.switch_policy.c_str(), sizeof(p.switch_policy) - 1);
 
-    hmi_sender_->Send(&p, sizeof(p));
+    if (!ValidHmiCmdPacket(p)) return false;
+    if (hmi_sender_->Send(&p, sizeof(p)) != static_cast<int>(sizeof(p))) return false;
+    hmi_seq_ = p.header.seq;
+    return true;
 }
 
 bool TransportUdpImpl::RecvCommand(robot_base::Command& cmd) {
+    uint64_t ignored_acknowledgement = 0;
+    return RecvCommandV2(cmd, ignored_acknowledgement);
+}
+
+bool TransportUdpImpl::RecvCommandV2(robot_base::Command &cmd,
+        uint64_t &acknowledge_fault_sequence) {
     if (!hmi_receiver_)
         return false;
 
     HmiCmdPacket p{};
     int n = hmi_receiver_->Recv(&p, sizeof(p));
-    if (n != static_cast<int>(sizeof(p)) || !ValidHeader(p.header, MsgType::HMI_CMD))
+    if (n != static_cast<int>(sizeof(p)) || !ValidHmiCmdPacket(p))
         return false;
 
     cmd.key = p.key;
     cmd.vx = p.vx;
     cmd.vy = p.vy;
     cmd.wz = p.wz;
-    cmd.switch_policy = p.switch_policy;
+    acknowledge_fault_sequence = p.acknowledge_fault_sequence;
+    cmd.switch_policy = DecodeText(p.switch_policy);
 
     return true;
 }
@@ -314,12 +348,16 @@ bool TransportUdpImpl::RecvCommand(robot_base::Command& cmd) {
 // ==================== Control 状态回传通道 ====================
 
 void TransportUdpImpl::SendStatus(const robot_base::ControlStatus& status) {
-    if (!status_sender_)
-        return;
+    (void)SendStatusV2(status, {});
+}
+
+bool TransportUdpImpl::SendStatusV2(const robot_base::ControlStatus &status,
+        const robot_base::FaultStatus &fault) {
+    if (!status_sender_ || !CanEncodeStatus(status, fault)) return false;
 
     ControlStatusPacket p{};
     p.header.type = static_cast<uint16_t>(MsgType::CONTROL_STATUS);
-    p.header.seq = ++status_seq_;
+    p.header.seq = status_seq_ + 1;
     p.control_mode = static_cast<int8_t>(status.mode);
     p.zero_ready = status.zero_ready ? 1 : 0;
     p.hmi_connected = status.hmi_connected ? 1 : 0;
@@ -329,18 +367,27 @@ void TransportUdpImpl::SendStatus(const robot_base::ControlStatus& status) {
     p.rl_frequency_hz = status.rl_frequency_hz;
     std::strncpy(p.active_policy, status.active_policy.c_str(),
         sizeof(p.active_policy) - 1);
+    EncodeFault(fault, &p.fault);
 
-    status_sender_->Send(&p, sizeof(p));
+    if (!ValidControlStatusPacket(p)) return false;
+    if (status_sender_->Send(&p, sizeof(p)) != static_cast<int>(sizeof(p))) return false;
+    status_seq_ = p.header.seq;
+    return true;
 }
 
 bool TransportUdpImpl::RecvStatus(robot_base::ControlStatus& status) {
+    robot_base::FaultStatus ignored_fault;
+    return RecvStatusV2(status, ignored_fault);
+}
+
+bool TransportUdpImpl::RecvStatusV2(robot_base::ControlStatus &status,
+        robot_base::FaultStatus &fault) {
     if (!status_receiver_)
         return false;
 
     ControlStatusPacket p{};
     int n = status_receiver_->Recv(&p, sizeof(p));
-    if (n != static_cast<int>(sizeof(p)) ||
-        !ValidHeader(p.header, MsgType::CONTROL_STATUS)) {
+    if (n != static_cast<int>(sizeof(p)) || !ValidControlStatusPacket(p)) {
         return false;
     }
 
@@ -351,8 +398,8 @@ bool TransportUdpImpl::RecvStatus(robot_base::ControlStatus& status) {
     status.vy = p.vy;
     status.wz = p.wz;
     status.rl_frequency_hz = p.rl_frequency_hz;
-    status.active_policy = p.active_policy;
-    return true;
+    status.active_policy = DecodeText(p.active_policy);
+    return DecodeFault(p.fault, &fault);
 }
 
 }  // namespace transport

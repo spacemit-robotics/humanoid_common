@@ -22,7 +22,7 @@ namespace transport {
  * 内部使用 POD 结构进行序列化，对外只暴露 robot_base 类型。
  * POD 协议定义在 transport_packet.h 中，与 SHM/DDS 共享。
  */
-class TransportUdpImpl : public TransportBase {
+class TransportUdpImpl : public TransportBaseV2 {
 public:
     TransportUdpImpl();
     ~TransportUdpImpl() override;
@@ -40,6 +40,20 @@ public:
 
     void SendStatus(const robot_base::ControlStatus& status) override;
     bool RecvStatus(robot_base::ControlStatus& status) override;
+
+    bool SendStateV2(const robot_base::RobotData &state,
+        const robot_base::FaultStatus &fault) override;
+    bool RecvStateV2(robot_base::RobotData &state,
+        robot_base::FaultStatus &fault) override;
+    bool SendControlV2(const robot_base::ControlCmd &cmd) override;
+    bool SendCommandV2(const robot_base::Command &cmd,
+        uint64_t acknowledge_fault_sequence) override;
+    bool RecvCommandV2(robot_base::Command &cmd,
+        uint64_t &acknowledge_fault_sequence) override;
+    bool SendStatusV2(const robot_base::ControlStatus &status,
+        const robot_base::FaultStatus &fault) override;
+    bool RecvStatusV2(robot_base::ControlStatus &status,
+        robot_base::FaultStatus &fault) override;
 
 private:
     // ==================== 成员变量 ====================

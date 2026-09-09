@@ -12,6 +12,7 @@
 
 #include <Eigen/Dense>
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -34,6 +35,8 @@ namespace behavior_manager {
 
 class StateRL : public State {
 public:
+    ~StateRL() override { StopInference(); }
+
     void SetConfig(const RLConfig &cfg) { config_ = cfg; }
 
     void OnEnter() override {
@@ -46,35 +49,59 @@ public:
             output_->kd = config_.kd;
         }
 
-        // 每次进入都重新初始化策略运行时（支持策略切换后重新加载模型）。
-        // PolicyExecutorConfig 整体透传，新增底层配置项无需在 common 逐字段同步。
-        policy_.Init(config_.policy);
-        ConfigurePolicyTrace();
-        if (config_.runtime_observer) {
-            config_.runtime_observer->OnRuntimeInitialized(
-                policy_.GetRuntimeInfo());
+        safety_triggered_ = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_fault_);
+            fault_ = {};
         }
 
-        safety_triggered_ = false;
+        running_.store(false, std::memory_order_release);
+        policy_adapter_.reset();
         has_action_ = false;
+        cached_action_.clear();
         action_sequence_ = 0;
         applied_action_sequence_ = 0;
         release_sequence_ = 0;
         sample_release_sequence_ = 0;
         cached_release_sequence_ = 0;
+        cached_timing_ = {};
         entry_target_transition_elapsed_ = 0.0;
         infer_count_window_ = 0;
-        infer_window_start_ = std::chrono::steady_clock::now();
+        entered_at_ = std::chrono::steady_clock::now();
+        infer_window_start_ = entered_at_;
+        time_since_last_infer_ = 0.0f;
+        new_data_ready_ = false;
+        policy_trace_enabled_ = false;
+        policy_trace_stream_.clear();
+        policy_apply_trace_stream_.clear();
+        policy_trace_header_.clear();
+        policy_apply_trace_header_.clear();
         if (config_.rl_freq_hz) {
             config_.rl_freq_hz->store(0.0, std::memory_order_relaxed);
         }
 
-        time_since_last_infer_ = 0.0f;
-        new_data_ready_ = false;
-        running_ = true;
+        // 每次进入都重新初始化策略运行时（支持策略切换后重新加载模型）。
+        // PolicyExecutorConfig 整体透传，新增底层配置项无需在 common 逐字段同步。
+        try {
+            policy_.Init(config_.policy);
+            ConfigurePolicyTrace();
+            runtime_logging::RecordArtifact(
+                "policy_model", config_.policy_name, config_.policy.model_path);
+            if (!config_.policy_adapter.reference_file.empty()) {
+                runtime_logging::RecordArtifact("policy_reference",
+                    config_.policy_name, config_.policy_adapter.reference_file);
+            }
+            if (config_.runtime_observer) {
+                config_.runtime_observer->OnRuntimeInitialized(
+                    policy_.GetRuntimeInfo());
+            }
+        } catch (const std::exception &error) {
+            ReportFault(robot_base::FaultCode::INTERNAL_ERROR,
+                std::string("RL runtime initialization failed: ") + error.what());
+            return;
+        }
 
         // 可选策略适配器：负责参考动作、模型特殊输入和时序状态。
-        policy_adapter_.reset();
         if (config_.policy_adapter.Enabled() && sensor_) {
             try {
                 policy_adapter_ = policy_adapter::Create(
@@ -88,34 +115,52 @@ public:
                 std::cerr << "[StateRL] policy_adapter 加载失败，切安全态: "
                     << e.what() << std::endl;
                 policy_adapter_.reset();
-                safety_triggered_ = true;
+                ReportFault(robot_base::FaultCode::INTERNAL_ERROR,
+                    std::string("policy adapter initialization failed: ") + e.what());
                 return;
             }
         }
 
         // 启动推理线程（配置从 RLConfig.infer_thread_cfg 注入）
         infer_loop_ = config_.infer_thread_cfg;
-        infer_loop_.Start([this] { return InferStep(); });
+        running_.store(true, std::memory_order_release);
+        try {
+            infer_loop_.Start([this] { return InferStep(); });
+        } catch (const std::exception &error) {
+            running_.store(false, std::memory_order_release);
+            ReportFault(robot_base::FaultCode::INTERNAL_ERROR,
+                std::string("RL inference thread failed to start: ") + error.what());
+        }
     }
 
     void Run(float control_dt, float rl_dt) override {
         if (!sensor_ || !output_ || !command_)
             return;
 
+        if (!std::isfinite(control_dt) || control_dt <= 0.0f ||
+            !std::isfinite(rl_dt) || rl_dt <= 0.0f) {
+            ReportFault(robot_base::FaultCode::INVALID_DATA,
+                "RL runtime received an invalid control period");
+            return;
+        }
+
         // 安全检查：IMU 倾角
         if (std::abs(sensor_->rpy[0]) > config_.max_roll ||
             std::abs(sensor_->rpy[1]) > config_.max_pitch) {
             std::cerr << "[StateRL] IMU 倾角超限! roll=" << sensor_->rpy[0]
                     << ", pitch=" << sensor_->rpy[1] << std::endl;
-            safety_triggered_ = true;
+            std::ostringstream detail;
+            detail << "RL attitude limit exceeded: roll=" << sensor_->rpy[0]
+                << ", pitch=" << sensor_->rpy[1];
+            ReportFault(robot_base::FaultCode::LIMIT_EXCEEDED, detail.str());
             return;
         }
 
         // 基于控制循环时间的推理触发机制
         time_since_last_infer_ += control_dt;
         if (time_since_last_infer_ >= rl_dt) {
-            // 保留调度余量，避免控制循环频率不能整除 rl_dt 时长期降频。
-            time_since_last_infer_ -= rl_dt;
+            // 保留余数但丢弃已错过的整周期，避免连续追赶补发。
+            time_since_last_infer_ = std::fmod(time_since_last_infer_, rl_dt);
 
             const auto release_time = RLRuntimeClock::now();
             std::uint64_t release_sequence = 0;
@@ -155,6 +200,24 @@ public:
         std::vector<double> applied_target_pos;
         {
             std::lock_guard<std::mutex> lock(mutex_action_);
+            const auto now = RLRuntimeClock::now();
+            if (!has_action_) {
+                if (config_.first_action_timeout_s > 0.0 &&
+                    std::chrono::duration<double>(now - entered_at_).count() >
+                        config_.first_action_timeout_s) {
+                    ReportFault(robot_base::FaultCode::INFERENCE_TIMEOUT,
+                        "RL first action deadline expired");
+                }
+                return;
+            }
+            if (config_.max_action_age_s > 0.0 &&
+                std::chrono::duration<double>(
+                    now - cached_timing_.action_published).count() >
+                    config_.max_action_age_s) {
+                ReportFault(robot_base::FaultCode::COMMAND_TIMEOUT,
+                    "RL action age exceeded the configured limit");
+                return;
+            }
             const bool transition_enabled =
                 config_.entry_target_transition_duration > 0.0;
             const bool has_new_action =
@@ -190,7 +253,7 @@ public:
 
     StateName CheckTransition() override {
         // 安全触发 → SAFETY
-        if (safety_triggered_) {
+        if (safety_triggered_.load(std::memory_order_acquire)) {
             return StateName::SAFETY;
         }
         // key=1 → 退回阻尼状态
@@ -207,16 +270,33 @@ public:
     }
 
     void OnExit() override {
-        running_ = false;
-        cv_sensor_.notify_one();  // 唤醒阻塞的推理线程使其能够退出
-        infer_loop_.Stop();
+        StopInference();
         if (config_.rl_freq_hz) {
             config_.rl_freq_hz->store(0.0, std::memory_order_relaxed);
         }
         std::cout << "[StateRL] 退出 RL 控制状态" << std::endl;
     }
 
+    robot_base::FaultStatus CurrentFault() const override {
+        std::lock_guard<std::mutex> lock(mutex_fault_);
+        return fault_;
+    }
+
 private:
+    void StopInference() noexcept {
+        running_.store(false, std::memory_order_release);
+        cv_sensor_.notify_one();
+        if (infer_loop_.IsRunning()) {
+            try {
+                policy_.RequestInferenceTermination();
+            } catch (const std::exception &error) {
+                std::cerr << "[StateRL] 请求终止推理失败: "
+                    << error.what() << std::endl;
+            }
+        }
+        infer_loop_.Stop();
+    }
+
     void ApplyEntryTargetTransition(const std::vector<double> &raw_target,
                                     float rl_dt,
                                     std::uint64_t inference_steps) {
@@ -253,8 +333,11 @@ private:
         // 等待控制循环的主线程发来通知（严格同步到 control_dt 驱动的时钟）
         {
             std::unique_lock<std::mutex> lock(mutex_sensor_);
-            cv_sensor_.wait(lock, [this] { return new_data_ready_ || !running_; });
-            if (!running_) {
+            cv_sensor_.wait(lock, [this] {
+                return new_data_ready_ ||
+                    !running_.load(std::memory_order_acquire);
+            });
+            if (!running_.load(std::memory_order_acquire)) {
                 return false;  // 退出线程
             }
             inference_start = RLRuntimeClock::now();
@@ -279,54 +362,74 @@ private:
         NotifyRuntimeEvent(RLRuntimeEventType::INFERENCE_START,
             release_sequence, inference_start);
 
-        // 在 AssembleObs 前注入 tracker-specific 输入。
-        if (policy_adapter_) {
-            const auto elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t_enter_).count();
-            robot_base::RobotData snapshot;
-            snapshot.num_dof = static_cast<int>(joint_pos.size());
-            snapshot.base_pos = base_pos;
-            snapshot.base_quat = base_quat;
-            snapshot.base_vel = {
-                base_vel[0], base_vel[1], base_vel[2],
-                gyro[0], gyro[1], gyro[2]};
-            snapshot.rpy = rpy;
-            snapshot.gyro = gyro;
-            snapshot.joint_pos = joint_pos;
-            snapshot.joint_vel = joint_vel;
-            policy_adapter_->PrepareInputs(snapshot, elapsed, policy_);
-        }
-
-        // 组装观测 + 推理
         Eigen::VectorXf obs;
-        policy_.AssembleObs(gyro,
-                            rpy,
-                            cmd_vx,
-                            cmd_vy,
-                            cmd_wz,
-                            joint_pos,
-                            joint_vel,
-                            base_quat,
-                            base_vel,
-                            rl_dt,
-                            obs);
-
         std::vector<double> raw_action;
         std::vector<double> executor_action;
         std::vector<double> action;
-        if (policy_trace_enabled_) {
-            policy_.Infer(obs, action, &raw_action);
-            executor_action = action;
-        } else {
-            policy_.Infer(obs, action);
-        }
-        if (policy_adapter_) {
-            policy_adapter_->OnAction(action);
+        try {
+            // 在 AssembleObs 前注入 tracker-specific 输入。
+            if (policy_adapter_) {
+                const auto elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t_enter_).count();
+                robot_base::RobotData snapshot;
+                snapshot.num_dof = static_cast<int>(joint_pos.size());
+                snapshot.base_pos = base_pos;
+                snapshot.base_quat = base_quat;
+                snapshot.base_vel = {
+                    base_vel[0], base_vel[1], base_vel[2],
+                    gyro[0], gyro[1], gyro[2]};
+                snapshot.rpy = rpy;
+                snapshot.gyro = gyro;
+                snapshot.joint_pos = joint_pos;
+                snapshot.joint_vel = joint_vel;
+                policy_adapter_->PrepareInputs(snapshot, elapsed, policy_);
+            }
+
+            // 组装观测 + 推理
+            policy_.AssembleObs(gyro,
+                                rpy,
+                                cmd_vx,
+                                cmd_vy,
+                                cmd_wz,
+                                joint_pos,
+                                joint_vel,
+                                base_quat,
+                                base_vel,
+                                rl_dt,
+                                obs);
+            if (policy_trace_enabled_) {
+                policy_.Infer(obs, action, &raw_action);
+                executor_action = action;
+            } else {
+                policy_.Infer(obs, action);
+            }
+            if (policy_adapter_) policy_adapter_->OnAction(action);
+        } catch (const std::exception &error) {
+            if (!running_.load(std::memory_order_acquire)) return false;
+            ReportFault(robot_base::FaultCode::INTERNAL_ERROR,
+                std::string("RL inference failed: ") + error.what());
+            return false;
         }
         const auto inference_finish = RLRuntimeClock::now();
         NotifyRuntimeEvent(RLRuntimeEventType::INFERENCE_FINISH,
             release_sequence, inference_finish);
         UpdateRlFreq();
+
+        if (config_.inference_deadline_s > 0.0 &&
+            std::chrono::duration<double>(
+                inference_finish - release_time).count() >
+                config_.inference_deadline_s) {
+            ReportFault(robot_base::FaultCode::INFERENCE_TIMEOUT,
+                "RL inference missed its release-to-finish deadline");
+            return false;
+        }
+        if (action.size() != static_cast<size_t>(policy_.ActionDim()) ||
+            !std::all_of(action.begin(), action.end(),
+                [](double value) { return std::isfinite(value); })) {
+            ReportFault(robot_base::FaultCode::INVALID_DATA,
+                "RL inference returned an invalid action");
+            return false;
+        }
 
         // 写入动作缓存
         RLRuntimeClock::time_point action_published;
@@ -359,7 +462,9 @@ private:
     robot_base::ThreadLoop infer_loop_;
 
     // 安全标志
-    bool safety_triggered_ = false;
+    std::atomic<bool> safety_triggered_{false};
+    mutable std::mutex mutex_fault_;
+    robot_base::FaultStatus fault_;
 
     // 策略输入协议适配器（policy_adapter.type 为空则不启用）
     std::unique_ptr<policy_adapter::PolicyAdapter> policy_adapter_;
@@ -376,7 +481,7 @@ private:
     std::condition_variable cv_sensor_;
     float time_since_last_infer_ = 0.0f;
     bool new_data_ready_ = false;
-    bool running_ = true;
+    std::atomic<bool> running_{false};
 
     std::array<double, 3> sample_gyro_ = {};
     std::array<double, 3> sample_rpy_ = {};
@@ -418,6 +523,25 @@ private:
     };
 
     PolicyTiming cached_timing_;
+    RLRuntimeClock::time_point entered_at_;
+
+    void ReportFault(robot_base::FaultCode code,
+            const std::string &detail) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_fault_);
+            if (!fault_.latched) {
+                fault_.active = true;
+                fault_.latched = true;
+                fault_.source = robot_base::FaultSource::POLICY;
+                fault_.code = code;
+                fault_.timestamp_s = ClockSeconds(RLRuntimeClock::now());
+                fault_.detail = detail;
+                runtime_logging::Log(runtime_logging::Level::kError,
+                    std::string("RL safety fault: ") + detail, false);
+            }
+        }
+        safety_triggered_.store(true, std::memory_order_release);
+    }
 
     static double ClockSeconds(RLRuntimeClock::time_point timestamp) {
         return std::chrono::duration<double>(timestamp.time_since_epoch()).count();

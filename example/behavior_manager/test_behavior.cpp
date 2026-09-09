@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -69,6 +70,8 @@ int main(int argc, char *argv[]) {
             .value_or(yaml.Read<double>("behavior_manager.zero_duration").value_or(3.0));
         const double zero_settle_duration = yaml.Read<double>(
             "behavior_manager.zero.settle_duration").value_or(0.20);
+        const double safety_release_duration = yaml.Read<double>(
+            "behavior_manager.safety.release_duration_s").value_or(1.0);
         const auto default_joint_pos =
             yaml.Read<std::vector<double>>("robot_base.default_joint_pos").value();
         const auto robot_kp = yaml.Read<std::vector<double>>("robot_base.kp").value();
@@ -97,6 +100,13 @@ int main(int argc, char *argv[]) {
         // joint_pos 和 joint_vel 已在 FromYaml() 中初始化大小
 
         Command cmd;
+        robot_base::FaultStatus sensor_fault;
+        const auto assert_finite_zero = [](const std::vector<double> &values) {
+            for (double value : values) {
+                assert(std::isfinite(value));
+                assert(value == 0.0);
+            }
+        };
         auto run_steps = [&](int count, bool follow_target) {
             for (int i = 0; i < count; ++i) {
                 const auto &current_output = bm.GetOutput();
@@ -107,6 +117,7 @@ int main(int argc, char *argv[]) {
                 }
                 sensor.time += control_dt;
                 bm.SetSensorData(sensor);
+                bm.SetSensorFault(sensor_fault);
                 bm.SetCommand(cmd);
                 bm.Step(control_dt, rl_dt);
             }
@@ -120,6 +131,10 @@ int main(int argc, char *argv[]) {
         std::cout << "使能: " << (out1.enable ? "是" : "否") << std::endl;
         assert(bm.CurrentState() == behavior_manager::StateName::POWER_OFF);
         assert(!out1.enable);
+        assert_finite_zero(out1.target_vel);
+        assert_finite_zero(out1.target_torque);
+        assert_finite_zero(out1.kp);
+        assert_finite_zero(out1.kd);
 
         // ========== 阶段2: 切换到 DAMP ==========
         std::cout << "\n--- 阶段2: key=1 → DAMP ---" << std::endl;
@@ -128,6 +143,12 @@ int main(int argc, char *argv[]) {
         bm.Step(control_dt, rl_dt);
         cmd.key = 0;
         std::cout << "当前状态: " << StateNameStr(bm.CurrentState()) << std::endl;
+        const auto &power_off_output = bm.GetOutput();
+        assert(!power_off_output.enable);
+        assert_finite_zero(power_off_output.target_vel);
+        assert_finite_zero(power_off_output.target_torque);
+        assert_finite_zero(power_off_output.kp);
+        assert_finite_zero(power_off_output.kd);
         const auto &out2 = bm.GetOutput();
         std::cout << "使能: " << (out2.enable ? "是" : "否") << std::endl;
         assert(bm.CurrentState() == behavior_manager::StateName::DAMP);
@@ -221,6 +242,179 @@ int main(int argc, char *argv[]) {
         bm.Step(control_dt, rl_dt);
         cmd.key = 0;
         std::cout << "当前状态: " << StateNameStr(bm.CurrentState()) << std::endl;
+
+        // ========== 阶段6: 故障锁存、恢复与 POWER_OFF 确认 ==========
+        std::cout << "\n--- 阶段6: 故障锁存与确认 ---" << std::endl;
+        sensor_fault.active = true;
+        sensor_fault.latched = true;
+        sensor_fault.source = robot_base::FaultSource::MOTOR;
+        sensor_fault.code = robot_base::FaultCode::DEVICE_ERROR;
+        sensor_fault.native_code = -3;
+        sensor_fault.sequence = 17;
+        sensor_fault.detail = "test motor feedback fault";
+        sensor.base_quat = {0.0, 0.0, 0.0, 0.0};
+        bm.SetSensorData(sensor);
+        bm.SetSensorFault(sensor_fault);
+        bm.SetCommand(cmd);
+        bm.Step(control_dt, rl_dt);
+        assert(bm.CurrentState() == behavior_manager::StateName::POWER_OFF);
+        assert(bm.CurrentFault().active && bm.CurrentFault().latched);
+        assert(bm.CurrentFault().source == robot_base::FaultSource::MOTOR);
+        assert(bm.CurrentFault().native_code == -3);
+        const uint64_t first_fault_sequence = bm.CurrentFault().sequence;
+        const std::string first_fault_detail = bm.CurrentFault().detail;
+
+        // 同周期的无效姿态属于次生故障，不能覆盖先观察到的 driver 根故障。
+        // 同一 driver 故障更新现场描述时，也不能生成新故障序列。
+        sensor_fault.detail = "test motor feedback fault, age=0.125 s";
+        bm.SetSensorData(sensor);
+        bm.SetSensorFault(sensor_fault);
+        bm.SetCommand(cmd);
+        bm.Step(control_dt, rl_dt);
+        assert(bm.CurrentFault().sequence == first_fault_sequence);
+        assert(bm.CurrentFault().detail == first_fault_detail);
+        assert(bm.CurrentFault().source == robot_base::FaultSource::MOTOR);
+
+        // 活动故障和未确认的恢复故障都必须阻止重新上电。
+        cmd.key = 1;
+        bm.SetCommand(cmd);
+        bm.Step(control_dt, rl_dt);
+        assert(bm.CurrentState() == behavior_manager::StateName::POWER_OFF);
+        cmd.key = 0;
+
+        // 如果确认请求与故障重新活动撞在同一周期，恢复后同一序号仍必须可确认。
+        bm.AcknowledgeFault(first_fault_sequence);
+        bm.Step(control_dt, rl_dt);
+        assert(bm.CurrentFault().active && bm.CurrentFault().latched);
+        sensor_fault.active = false;
+        sensor.base_quat = {1.0, 0.0, 0.0, 0.0};
+        bm.SetSensorData(sensor);
+        bm.SetSensorFault(sensor_fault);
+        bm.SetCommand(cmd);
+        bm.Step(control_dt, rl_dt);
+        assert(!bm.CurrentFault().active && bm.CurrentFault().latched);
+        bm.AcknowledgeFault(first_fault_sequence);
+        bm.Step(control_dt, rl_dt);
+        assert(!bm.CurrentFault().latched);
+        bm.AcknowledgeFault(0);
+
+        // 未确认的恢复故障再次活动时属于新事件，旧确认序号不得继续有效。
+        sensor_fault.active = true;
+        bm.SetSensorFault(sensor_fault);
+        bm.Step(control_dt, rl_dt);
+        const uint64_t second_fault_sequence = bm.CurrentFault().sequence;
+        assert(second_fault_sequence > first_fault_sequence);
+        sensor_fault.active = false;
+        bm.SetSensorFault(sensor_fault);
+        bm.Step(control_dt, rl_dt);
+        assert(!bm.CurrentFault().active && bm.CurrentFault().latched);
+        sensor_fault.active = true;
+        bm.SetSensorFault(sensor_fault);
+        bm.Step(control_dt, rl_dt);
+        const uint64_t reactivated_fault_sequence = bm.CurrentFault().sequence;
+        assert(reactivated_fault_sequence > second_fault_sequence);
+        sensor_fault.active = false;
+        bm.SetSensorFault(sensor_fault);
+        bm.Step(control_dt, rl_dt);
+
+        // 过期或串错的确认序列不得清除当前故障。
+        bm.AcknowledgeFault(bm.CurrentFault().sequence + 1);
+        bm.Step(control_dt, rl_dt);
+        assert(bm.CurrentFault().latched);
+        bm.AcknowledgeFault(0);
+
+        // 确认同一 driver 故障序列后，后续重复状态不得立即重新锁存。
+        bm.AcknowledgeFault(bm.CurrentFault().sequence);
+        bm.Step(control_dt, rl_dt);
+        assert(!bm.CurrentFault().latched);
+        bm.AcknowledgeFault(0);
+        bm.Step(control_dt, rl_dt);
+        assert(!bm.CurrentFault().latched);
+
+        cmd.key = 1;
+        bm.SetCommand(cmd);
+        bm.Step(control_dt, rl_dt);
+        cmd.key = 0;
+        assert(bm.CurrentState() == behavior_manager::StateName::DAMP);
+
+        // 同一来源故障再次变为 active 时，必须作为新事件进入 SAFETY 并重新确认。
+        sensor_fault.active = true;
+        bm.SetSensorData(sensor);
+        bm.SetSensorFault(sensor_fault);
+        bm.SetCommand(cmd);
+        bm.Step(control_dt, rl_dt);
+        assert(bm.CurrentState() == behavior_manager::StateName::SAFETY);
+        assert(bm.CurrentFault().active && bm.CurrentFault().latched);
+        const auto &safety_output = bm.GetOutput();
+        assert(!safety_output.enable);
+        assert_finite_zero(safety_output.target_vel);
+        assert_finite_zero(safety_output.target_torque);
+        assert_finite_zero(safety_output.kp);
+        assert_finite_zero(safety_output.kd);
+
+        sensor_fault.active = false;
+        run_steps(static_cast<int>(
+            std::ceil(safety_release_duration / control_dt)) + 2, true);
+        assert(bm.CurrentState() == behavior_manager::StateName::POWER_OFF);
+        assert(!bm.CurrentFault().active && bm.CurrentFault().latched);
+        const auto &released_output = bm.GetOutput();
+        assert(!released_output.enable);
+        assert_finite_zero(released_output.target_vel);
+        assert_finite_zero(released_output.target_torque);
+        assert_finite_zero(released_output.kp);
+        assert_finite_zero(released_output.kd);
+        bm.AcknowledgeFault(bm.CurrentFault().sequence);
+        bm.Step(control_dt, rl_dt);
+        assert(!bm.CurrentFault().latched);
+        bm.AcknowledgeFault(0);
+
+        // 时间戳和姿态四元数损坏时，即使数组维度正确也必须锁存故障。
+        sensor.base_quat = {0.0, 0.0, 0.0, 0.0};
+        bm.SetSensorData(sensor);
+        bm.SetCommand(cmd);
+        bm.Step(control_dt, rl_dt);
+        assert(bm.CurrentFault().active);
+        assert(bm.CurrentFault().code == robot_base::FaultCode::INVALID_DATA);
+
+        sensor.base_quat = {1.0, 0.0, 0.0, 0.0};
+        bm.SetSensorData(sensor);
+        bm.Step(control_dt, rl_dt);
+        bm.AcknowledgeFault(bm.CurrentFault().sequence);
+        bm.Step(control_dt, rl_dt);
+        assert(!bm.CurrentFault().latched);
+        bm.AcknowledgeFault(0);
+
+        // 活动状态下的无效关节反馈不得被 SAFETY 当作缓慢卸力目标继续发送。
+        cmd.key = 1;
+        bm.SetSensorData(sensor);
+        bm.SetCommand(cmd);
+        bm.Step(control_dt, rl_dt);
+        cmd.key = 0;
+        assert(bm.CurrentState() == behavior_manager::StateName::DAMP);
+        sensor.joint_pos[0] = std::numeric_limits<double>::quiet_NaN();
+        bm.SetSensorData(sensor);
+        bm.SetCommand(cmd);
+        bm.Step(control_dt, rl_dt);
+        assert(bm.CurrentState() == behavior_manager::StateName::SAFETY);
+        const auto &invalid_state_output = bm.GetOutput();
+        assert(!invalid_state_output.enable);
+        for (double value : invalid_state_output.target_pos) assert(std::isfinite(value));
+        for (double value : invalid_state_output.kp) assert(value == 0.0);
+        for (double value : invalid_state_output.kd) assert(value == 0.0);
+        sensor.joint_pos[0] = 0.0;
+        run_steps(2, true);
+        assert(bm.CurrentState() == behavior_manager::StateName::POWER_OFF);
+        bm.AcknowledgeFault(bm.CurrentFault().sequence);
+        bm.Step(control_dt, rl_dt);
+        assert(!bm.CurrentFault().latched);
+        bm.AcknowledgeFault(0);
+
+        sensor.time = -1.0;
+        bm.SetSensorData(sensor);
+        bm.SetCommand(cmd);
+        bm.Step(control_dt, rl_dt);
+        assert(bm.CurrentFault().active);
+        assert(bm.CurrentFault().code == robot_base::FaultCode::INVALID_DATA);
 
         std::cout << "\n========================================" << std::endl;
         std::cout << "  测试完成 ✓" << std::endl;

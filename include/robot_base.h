@@ -25,6 +25,61 @@
 
 namespace robot_base {
 
+/** @brief Runtime fault origin shared by driver, control and HMI. */
+enum class FaultSource : uint8_t {
+    NONE = 0,
+    TRANSPORT = 1,
+    DRIVER = 2,
+    WHOLE_BODY = 3,
+    MOTOR = 4,
+    IMU = 5,
+    CONTROL = 6,
+    POLICY = 7,
+    SAFETY_MONITOR = 8,
+};
+
+/** @brief Machine-independent fault category. native_code keeps component detail. */
+enum class FaultCode : int16_t {
+    NONE = 0,
+    STATE_TIMEOUT = 1,
+    FEEDBACK_TIMEOUT = 2,
+    DEVICE_ERROR = 3,
+    COMMAND_REJECTED = 4,
+    COMMAND_TIMEOUT = 5,
+    INFERENCE_TIMEOUT = 6,
+    INVALID_DATA = 7,
+    LIMIT_EXCEEDED = 8,
+    INTERNAL_ERROR = 9,
+};
+
+/**
+ * @brief Structured runtime fault propagated across process boundaries.
+ *
+ * active describes the current condition. latched remains set until the operator
+ * acknowledges the fault from POWER_OFF after the active condition has cleared.
+ */
+struct FaultStatus {
+    bool active = false;
+    bool latched = false;
+    FaultSource source = FaultSource::NONE;
+    FaultCode code = FaultCode::NONE;
+    int32_t native_code = 0;
+    uint64_t sequence = 0;
+    double timestamp_s = 0.0;
+    std::string detail;
+};
+
+constexpr bool IsValidFaultSource(FaultSource source) {
+    return source >= FaultSource::NONE && source <= FaultSource::SAFETY_MONITOR;
+}
+
+constexpr bool IsValidFaultCode(FaultCode code) {
+    return code >= FaultCode::NONE && code <= FaultCode::INTERNAL_ERROR;
+}
+
+const char *FaultSourceName(FaultSource source);
+const char *FaultCodeName(FaultCode code);
+
 /**
  * @brief YAML 配置读取入口
  *

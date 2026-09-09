@@ -8,7 +8,10 @@
 
 #include "runtime_logger.h"
 
+#include <fcntl.h>
+#include <spawn.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -16,6 +19,7 @@
 #include <cerrno>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -36,6 +40,17 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
+
+extern char **environ;
+
+#ifndef HUMANOID_COMMON_GIT_COMMIT
+#define HUMANOID_COMMON_GIT_COMMIT "unknown"
+#endif
+
+#ifndef HUMANOID_COMMON_GIT_DIRTY
+#define HUMANOID_COMMON_GIT_DIRTY 0
+#endif
 
 namespace runtime_logging {
 namespace {
@@ -45,6 +60,13 @@ struct QueueItem {
     std::string header;
     std::string line;
     bool csv = false;
+    enum class Kind {
+        kRecord,
+        kArtifact,
+    } kind = Kind::kRecord;
+    std::string artifact_kind;
+    std::string artifact_name;
+    std::string artifact_path;
 };
 
 struct FileState {
@@ -76,6 +98,15 @@ Level ParseLevel(std::string value) {
     if (value == "warning" || value == "warn") return Level::kWarning;
     if (value == "error") return Level::kError;
     return Level::kInfo;
+}
+
+double ReadFiniteClamped(const robot_base::YamlFile &yaml_file,
+        const std::string &path, double fallback, double minimum, double maximum) {
+    const double value = yaml_file.Read<double>(path).value_or(fallback);
+    if (!std::isfinite(value)) {
+        throw std::runtime_error(path + " must be finite");
+    }
+    return std::clamp(value, minimum, maximum);
 }
 
 std::string Timestamp(const char *format, bool milliseconds) {
@@ -114,6 +145,163 @@ std::string JsonEscape(const std::string &value) {
         }
     }
     return output;
+}
+
+std::string CsvEscape(const std::string &value) {
+    if (value.find_first_of(",\"\r\n") == std::string::npos) return value;
+    std::string output = "\"";
+    for (char c : value) {
+        if (c == '"') output.push_back('"');
+        output.push_back(c);
+    }
+    output.push_back('"');
+    return output;
+}
+
+struct CsvShape {
+    bool valid = false;
+    size_t columns = 0;
+    size_t records = 0;
+};
+
+CsvShape AnalyzeCsv(const std::string &value) {
+    if (value.empty()) return {};
+
+    CsvShape result;
+    size_t columns = 1;
+    bool in_quotes = false;
+    bool record_has_data = false;
+    const auto finish_record = [&]() {
+        if (!record_has_data && columns == 1) return false;
+        if (result.records == 0) {
+            result.columns = columns;
+        } else if (result.columns != columns) {
+            return false;
+        }
+        ++result.records;
+        columns = 1;
+        record_has_data = false;
+        return true;
+    };
+
+    for (size_t i = 0; i < value.size(); ++i) {
+        const char character = value[i];
+        if (character == '"') {
+            record_has_data = true;
+            if (in_quotes && i + 1 < value.size() && value[i + 1] == '"') {
+                ++i;
+            } else {
+                in_quotes = !in_quotes;
+            }
+            continue;
+        }
+        if (!in_quotes && character == ',') {
+            ++columns;
+            record_has_data = true;
+            continue;
+        }
+        if (!in_quotes && (character == '\n' || character == '\r')) {
+            if (!finish_record()) return {};
+            if (character == '\r' && i + 1 < value.size() && value[i + 1] == '\n') ++i;
+            continue;
+        }
+        record_has_data = true;
+    }
+    if (in_quotes) return {};
+    if (record_has_data || columns > 1) {
+        if (!finish_record()) return {};
+    }
+    result.valid = result.records > 0;
+    return result;
+}
+
+std::string CaptureCommand(const std::vector<std::string> &arguments) {
+    if (arguments.empty()) return {};
+    int output_pipe[2];
+    if (pipe(output_pipe) != 0) return {};
+
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        return {};
+    }
+    posix_spawn_file_actions_adddup2(&actions, output_pipe[1], STDOUT_FILENO);
+    posix_spawn_file_actions_addclose(&actions, output_pipe[0]);
+    posix_spawn_file_actions_addclose(&actions, output_pipe[1]);
+    posix_spawn_file_actions_addopen(
+        &actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+
+    std::vector<char *> argv;
+    argv.reserve(arguments.size() + 1);
+    for (const auto &argument : arguments)
+        argv.push_back(const_cast<char *>(argument.c_str()));
+    argv.push_back(nullptr);
+
+    pid_t child = -1;
+    const int spawn_result = posix_spawnp(&child, arguments[0].c_str(),
+        &actions, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(output_pipe[1]);
+    if (spawn_result != 0) {
+        close(output_pipe[0]);
+        return {};
+    }
+
+    std::string output;
+    char buffer[512];
+    for (;;) {
+        const ssize_t count = read(output_pipe[0], buffer, sizeof(buffer));
+        if (count > 0) {
+            output.append(buffer, static_cast<size_t>(count));
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        break;
+    }
+    close(output_pipe[0]);
+
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return {};
+    while (!output.empty() &&
+        (output.back() == '\n' || output.back() == '\r')) {
+        output.pop_back();
+    }
+    return output;
+}
+
+std::string Sha256File(const std::string &path) {
+    const std::string output = CaptureCommand({"sha256sum", "--", path});
+    if (output.size() < 64) return {};
+    const std::string digest = output.substr(0, 64);
+    const bool valid = std::all_of(digest.begin(), digest.end(), [](unsigned char c) {
+        return std::isxdigit(c) != 0;
+    });
+    return valid ? digest : std::string{};
+}
+
+struct GitInfo {
+    std::string commit = "unknown";
+    bool dirty = false;
+};
+
+GitInfo GitInfoForPath(const std::string &path) {
+    std::error_code error;
+    std::filesystem::path directory = std::filesystem::absolute(path, error);
+    if (error) return {};
+    if (!std::filesystem::is_directory(directory, error)) directory = directory.parent_path();
+    const std::string root = CaptureCommand(
+        {"git", "-C", directory.string(), "rev-parse", "--show-toplevel"});
+    if (root.empty()) return {};
+
+    GitInfo result;
+    const std::string commit = CaptureCommand(
+        {"git", "-C", root, "rev-parse", "HEAD"});
+    if (!commit.empty()) result.commit = commit;
+    result.dirty = !CaptureCommand(
+        {"git", "-C", root, "status", "--porcelain"}).empty();
+    return result;
 }
 
 gid_t RuntimeLogGroup() {
@@ -221,20 +409,18 @@ public:
             yaml_file.Read<bool>("logging.telemetry.enabled").value_or(false);
         config.driver_monitor_enabled = console_allowed &&
             yaml_file.Read<bool>("logging.driver_monitor.enabled").value_or(false);
-        config.telemetry_rate_hz = std::clamp(
-            yaml_file.Read<double>("logging.telemetry.rate_hz").value_or(20.0),
+        config.telemetry_rate_hz = ReadFiniteClamped(yaml_file,
+            "logging.telemetry.rate_hz", 20.0, 0.1, 500.0);
+        config.control_telemetry_rate_hz = ReadFiniteClamped(yaml_file,
+            "logging.telemetry.control_rate_hz", config.telemetry_rate_hz,
             0.1, 500.0);
-        config.control_telemetry_rate_hz = std::clamp(
-            yaml_file.Read<double>("logging.telemetry.control_rate_hz")
-                .value_or(config.telemetry_rate_hz),
+        config.hardware_telemetry_rate_hz = ReadFiniteClamped(yaml_file,
+            "logging.telemetry.hardware_rate_hz", config.telemetry_rate_hz,
             0.1, 500.0);
-        config.hardware_telemetry_rate_hz = std::clamp(
-            yaml_file.Read<double>("logging.telemetry.hardware_rate_hz")
-                .value_or(config.telemetry_rate_hz),
-            0.1, 500.0);
-        config.driver_monitor_rate_hz = std::clamp(
-            yaml_file.Read<double>("logging.driver_monitor.rate_hz").value_or(2.0),
-            0.1, 20.0);
+        config.driver_monitor_rate_hz = ReadFiniteClamped(yaml_file,
+            "logging.driver_monitor.rate_hz", 2.0, 0.1, 20.0);
+        config.timing_window_s = ReadFiniteClamped(yaml_file,
+            "logging.telemetry.timing_window_s", 5.0, 1.0, 15.0);
         config.queue_capacity = std::clamp(
             yaml_file.Read<int>("logging.queue_capacity").value_or(4096),
             64, 65536);
@@ -255,6 +441,7 @@ public:
             component_ = Sanitize(component);
             yaml_path_ = yaml_path;
             stopped_ = false;
+            artifacts_stopped_ = false;
             initialized_ = true;
             dropped_.store(0);
         }
@@ -275,20 +462,40 @@ public:
             }
             WriteMetadata(robot);
             worker_ = std::thread(&Logger::Worker, this);
+            artifact_worker_ = std::thread(&Logger::ArtifactWorker, this);
+            WriteArtifact("config", "runtime_config", yaml_path_);
+            const auto artifacts = yaml_file.Read<std::vector<std::string>>(
+                "logging.artifacts").value_or(std::vector<std::string>{});
+            for (const auto &artifact : artifacts) {
+                const auto artifact_path = yaml_file.ToAbsPath(artifact);
+                WriteArtifact("configured",
+                    std::filesystem::path(artifact_path).filename().string(), artifact_path);
+            }
         } catch (const std::exception &error) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            config_.file_enabled = false;
-            config_.telemetry_enabled = false;
             std::cerr << "[runtime_logger] failed to open log directory: "
                 << error.what() << "\n";
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                config_.file_enabled = false;
+                config_.telemetry_enabled = false;
+            }
+            Shutdown();
         }
     }
 
     void Shutdown() {
+        std::thread artifact_worker;
         std::thread worker;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!initialized_) return;
+            artifacts_stopped_ = true;
+            artifact_condition_.notify_all();
+            artifact_worker = std::move(artifact_worker_);
+        }
+        if (artifact_worker.joinable()) artifact_worker.join();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
             stopped_ = true;
             condition_.notify_all();
             worker = std::move(worker_);
@@ -298,6 +505,7 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             files_.clear();
             queue_.clear();
+            artifact_queue_.clear();
             initialized_ = false;
             session_directory_.clear();
         }
@@ -327,6 +535,25 @@ public:
         const Config config = GetConfig();
         if (!config.telemetry_enabled) return;
         Enqueue({Sanitize(stream), header, row, true});
+    }
+
+    void WriteArtifact(const std::string &kind, const std::string &name,
+        const std::string &path) {
+        const Config config = GetConfig();
+        if (!config.file_enabled) return;
+        QueueItem item;
+        item.kind = QueueItem::Kind::kArtifact;
+        item.artifact_kind = kind;
+        item.artifact_name = name;
+        item.artifact_path = path;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!initialized_ || !config_.file_enabled || artifacts_stopped_) return;
+        if (artifact_queue_.size() >= static_cast<size_t>(config_.queue_capacity)) {
+            ++dropped_;
+            return;
+        }
+        artifact_queue_.push_back(std::move(item));
+        artifact_condition_.notify_one();
     }
 
     Config GetConfig() const {
@@ -372,7 +599,7 @@ private:
                         std::to_string(dropped) + " log records",
                     false});
             }
-            WriteItem(item);
+            WriteRecord(item);
         }
         const uint64_t dropped = dropped_.exchange(0);
         if (dropped > 0) {
@@ -383,6 +610,79 @@ private:
                 false});
         }
         for (auto &[name, file] : files_) file.stream.flush();
+    }
+
+    void ArtifactWorker() {
+        for (;;) {
+            QueueItem item;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                artifact_condition_.wait(lock, [this]() {
+                    return artifacts_stopped_ || !artifact_queue_.empty();
+                });
+                if (artifact_queue_.empty() && artifacts_stopped_) break;
+                item = std::move(artifact_queue_.front());
+                artifact_queue_.pop_front();
+            }
+            Enqueue(BuildArtifactRecord(item));
+        }
+    }
+
+    void WriteRecord(const QueueItem &item) {
+        if (item.csv) {
+            std::string reason;
+            if (!ValidateCsvItem(item, &reason)) {
+                WriteItem({"events", "",
+                    Timestamp("%Y-%m-%d %H:%M:%S", true) +
+                        " [" + component_ + "] [ERROR] rejected CSV stream " +
+                        item.stream + ": " + reason,
+                    false});
+                return;
+            }
+        }
+        WriteItem(item);
+    }
+
+    bool ValidateCsvItem(const QueueItem &item, std::string *reason) const {
+        const CsvShape header = AnalyzeCsv(item.header);
+        if (!header.valid || header.records != 1) {
+            *reason = "header is not one valid CSV record";
+            return false;
+        }
+        const CsvShape rows = AnalyzeCsv(item.line);
+        if (!rows.valid) {
+            *reason = "row data is not valid CSV";
+            return false;
+        }
+        if (rows.columns != header.columns) {
+            *reason = "header has " + std::to_string(header.columns) +
+                " columns but row has " + std::to_string(rows.columns);
+            return false;
+        }
+        const auto existing = files_.find(item.stream);
+        if (existing != files_.end() && existing->second.header != item.header) {
+            *reason = "header changed after the stream was opened";
+            return false;
+        }
+        return true;
+    }
+
+    QueueItem BuildArtifactRecord(const QueueItem &item) const {
+        std::error_code error;
+        const auto absolute_path = std::filesystem::absolute(item.artifact_path, error);
+        const std::string resolved_path = error ? item.artifact_path
+            : absolute_path.lexically_normal().string();
+        error.clear();
+        const bool exists = std::filesystem::is_regular_file(resolved_path, error);
+        error.clear();
+        const uintmax_t size = exists ? std::filesystem::file_size(resolved_path, error) : 0;
+        const std::string digest = exists && !error ? Sha256File(resolved_path) : std::string{};
+        std::ostringstream row;
+        row << CsvEscape(item.artifact_kind) << "," << CsvEscape(item.artifact_name) << ","
+            << CsvEscape(resolved_path) << "," << exists << "," << size << ","
+            << digest;
+        return {"artifacts", "kind,name,path,exists,size_bytes,sha256",
+            row.str(), true};
     }
 
     void WriteItem(const QueueItem &item) {
@@ -473,6 +773,8 @@ private:
             std::filesystem::remove(path, error);
             throw std::runtime_error("failed to secure log metadata file");
         }
+        const std::string config_sha256 = Sha256File(yaml_path_);
+        const GitInfo config_git = GitInfoForPath(yaml_path_);
         output << "{\n"
             << "  \"robot\": \"" << JsonEscape(robot) << "\",\n"
             << "  \"component\": \"" << JsonEscape(component_) << "\",\n"
@@ -481,15 +783,27 @@ private:
             << "\",\n"
             << "  \"config_path\": \"" << JsonEscape(yaml_path_) << "\",\n"
             << "  \"config_hash_fnv1a64\": \"0x" << std::hex
-            << HashFile(yaml_path_) << std::dec << "\"\n"
+            << HashFile(yaml_path_) << std::dec << "\",\n"
+            << "  \"config_sha256\": \"" << config_sha256 << "\",\n"
+            << "  \"config_repository_commit\": \""
+            << JsonEscape(config_git.commit) << "\",\n"
+            << "  \"config_repository_dirty\": "
+            << (config_git.dirty ? "true" : "false") << ",\n"
+            << "  \"common_build_commit\": \"" << HUMANOID_COMMON_GIT_COMMIT
+            << "\",\n"
+            << "  \"common_build_dirty\": "
+            << (HUMANOID_COMMON_GIT_DIRTY ? "true" : "false") << "\n"
             << "}\n";
     }
 
     mutable std::mutex mutex_;
     std::condition_variable condition_;
+    std::condition_variable artifact_condition_;
     std::deque<QueueItem> queue_;
+    std::deque<QueueItem> artifact_queue_;
     std::map<std::string, FileState> files_;
     std::thread worker_;
+    std::thread artifact_worker_;
     std::atomic<uint64_t> dropped_{0};
     Config config_;
     std::string component_ = "runtime";
@@ -497,6 +811,7 @@ private:
     std::string session_directory_;
     bool initialized_ = false;
     bool stopped_ = true;
+    bool artifacts_stopped_ = true;
 };
 
 }  // namespace
@@ -519,6 +834,11 @@ void Log(Level level, const std::string &message, bool emit_console) {
 void RecordCsv(
     const std::string &stream, const std::string &header, const std::string &row) {
     Logger::Instance().WriteCsv(stream, header, row);
+}
+
+void RecordArtifact(
+    const std::string &kind, const std::string &name, const std::string &path) {
+    Logger::Instance().WriteArtifact(kind, name, path);
 }
 
 Config GetConfig() { return Logger::Instance().GetConfig(); }

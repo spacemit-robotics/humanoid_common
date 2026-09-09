@@ -144,6 +144,25 @@ public:
         return overflow_events_.load(std::memory_order_acquire);
     }
 
+    void Reset() {
+        for (std::size_t index = 0; index < capacity_; ++index) {
+            AtomicTrace &trace = traces_[index];
+            trace.release_ns.store(kUnsetTimestamp, std::memory_order_relaxed);
+            trace.inference_start_ns.store(
+                kUnsetTimestamp, std::memory_order_relaxed);
+            trace.inference_finish_ns.store(
+                kUnsetTimestamp, std::memory_order_relaxed);
+            trace.published_ns.store(kUnsetTimestamp, std::memory_order_relaxed);
+            trace.applied_ns.store(kUnsetTimestamp, std::memory_order_relaxed);
+        }
+        runtime_ = {};
+        runtime_ready_ = false;
+        maximum_release_.store(0, std::memory_order_relaxed);
+        maximum_published_.store(0, std::memory_order_relaxed);
+        maximum_applied_.store(0, std::memory_order_relaxed);
+        overflow_events_.store(0, std::memory_order_relaxed);
+    }
+
     TraceSnapshot Snapshot(std::uint64_t sequence) const {
         if (sequence >= capacity_) {
             throw std::out_of_range("runtime trace sequence exceeds capacity");
@@ -189,7 +208,13 @@ public:
     }
 
     void Start() {
-        fsm_.Init();
+        if (active_) {
+            throw std::logic_error("StateRL session is already active");
+        }
+        if (!initialized_) {
+            fsm_.Init();
+            initialized_ = true;
+        }
         fsm_.ForceSwitch(StateName::RL, "runtime benchmark");
         active_ = true;
     }
@@ -205,8 +230,17 @@ public:
 
     void Step(float control_dt, float rl_dt) { fsm_.Step(control_dt, rl_dt); }
 
+    void ThrowIfFault() const {
+        const robot_base::FaultStatus fault = fsm_.CurrentFault();
+        if (!fault.active && !fault.latched) return;
+        throw std::runtime_error(std::string("StateRL fault: ") +
+            robot_base::FaultSourceName(fault.source) + "/" +
+            robot_base::FaultCodeName(fault.code) + ": " + fault.detail);
+    }
+
 private:
     FSM fsm_;
+    bool initialized_ = false;
     bool active_ = false;
 };
 
@@ -255,6 +289,8 @@ void PrintUsage(const char *program) {
     rl_benchmark::PrintCommonUsage(std::cerr);
     std::cerr << "  --reference-loop            ";
     std::cerr << "内存中覆盖参考动作为循环，不修改 YAML\n";
+    std::cerr << "  --restart-smoke             ";
+    std::cerr << "测量后复用同一 StateRL 对象完成一次退出和重入\n";
     std::cerr << "\n本工具运行真实 StateRL 周期路径，仅支持 --mode periodic；";
     std::cerr << "未指定 --mode 时默认 periodic。\n";
 }
@@ -269,7 +305,8 @@ bool HasOption(int argc, char *argv[], const std::string &name) {
 }
 
 Options ParseRuntimeOptions(
-    int argc, char *argv[], double default_hz, bool *reference_loop) {
+    int argc, char *argv[], double default_hz, bool *reference_loop,
+    bool *restart_smoke) {
     const bool mode_overridden = HasOption(argc, argv, "--mode");
     if (HasOption(argc, argv, "--overrun")) {
         throw std::invalid_argument(
@@ -286,6 +323,14 @@ Options ParseRuntimeOptions(
                     "--reference-loop may only be specified once");
             }
             *reference_loop = true;
+            continue;
+        }
+        if (index >= 4 && std::string(argv[index]) == "--restart-smoke") {
+            if (*restart_smoke) {
+                throw std::invalid_argument(
+                    "--restart-smoke may only be specified once");
+            }
+            *restart_smoke = true;
             continue;
         }
         common_argv.push_back(argv[index]);
@@ -378,6 +423,7 @@ void DriveUntilRelease(StateRLSession *session, RuntimeCollector *collector,
         const std::uint64_t applied_before = collector->MaximumApplied();
         session->Step(
             static_cast<float>(actual_control_dt), static_cast<float>(rl_dt));
+        session->ThrowIfFault();
         UpdateControlStats(*collector, applied_before, actual_control_dt,
             control_dt, control_samples);
         if (now > deadline) {
@@ -402,9 +448,11 @@ void DrainUntilApplied(StateRLSession *session, RuntimeCollector *collector,
         *last_control_time = now;
         const std::uint64_t applied_before = collector->MaximumApplied();
 
-        // 测量窗口的最后一次 release 后冻结推理触发累计，仅继续真实控制线程
-        // 的动作缓存消费，确保最后一个 action 在下一个控制周期被应用。
-        session->Step(0.0f, static_cast<float>(rl_dt));
+        // 测量窗口最后一次 release 后只消费动作缓存。最小正 float 保持
+        // StateRL 的周期参数契约，同时不会在排空阶段触发下一次推理。
+        session->Step(
+            std::numeric_limits<float>::epsilon(), static_cast<float>(rl_dt));
+        session->ThrowIfFault();
         UpdateControlStats(*collector, applied_before, actual_control_dt,
             control_dt, control_samples);
         if (now > deadline) {
@@ -412,6 +460,48 @@ void DrainUntilApplied(StateRLSession *session, RuntimeCollector *collector,
                 "timed out while waiting for the final StateRL action");
         }
     }
+}
+
+void RunRestartSmoke(StateRLSession *session, RuntimeCollector *collector,
+    robot_base::RobotData *robot, behavior_manager::ControlOutput *output,
+    double control_dt, double rl_dt) {
+    constexpr std::uint64_t kRestartReleases = 2;
+    collector->Reset();
+    session->Start();
+    if (!collector->RuntimeReady()) {
+        throw std::runtime_error(
+            "StateRL restart did not initialize the policy runtime");
+    }
+    session->Step(std::numeric_limits<float>::epsilon(),
+        static_cast<float>(rl_dt));
+    session->ThrowIfFault();
+    if (output->enable || collector->MaximumRelease() != 0 ||
+        collector->MaximumPublished() != 0 ||
+        collector->MaximumApplied() != 0) {
+        throw std::runtime_error(
+            "StateRL restart reused action or timing state from the prior run");
+    }
+
+    auto control_time = RLRuntimeClock::now();
+    const auto timeout = control_time +
+        std::chrono::duration_cast<RLRuntimeClock::duration>(
+            std::chrono::duration<double>(30.0));
+    ControlLoopSamples samples;
+    DriveUntilRelease(session, collector, robot, control_dt, rl_dt,
+        kRestartReleases, timeout, &control_time, &samples);
+    DrainUntilApplied(session, collector, control_dt, rl_dt,
+        kRestartReleases, timeout, &control_time, &samples);
+    if (collector->MaximumPublished() < kRestartReleases ||
+        collector->MaximumApplied() < kRestartReleases ||
+        collector->OverflowEvents() != 0) {
+        throw std::runtime_error(
+            "StateRL restart did not publish and apply fresh actions");
+    }
+    session->Stop();
+    if (output->enable) {
+        throw std::runtime_error("StateRL restart did not leave actuation disabled");
+    }
+    std::cout << "StateRL restart smoke: passed (2/2 fresh actions)\n";
 }
 
 RuntimeResult AnalyzeRuntime(const RuntimeCollector &collector,
@@ -644,8 +734,10 @@ int main(int argc, char *argv[]) {
             yaml_path, policy_name, robot_dir);
 
         bool reference_loop_override = false;
+        bool restart_smoke = false;
         Options options = ParseRuntimeOptions(
-            argc, argv, 1.0 / config.rl_dt, &reference_loop_override);
+            argc, argv, 1.0 / config.rl_dt, &reference_loop_override,
+            &restart_smoke);
         config.rl_dt = 1.0 / options.hz;
         if (reference_loop_override && !config.policy_adapter.Enabled()) {
             throw std::invalid_argument(
@@ -680,8 +772,8 @@ int main(int argc, char *argv[]) {
         config.policy.runtime.ep_profile_prefix = options.ep_profile_prefix;
         config.policy.runtime.ort_spinning = options.ort_spinning;
 
-        RuntimeCollector collector(
-            static_cast<std::size_t>(options.warmup + options.rounds));
+        RuntimeCollector collector(static_cast<std::size_t>(std::max(
+            options.warmup + options.rounds, 2)));
         config.runtime_observer = &collector;
 
         robot_base::RobotData robot = MakeSyntheticRobot(config);
@@ -789,6 +881,10 @@ int main(int argc, char *argv[]) {
         }
         const RuntimeResult result = AnalyzeRuntime(
             collector, first_measured_sequence, options.rounds, config.rl_dt);
+        if (restart_smoke) {
+            RunRestartSmoke(&session, &collector, &robot, &output,
+                control_dt, config.rl_dt);
+        }
 
         PrintStats("Control interval error", control_samples.interval_error_ms);
         PrintStats("RL release interval jitter", result.release_jitter_ms);

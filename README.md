@@ -115,7 +115,8 @@ cd ~/spacemit_robot/output/staging/bin
 
 默认按 YAML 的参考动作播放规则运行。短动作做长尾采样时可加
 `--reference-loop`，它只在 benchmark 内存配置中启用循环，不修改 YAML；输出和
-CSV 会明确记录该覆盖。
+CSV 会明确记录该覆盖。加 `--restart-smoke` 会在测量结束后复用同一个 StateRL
+对象完成一次退出、重入和两帧新动作校验，用于检查线程、动作缓存及模型状态残留。
 
 主要指标包括控制周期误差、RL release 间隔抖动、推理线程唤醒时间、推理 service
 time、release-to-publish、publish-to-apply、action age、动作更新间隔、deadline
@@ -171,9 +172,18 @@ backend 生命周期；MuJoCo 与整机硬件细节分别封装在私有 adapter
 按全零处理。SHM/UDP 使用同一版二进制协议，协议版本不匹配会拒绝数据包，
 不会静默按旧布局解析。
 
+driver 通过 `TransportBaseV2` 在机器人状态旁路发送硬件或仿真 backend 故障，不改变
+`RobotData`、`Command`、`ControlStatus` 和旧 `TransportBase` 的布局。control 会锁存
+driver、传输、安全监控和策略故障，阻止重新上电并通过 v2 状态旁路回传给 HMI；故障
+条件消失后，仍需先回到 `POWER_OFF`，再在 HMI 按 `x` 确认。活动故障不能确认，同一
+故障再次发生时会生成新的故障事件并重新进入 SAFETY。
+电机、IMU、whole_body 或 transport 反馈失效时 SAFETY 立即保持失能，不使用冻结状态
+继续渐退；只有反馈仍有效的策略故障和姿态/角速度超限才执行配置的受控卸力。
+
 ### Runtime 日志
 
-日志是 common 内部能力，不进入公开头文件，也不扩展 `RobotData` 或 SHM 协议。
+日志落盘实现是 common 内部能力，不额外扩展对外数据接口；上节所述结构化故障由
+`TransportBaseV2` 在 SHM/UDP v5 协议中与原有数据并行传递。
 机型 YAML 可按需启用：
 
 ```yaml
@@ -187,23 +197,36 @@ logging:
     max_size_mb: 32
     max_files: 3
   queue_capacity: 8192
+  artifacts:
+    - "config/hardware.yaml"
+    - "policy/policy.onnx"
   telemetry:
     enabled: true
     rate_hz: 20
     control_rate_hz: 50
     hardware_rate_hz: 100
+    timing_window_s: 5
   driver_monitor:
     enabled: true
     rate_hz: 2
 ```
 
 未配置时保留原控制行为且不落盘。启用后，每个 runtime 建立独立 session 目录：
-`events.log` 记录生命周期、FSM、策略和错误；driver 记录物理电机、虚拟关节和 IMU
-CSV；control 记录控制状态以及关节目标/反馈 CSV。`control_rate_hz` 和
+`events.log` 记录生命周期、FSM、策略和错误；`driver_timing.csv` 和
+`control_timing.csv` 记录周期、迟到和跳周期统计；`driver_motor.csv`、
+`driver_joint.csv`、`driver_imu.csv`、`driver_coupling.csv` 分别记录物理电机命令与
+反馈、统一关节反馈、IMU 接收质量和耦合机构数值状态；`control_trace.csv` 和
+`control_joint.csv` 记录控制状态及最终关节目标/反馈。`control_rate_hz` 和
 `hardware_rate_hz` 可分别提高控制与实机硬件诊断采样率，未配置时继承 `rate_hz`。
 driver 终端以固定屏限频刷新，
 不会按控制频率刷屏。落盘由有界后台队列完成，磁盘跟不上时丢弃日志并记录丢弃数，
 不会阻塞控制循环。
+
+`metadata.json` 记录启动配置、common 构建版本和工作区状态。配置中的
+`logging.artifacts` 以及运行期加载的硬件配置、仿真模型、策略模型和参考动作会登记到
+`artifacts.csv`；文件大小和 SHA256 由日志线程异步计算。CSV 写入前会检查表头、列数
+和同一流的表头一致性，格式错误只写入 `events.log`，不会污染数据文件。资产哈希使用
+独立后台队列，不会阻塞控制循环或 CSV 落盘线程。
 
 `level: debug` 且启用 telemetry 时，StateRL 还会按每次实际推理记录
 `control_policy_<策略名>.csv`。每行包含组装观测、ONNX 原始 action、策略执行器完成

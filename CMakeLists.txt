@@ -37,6 +37,32 @@ find_package(Threads REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
+set(HUMANOID_COMMON_GIT_COMMIT "unknown")
+set(HUMANOID_COMMON_GIT_DIRTY 0)
+find_package(Git QUIET)
+if(GIT_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE HUMANOID_COMMON_GIT_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} status --porcelain
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE HUMANOID_COMMON_GIT_STATUS
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(NOT HUMANOID_COMMON_GIT_COMMIT)
+        set(HUMANOID_COMMON_GIT_COMMIT "unknown")
+    endif()
+    if(HUMANOID_COMMON_GIT_STATUS)
+        set(HUMANOID_COMMON_GIT_DIRTY 1)
+    endif()
+endif()
+
 # rl 可选（找到则启用 RL 相关 target；否则跳过 behavior_manager / control_runtime / control_sim2sim_runtime / test_behavior）
 find_library(RL_LIB NAMES rl
     PATHS ${CMAKE_INSTALL_PREFIX}/lib NO_DEFAULT_PATH)
@@ -101,6 +127,10 @@ target_include_directories(robot_base
 
 target_link_libraries(robot_base
     PUBLIC  Threads::Threads yaml-cpp
+)
+target_compile_definitions(robot_base PRIVATE
+    HUMANOID_COMMON_GIT_COMMIT="${HUMANOID_COMMON_GIT_COMMIT}"
+    HUMANOID_COMMON_GIT_DIRTY=${HUMANOID_COMMON_GIT_DIRTY}
 )
 
 # ============================================================================
@@ -280,9 +310,16 @@ target_link_libraries(test_policy_command_limits PRIVATE robot_base)
 enable_testing()
 add_test(NAME policy_command_limits COMMAND test_policy_command_limits)
 
+add_executable(test_runtime_timing example/runtime/test_runtime_timing.cpp)
+target_include_directories(test_runtime_timing PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime)
+add_test(NAME runtime_timing COMMAND test_runtime_timing)
+install(TARGETS test_runtime_timing RUNTIME DESTINATION bin)
+
 add_executable(test_transport_executor example/transport_executor/test_transport_executor.cpp)
 target_include_directories(test_transport_executor PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/transport_executor
     ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/shm
 )
 target_link_libraries(test_transport_executor PRIVATE transport_executor robot_base)

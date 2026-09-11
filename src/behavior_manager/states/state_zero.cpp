@@ -41,6 +41,7 @@ public:
         max_position_error_ = std::numeric_limits<double>::infinity();
         max_position_error_index_ = 0;
         max_velocity_ = std::numeric_limits<double>::infinity();
+        max_velocity_index_ = 0;
         finished_ = false;
         feedback_valid_ = false;
         blocked_request_active_ = false;
@@ -136,6 +137,7 @@ private:
         max_position_error_ = 0.0;
         max_position_error_index_ = 0;
         max_velocity_ = 0.0;
+        max_velocity_index_ = 0;
         for (std::size_t i = 0; i < default_pos_.size(); ++i) {
             if (!std::isfinite(default_pos_[i]) ||
                 !std::isfinite(sensor_->joint_pos[i]) ||
@@ -148,8 +150,11 @@ private:
                 max_position_error_ = position_error;
                 max_position_error_index_ = i;
             }
-            max_velocity_ = std::max(max_velocity_,
-                std::abs(sensor_->joint_vel[i]));
+            const double velocity = std::abs(sensor_->joint_vel[i]);
+            if (velocity > max_velocity_) {
+                max_velocity_ = velocity;
+                max_velocity_index_ = i;
+            }
         }
         feedback_valid_ = true;
         return true;
@@ -178,6 +183,12 @@ private:
         return radians * kRadiansToDegrees;
     }
 
+    std::string JointName(std::size_t index) const {
+        return index < transition_config_.joint_names.size()
+            ? transition_config_.joint_names[index]
+            : "joint[" + std::to_string(index) + "]";
+    }
+
     std::string FormatPoseStatus() const {
         if (!feedback_valid_) return "关节反馈无效";
 
@@ -190,13 +201,14 @@ private:
 
         std::ostringstream stream;
         stream << std::fixed << std::setprecision(2)
-            << "关节[" << max_position_error_index_
-            << "]最大位置误差=" << position_error << "°"
+            << JointName(max_position_error_index_)
+            << " 位置误差=" << position_error << "°"
             << "（限值=" << position_limit << "°";
         if (position_error > position_limit) {
             stream << "，超出=" << position_error - position_limit << "°";
         }
-        stream << "），最大速度=" << velocity << "°/s"
+        stream << "），" << JointName(max_velocity_index_)
+            << " 最大速度=" << velocity << "°/s"
             << "（限值=" << velocity_limit << "°/s";
         if (velocity > velocity_limit) {
             stream << "，超出=" << velocity - velocity_limit << "°/s";
@@ -229,6 +241,7 @@ private:
     double max_position_error_ = std::numeric_limits<double>::infinity();
     std::size_t max_position_error_index_ = 0;
     double max_velocity_ = std::numeric_limits<double>::infinity();
+    std::size_t max_velocity_index_ = 0;
     bool finished_ = false;
     bool feedback_valid_ = false;
     bool blocked_request_active_ = false;

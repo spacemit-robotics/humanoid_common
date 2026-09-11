@@ -83,7 +83,8 @@ public:
                 if (command->mode != last_mode) {
                     if (command->mode == robot_base::ControlMode::RL)
                         simulator_->SetAssistEnabled(false);
-                    else if (command->mode == robot_base::ControlMode::POWER_OFF)
+                    else if (command->mode == robot_base::ControlMode::POWER_OFF ||
+                        command->mode == robot_base::ControlMode::DAMP)
                         simulator_->SetAssistEnabled(true);
                     last_mode = command->mode;
                 }

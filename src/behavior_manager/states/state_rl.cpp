@@ -39,6 +39,16 @@ public:
 
     void SetConfig(const RLConfig &cfg) { config_ = cfg; }
 
+    void PrepareRuntime() {
+        policy_adapter_.reset();
+        policy_.Init(config_.policy);
+        if (config_.policy_adapter.Enabled()) {
+            policy_adapter_ = policy_adapter::Create(
+                config_.policy_adapter, config_.policy);
+        }
+        runtime_prepared_ = true;
+    }
+
     void OnEnter() override {
         std::cout << "[StateRL] 进入 RL 控制状态（异步推理）" << std::endl;
 
@@ -56,7 +66,6 @@ public:
         }
 
         running_.store(false, std::memory_order_release);
-        policy_adapter_.reset();
         has_action_ = false;
         cached_action_.clear();
         action_sequence_ = 0;
@@ -67,8 +76,6 @@ public:
         cached_timing_ = {};
         entry_target_transition_elapsed_ = 0.0;
         infer_count_window_ = 0;
-        entered_at_ = std::chrono::steady_clock::now();
-        infer_window_start_ = entered_at_;
         time_since_last_infer_ = 0.0f;
         new_data_ready_ = false;
         policy_trace_enabled_ = false;
@@ -80,10 +87,10 @@ public:
             config_.rl_freq_hz->store(0.0, std::memory_order_relaxed);
         }
 
-        // 每次进入都重新初始化策略运行时（支持策略切换后重新加载模型）。
-        // PolicyExecutorConfig 整体透传，新增底层配置项无需在 common 逐字段同步。
+        // BehaviorManager 会在 POWER_OFF/DAMP 中预先创建运行时。直接使用 StateRL
+        // 的测试和旧调用路径仍在这里同步初始化，保持内部工厂兼容。
         try {
-            policy_.Init(config_.policy);
+            if (!runtime_prepared_) PrepareRuntime();
             ConfigurePolicyTrace();
             runtime_logging::RecordArtifact(
                 "policy_model", config_.policy_name, config_.policy.model_path);
@@ -101,11 +108,9 @@ public:
             return;
         }
 
-        // 可选策略适配器：负责参考动作、模型特殊输入和时序状态。
+        // 可选策略适配器已随策略运行时创建；进入状态时只重置时序数据。
         if (config_.policy_adapter.Enabled() && sensor_) {
             try {
-                policy_adapter_ = policy_adapter::Create(
-                    config_.policy_adapter, config_.policy);
                 policy_adapter_->Reset(*sensor_);
                 t_enter_ = std::chrono::steady_clock::now();
                 std::cout << "[StateRL] policy_adapter 启用: type="
@@ -123,6 +128,8 @@ public:
 
         // 启动推理线程（配置从 RLConfig.infer_thread_cfg 注入）
         infer_loop_ = config_.infer_thread_cfg;
+        entered_at_ = std::chrono::steady_clock::now();
+        infer_window_start_ = entered_at_;
         running_.store(true, std::memory_order_release);
         try {
             infer_loop_.Start([this] { return InferStep(); });
@@ -271,6 +278,9 @@ public:
 
     void OnExit() override {
         StopInference();
+        // 历史观测、last_action 和模型反馈状态已被本轮推理修改。下次进入必须
+        // 使用 BehaviorManager 在安全状态重新准备的新实例，兼容路径则重新 Init。
+        runtime_prepared_ = false;
         if (config_.rl_freq_hz) {
             config_.rl_freq_hz->store(0.0, std::memory_order_relaxed);
         }
@@ -283,6 +293,8 @@ public:
     }
 
 private:
+    bool runtime_prepared_ = false;
+
     void StopInference() noexcept {
         running_.store(false, std::memory_order_release);
         cv_sensor_.notify_one();
@@ -681,6 +693,13 @@ private:
 std::unique_ptr<State> CreateStateRl(const RLConfig &cfg) {
     auto s = std::make_unique<StateRL>();
     s->SetConfig(cfg);
+    return s;
+}
+
+std::unique_ptr<State> CreatePreparedStateRl(const RLConfig &cfg) {
+    auto s = std::make_unique<StateRL>();
+    s->SetConfig(cfg);
+    s->PrepareRuntime();
     return s;
 }
 

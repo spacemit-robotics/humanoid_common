@@ -147,7 +147,7 @@ HMI 的 `x` 才能清除锁存。重复收到同一条已确认的恢复状态�
 
 ### 关键设计
 
-- **异步推理：** StateRL 在独立线程执行 ONNX 推理，不阻塞主循环
+- **策略准备与异步推理：** 默认策略在 BehaviorManager 初始化时创建 ONNX runtime；退出 RL 后或在 POWER_OFF/DAMP 选择策略时，后台准备全新的策略状态，准备完成前不进入 HOME。进入 RL 后只重置时序状态并启动独立推理线程，不在控制循环内加载模型
 - **策略入场过渡：** 可按策略配置目标位置过渡；RL 增益立即生效，推理与 recurrent state 正常更新，仅在新推理结果到达时平滑目标位置
 - **通用模型 I/O：** `PolicyExecutorConfig` 整体透传给 RL 组件；多输入输出、feedback、external 等拓扑由策略 YAML `model_io` 声明，common 无需复制底层字段
 - **策略协议适配：** `policy_adapter` 是 behavior_manager 的私有子模块；机器人自由度、关节映射和自定义观测维度由机型 YAML 透传，common 不固定具体机型维度

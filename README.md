@@ -335,7 +335,7 @@ common 不固定自由度或手臂索引。
 
 - **三进程 FSM 模式**：`control_runtime` 把 `bm.CurrentState()` 透传到 `ctrl.mode`
 - **sim2sim 模式**：`control_sim2sim_runtime` 始终发 `ControlMode::RL`
-- **mujoco driver**：边沿检测 mode 变化—— `RL` → 自动取消悬挂保护，`POWER_OFF` → 自动启用悬挂；其余 mode 不主动覆盖（保留 mujoco 界面 F 键的手动权限）
+- **mujoco driver**：边沿检测 mode 变化—— `RL` → 自动取消悬挂保护，`POWER_OFF` / `DAMP` → 自动启用悬挂；其余 mode 不主动覆盖（保留 mujoco 界面 F 键的手动权限）
 - **whole_body driver**：转换为整机控制模式，并由组件本地安全门控与 watchdog 约束
 
 设计原则：跨层接口字段必须用通用语义，禁止携带某一具体后端（mujoco 悬挂等）的私有概念。

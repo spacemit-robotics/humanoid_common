@@ -32,6 +32,7 @@ struct ZeroTransitionConfig {
     double position_tolerance = 0.15;
     double velocity_tolerance = 0.10;
     double settle_duration = 0.20;
+    std::vector<std::string> joint_names;
 };
 
 enum class RLRuntimeEventType {
@@ -112,6 +113,7 @@ std::unique_ptr<State> CreateStateZero(const std::vector<double> &default_pos,
                                         const std::vector<double> &kp,
                                         const std::vector<double> &kd);
 std::unique_ptr<State> CreateStateRl(const RLConfig &cfg);
+std::unique_ptr<State> CreatePreparedStateRl(const RLConfig &cfg);
 std::unique_ptr<State> CreateStateSafety(double release_duration,
     const robot_base::FaultStatus *fault);
 

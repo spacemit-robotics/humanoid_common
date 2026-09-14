@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <future>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -122,6 +123,8 @@ ZeroTransitionConfig LoadZeroTransitionConfig(
         base + ".velocity_tolerance").value_or(0.10);
     config.settle_duration = yaml.Read<double>(
         base + ".settle_duration").value_or(0.20);
+    config.joint_names = yaml.Read<std::vector<std::string>>(
+        "robot_base.joint_names").value_or(std::vector<std::string>{});
 
     const auto positive_finite = [](double value) {
         return std::isfinite(value) && value > 0.0;
@@ -134,6 +137,40 @@ ZeroTransitionConfig LoadZeroTransitionConfig(
             "[BehaviorManager] " + base + " 到位参数无效");
     }
     return config;
+}
+
+struct PreparedPolicyStates {
+    std::string policy_name;
+    std::string model_path;
+    std::unique_ptr<State> zero;
+    std::unique_ptr<State> rl;
+};
+
+PreparedPolicyStates PreparePolicyStates(
+        const std::string &config_path,
+        const std::string &policy_name,
+        const std::string &robot_dir,
+        const robot_base::ThreadLoop &infer_thread_cfg,
+        const ZeroTransitionConfig &zero_transition_config,
+        const std::vector<double> &zero_kp,
+        const std::vector<double> &zero_kd,
+        std::atomic<double> *rl_freq_hz) {
+    RLConfig config = LoadRLStateConfig(config_path, policy_name, robot_dir);
+    config.infer_thread_cfg = infer_thread_cfg;
+    config.rl_freq_hz = rl_freq_hz;
+
+    const auto &effective_zero_pos = config.zero_target_pos.empty()
+        ? config.policy.rl_default_pos : config.zero_target_pos;
+    const auto &effective_zero_kp = zero_kp.empty() ? config.kp : zero_kp;
+    const auto &effective_zero_kd = zero_kd.empty() ? config.kd : zero_kd;
+
+    PreparedPolicyStates result;
+    result.policy_name = policy_name;
+    result.model_path = config.policy.model_path;
+    result.zero = CreateStateZero(effective_zero_pos,
+        zero_transition_config, effective_zero_kp, effective_zero_kd);
+    result.rl = CreatePreparedStateRl(config);
+    return result;
 }
 
 }  // namespace
@@ -184,6 +221,101 @@ public:
     // 边沿检测（control_runtime 每帧重发缓存 cmd，需要识别真实的"用户新请求"）
     std::string prev_switch_policy;          // 上一帧 cmd.switch_policy
     StateName prev_fsm_state = StateName::POWER_OFF;  // 上一帧 FSM 状态
+
+    std::future<PreparedPolicyStates> policy_prepare_future;
+    std::string preparing_policy;
+    bool policy_prepare_active = false;
+    bool policy_prepare_failed = false;
+    bool policy_runtime_ready = false;
+    bool policy_prepare_block_reported = false;
+
+    bool RequestedPolicyReady() const {
+        return policy_runtime_ready && pending_policy == active_policy &&
+            !policy_prepare_active;
+    }
+
+    void StartPolicyPreparation(const std::string &policy_name) {
+        if (policy_prepare_active || policy_name.empty()) return;
+
+        const std::string path = config_path;
+        const std::string directory = robot_dir;
+        const robot_base::ThreadLoop thread_config = infer_thread_cfg;
+        const ZeroTransitionConfig transition_config = zero_transition_config;
+        const std::vector<double> kp = zero_kp;
+        const std::vector<double> kd = zero_kd;
+        std::atomic<double> *frequency = &rl_freq_hz;
+
+        preparing_policy = policy_name;
+        policy_prepare_failed = false;
+        policy_prepare_active = true;
+        std::cout << "[BehaviorManager] 后台准备 RL 策略: "
+            << policy_name << std::endl;
+        runtime_logging::Log(runtime_logging::Level::kInfo,
+            "preparing RL policy runtime: " + policy_name, false);
+        try {
+            policy_prepare_future = std::async(std::launch::async,
+                [path, policy_name, directory, thread_config,
+                    transition_config, kp, kd, frequency] {
+                    return PreparePolicyStates(path, policy_name, directory,
+                        thread_config, transition_config, kp, kd, frequency);
+                });
+        } catch (...) {
+            policy_prepare_active = false;
+            throw;
+        }
+    }
+
+    void InstallPreparedPolicy(PreparedPolicyStates states) {
+        fsm.ReplaceState(StateName::ZERO, std::move(states.zero));
+        fsm.ReplaceState(StateName::RL, std::move(states.rl));
+        active_policy = states.policy_name;
+        policy_runtime_ready = true;
+        policy_prepare_failed = false;
+        policy_prepare_block_reported = false;
+        prerequisite_timer = 0.0;
+        std::cout << "[BehaviorManager] RL 策略已准备: " << active_policy
+            << " (" << states.model_path << ")" << std::endl;
+        runtime_logging::Log(runtime_logging::Level::kInfo,
+            "RL policy runtime prepared: " + active_policy + " (" +
+                states.model_path + ")",
+            false);
+    }
+
+    void PollPolicyPreparation() {
+        if (!policy_prepare_active ||
+            policy_prepare_future.wait_for(std::chrono::seconds(0)) !=
+                std::future_status::ready) {
+            return;
+        }
+
+        const std::string completed_policy = preparing_policy;
+        policy_prepare_active = false;
+        preparing_policy.clear();
+        try {
+            PreparedPolicyStates states = policy_prepare_future.get();
+            if (states.policy_name != pending_policy) {
+                std::cout << "[BehaviorManager] 丢弃已过期的策略准备结果: "
+                    << states.policy_name << std::endl;
+                return;
+            }
+            InstallPreparedPolicy(std::move(states));
+        } catch (const std::exception &error) {
+            std::cerr << "[BehaviorManager] RL 策略准备失败: "
+                << completed_policy << ": " << error.what() << std::endl;
+            runtime_logging::Log(runtime_logging::Level::kError,
+                "RL policy runtime preparation failed: " + completed_policy +
+                    ": " + error.what(),
+                false);
+            if (completed_policy != active_policy) {
+                pending_policy = active_policy;
+                final_target_policy.clear();
+                waiting_prerequisite = false;
+                policy_prepare_failed = false;
+            } else {
+                policy_prepare_failed = true;
+            }
+        }
+    }
 
     robot_base::FaultStatus MakeFault(robot_base::FaultSource source,
             robot_base::FaultCode code, const std::string &detail,
@@ -530,11 +662,12 @@ public:
                 CreateStateZero(effective_zero_pos, zero_transition_config,
                                 effective_zero_kp, effective_zero_kd));
 
-            fsm.AddState(StateName::RL, CreateStateRl(rc));
+            fsm.AddState(StateName::RL, CreatePreparedStateRl(rc));
             has_rl = true;
 
-            std::cout << "[BehaviorManager] RL 状态: 已加载 (" << rc.policy.model_path << ")"
-                    << std::endl;
+            policy_runtime_ready = true;
+            std::cout << "[BehaviorManager] RL 策略已准备 ("
+                    << rc.policy.model_path << ")" << std::endl;
 
             // 解析所有策略的可选 prerequisite 子节点，构建策略链 map
             auto policy_names = yaml_file.Read<std::vector<std::string>>(
@@ -593,6 +726,7 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
         impl_->ObserveFault(state_fault_before_step);
     }
     impl_->ResolveObservedFaults();
+    impl_->PollPolicyPreparation();
 
     StateName current = impl_->fsm.CurrentState();
     if (impl_->fault.latched && current != StateName::POWER_OFF &&
@@ -613,8 +747,42 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
         }
     }
 
-    // 策略切换：pending_policy 由 SetCommand（POWER_OFF/DAMP 直切）或前置链调度（RL 中到期自动切）触发
-    if (impl_->has_rl && impl_->pending_policy != impl_->active_policy) {
+    const bool policy_preparation_state =
+        current == StateName::POWER_OFF || current == StateName::DAMP;
+    if (impl_->has_rl && policy_preparation_state &&
+        !impl_->RequestedPolicyReady() && !impl_->policy_prepare_active &&
+        !impl_->policy_prepare_failed) {
+        try {
+            impl_->StartPolicyPreparation(impl_->pending_policy);
+        } catch (const std::exception &error) {
+            impl_->policy_prepare_failed = true;
+            std::cerr << "[BehaviorManager] 无法启动 RL 策略准备: "
+                << error.what() << std::endl;
+            runtime_logging::Log(runtime_logging::Level::kError,
+                std::string("failed to start RL policy preparation: ") +
+                    error.what(),
+                false);
+        }
+    }
+    if (impl_->has_rl && current == StateName::DAMP &&
+        impl_->command.key == 4 && !impl_->RequestedPolicyReady()) {
+        impl_->command.key = 0;
+        if (!impl_->policy_prepare_block_reported) {
+            const std::string detail = impl_->policy_prepare_failed
+                ? "RL policy runtime is unavailable"
+                : "RL policy runtime is still being prepared";
+            std::cout << "[BehaviorManager] RL 策略尚未准备完成，暂不进入 HOME"
+                << std::endl;
+            runtime_logging::Log(
+                runtime_logging::Level::kWarning, detail, false);
+            impl_->policy_prepare_block_reported = true;
+        }
+    }
+
+    // 现有前置策略链会在 RL 内设置 pending_policy。该路径保持原行为；本次只把
+    // POWER_OFF/DAMP 中选定策略的模型加载移出控制循环。
+    if (impl_->has_rl && current == StateName::RL &&
+        impl_->pending_policy != impl_->active_policy) {
         try {
             RLConfig rc = LoadRLStateConfig(
                 impl_->config_path, impl_->pending_policy, impl_->robot_dir);
@@ -636,6 +804,7 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
             impl_->fsm.ReplaceState(StateName::RL, CreateStateRl(rc));
 
             impl_->active_policy = impl_->pending_policy;
+            impl_->policy_runtime_ready = true;
             impl_->prerequisite_timer = 0.0;  // 切换后重置计时（仅前置策略生效时再启用）
             std::cout << "[BehaviorManager] 策略已切换: " << impl_->active_policy << " ("
                     << rc.policy.model_path << ")" << std::endl;
@@ -670,6 +839,11 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
 
     // 前置策略链调度：仅在 RL 状态累计时长，到期后设置 pending_policy = final_target
     StateName cur = impl_->fsm.CurrentState();
+    if (impl_->prev_fsm_state == StateName::RL && cur != StateName::RL) {
+        impl_->policy_runtime_ready = false;
+        impl_->policy_prepare_failed = false;
+        impl_->policy_prepare_block_reported = false;
+    }
     if (impl_->waiting_prerequisite && cur == StateName::RL) {
         impl_->prerequisite_timer += control_dt;
         auto it = impl_->prerequisite_map.find(impl_->final_target_policy);
@@ -741,6 +915,8 @@ void BehaviorManagerClass::SetCommand(const robot_base::Command &cmd) {
         impl_->waiting_prerequisite = false;
         impl_->prerequisite_timer = 0.0;
     }
+    impl_->policy_prepare_failed = false;
+    impl_->policy_prepare_block_reported = false;
 }
 
 void BehaviorManagerClass::AcknowledgeFault(uint64_t sequence) {

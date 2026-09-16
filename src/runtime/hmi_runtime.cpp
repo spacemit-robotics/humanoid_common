@@ -186,6 +186,7 @@ struct HmiConfig {
 struct UiConfig {
     HmiConfig hmi;
     std::vector<std::string> policies;
+    std::vector<std::string> manual_reference_policies;
     runtime_config::PolicyCommandLimitMap command_limits;
     int default_policy_idx = 0;
 };
@@ -205,6 +206,20 @@ UiConfig LoadUiConfig(const std::string &yaml_path) {
         if (it != config.policies.end()) {
             config.default_policy_idx = static_cast<int>(
                 std::distance(config.policies.begin(), it));
+        }
+    }
+
+    for (const auto &policy : config.policies) {
+        const std::string policy_base =
+            "rl_policy.onnx_infer.policies." + policy;
+        auto start_mode = yaml.Read<std::string>(
+            policy_base + ".policy_adapter.start_mode");
+        if (!start_mode) {
+            start_mode = yaml.Read<std::string>(
+                policy_base + ".tracker.start_mode");
+        }
+        if (start_mode && *start_mode == "manual") {
+            config.manual_reference_policies.push_back(policy);
         }
     }
 
@@ -265,11 +280,15 @@ struct UiState {
     robot_base::Command target_command;
     PendingTransition transition;
     std::vector<std::string> policies;
+    std::vector<std::string> manual_reference_policies;
     runtime_config::PolicyCommandLimitMap command_limits;
     int active_policy_idx = 0;
     int policy_cursor_idx = 0;
     std::string pending_policy;
     uint64_t fault_ack_sequence = 0;
+    bool reference_start_pulse = false;
+    bool reference_start_requested = false;
+    Clock::time_point reference_start_until{};
     std::string policy_source;
     Clock::time_point policy_requested_at{};
     std::string last_action = "等待 Control 状态回传";
@@ -277,6 +296,12 @@ struct UiState {
     int highlighted_key = -1;
     Clock::time_point highlight_until{};
 };
+
+bool IsManualReferencePolicy(const UiState &state) {
+    return std::find(state.manual_reference_policies.begin(),
+        state.manual_reference_policies.end(), state.status.active_policy) !=
+        state.manual_reference_policies.end();
+}
 
 const runtime_config::PolicyCommandLimits *ActiveCommandLimits(
         const UiState &state) {
@@ -414,6 +439,13 @@ void RenderMainPage(const UiState &state) {
         SetFg(Color::BRIGHT_RED);
         SetBold();
         printf("SAFETY 正在卸力；等待 Control 自动回到 POWER_OFF");
+    } else if (state.status_online && state.status.mode == ControlMode::RL &&
+        IsManualReferencePolicy(state)) {
+        SetFg(state.reference_start_requested ?
+            Color::BRIGHT_GREEN : Color::BRIGHT_YELLOW);
+        printf("%s", state.reference_start_requested ?
+            "开始命令已发送；未动作可再次按 [G]" :
+            "RL 已接管，等待人工确认    [G] 开始动作");
     } else {
         SetDim();
         printf("← 后退；→ 前进；从 RL 按 ← 直接退回 DAMP");
@@ -467,7 +499,7 @@ void RenderMainPage(const UiState &state) {
     printf(" POWER_OFF    [Space] 速度清零    [Ctrl+C] 退出");
     MoveTo(20, layout.content_left);
     SetDim();
-    printf("兼容快捷键: o=DAMP  z=ZERO  r=RL  x=故障确认");
+    printf("[G] 手动动作    快捷: o=DAMP z=ZERO r=RL x=故障确认");
     ResetAttr();
 
     PrintLastAction(layout, 22, state.last_action);
@@ -656,7 +688,8 @@ void ZeroVelocity(UiState *state) {
 
 robot_base::Command BuildCommand(const UiState &state) {
     robot_base::Command command = state.target_command;
-    command.key = state.transition.active ? state.transition.key : 0;
+    command.key = state.transition.active ? state.transition.key :
+        (state.reference_start_pulse ? robot_base::kCommandStartReference : 0);
     command.switch_policy = state.pending_policy;
     return command;
 }
@@ -699,6 +732,8 @@ bool RequestTransition(UiState *state, ControlMode target, int key,
         return false;
     }
 
+    state->reference_start_pulse = false;
+    state->reference_start_requested = false;
     state->transition.active = true;
     state->transition.source = state->status.mode;
     state->transition.target = target;
@@ -706,6 +741,23 @@ bool RequestTransition(UiState *state, ControlMode target, int key,
     state->transition.requested_at = now;
     state->last_action = std::string("请求 ") + ModeName(state->status.mode)
         + " → " + ModeName(target) + "，等待 Control 确认";
+    return true;
+}
+
+bool RequestReferenceStart(UiState *state, const Clock::time_point &now) {
+    if (!state->status_online || !state->status.hmi_connected ||
+        state->fault.latched || state->status.mode != ControlMode::RL ||
+        state->transition.active || !state->pending_policy.empty() ||
+        !IsManualReferencePolicy(*state)) {
+        state->last_action =
+            "开始请求未发送：仅手动参考策略在 RL 且链路正常时可用";
+        return false;
+    }
+
+    state->reference_start_pulse = true;
+    state->reference_start_requested = true;
+    state->reference_start_until = now + std::chrono::milliseconds(250);
+    state->last_action = "开始参考动作命令已发送";
     return true;
 }
 
@@ -845,11 +897,21 @@ void ProcessStatus(UiState *state, const robot_base::ControlStatus &status,
         const robot_base::FaultStatus &fault, const Clock::time_point &now,
         bool *send_immediately) {
     const uint64_t previous_fault_sequence = state->fault.sequence;
+    const auto previous_mode = state->status.mode;
+    const std::string previous_policy = state->status.active_policy;
     state->status = status;
     state->fault = fault;
     state->has_status = true;
     state->last_status_at = now;
     UpdateActivePolicy(state);
+
+    if (status.mode != ControlMode::RL ||
+        (state->has_status && (previous_mode != status.mode ||
+            previous_policy != status.active_policy))) {
+        if (state->reference_start_pulse) *send_immediately = true;
+        state->reference_start_pulse = false;
+        state->reference_start_requested = false;
+    }
 
     if (fault.latched && fault.sequence != previous_fault_sequence) {
         state->last_action = std::string("故障: ") +
@@ -955,6 +1017,7 @@ int main(int argc, char *argv[]) {
 
     UiState state;
     state.policies = config.policies;
+    state.manual_reference_policies = config.manual_reference_policies;
     state.command_limits = config.command_limits;
     state.active_policy_idx = config.default_policy_idx;
     state.policy_cursor_idx = config.default_policy_idx;
@@ -997,6 +1060,8 @@ int main(int argc, char *argv[]) {
                 state.transition.active = false;
                 state.pending_policy.clear();
                 state.fault_ack_sequence = 0;
+                state.reference_start_pulse = false;
+                state.reference_start_requested = false;
                 ZeroVelocity(&state);
                 if (state.page == HmiPage::VELOCITY) state.page = HmiPage::MAIN;
                 state.last_action = "Control 状态回传超时，速度已清零";
@@ -1025,6 +1090,12 @@ int main(int argc, char *argv[]) {
 
         if (state.highlighted_key >= 0 && now >= state.highlight_until) {
             state.highlighted_key = -1;
+            dirty = true;
+        }
+        if (state.reference_start_pulse &&
+            now >= state.reference_start_until) {
+            state.reference_start_pulse = false;
+            send_immediately = true;
             dirty = true;
         }
 
@@ -1136,7 +1207,10 @@ int main(int argc, char *argv[]) {
                         config.hmi.key_highlight_ms);
                 }
             } else {
-                if (key == kKeyLeft) {
+                if (key == 'g') {
+                    send_immediately = RequestReferenceStart(&state, now) ||
+                        send_immediately;
+                } else if (key == kKeyLeft) {
                     send_immediately = RequestByArrow(&state, false, now) ||
                         send_immediately;
                 } else if (key == kKeyRight) {
@@ -1207,6 +1281,8 @@ int main(int argc, char *argv[]) {
     state.transition.key = -1;
     state.pending_policy.clear();
     state.fault_ack_sequence = 0;
+    state.reference_start_pulse = false;
+    state.reference_start_requested = false;
     ZeroVelocity(&state);
     (void)SendCommand(transport.get(), &state);
     runtime_logging::Log(

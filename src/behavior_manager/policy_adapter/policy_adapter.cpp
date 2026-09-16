@@ -157,6 +157,8 @@ public:
 
     void Reset(const robot_base::RobotData &robot) override {
         reference_sample_ready_ = false;
+        playback_start_elapsed_ = 0.0;
+        playback_started_ = !config_.manual_start;
         if (!config_.anchor_yaw_align) {
             heading_offset_ = Eigen::Quaternionf::Identity();
             return;
@@ -168,11 +170,22 @@ public:
         heading_offset_.normalize();
     }
 
+    bool StartPlayback(double elapsed_s) override {
+        if (!config_.manual_start || playback_started_ ||
+            !std::isfinite(elapsed_s) || elapsed_s < 0.0) {
+            return false;
+        }
+        playback_start_elapsed_ = elapsed_s;
+        playback_started_ = true;
+        return true;
+    }
+
     void PrepareInputs(const robot_base::RobotData &robot,
         double elapsed_s,
         rl_policy::PolicyExecutor &policy) override {
-        const PlaybackSample sample =
-            SamplePlayback(elapsed_s, num_frames_, config_);
+        const bool waiting = config_.manual_start && !playback_started_;
+        const PlaybackSample sample = waiting ? PlaybackSample{} :
+            SamplePlayback(elapsed_s - playback_start_elapsed_, num_frames_, config_);
         const Eigen::VectorXf &pos0 = reference_joint_pos_[sample.frame0];
         const Eigen::VectorXf &pos1 = reference_joint_pos_[sample.frame1];
         const Eigen::VectorXf &vel0 = reference_joint_vel_[sample.frame0];
@@ -182,7 +195,7 @@ public:
             motion_command_[joint] =
                 (1.0F - sample.alpha) * pos0[joint] +
                 sample.alpha * pos1[joint];
-            motion_command_[joint_dim_ + joint] = sample.hold_last_frame
+            motion_command_[joint_dim_ + joint] = (waiting || sample.hold_last_frame)
                 ? 0.0F
                 : static_cast<float>(config_.playback_speed) *
                     ((1.0F - sample.alpha) * vel0[joint] +
@@ -458,6 +471,8 @@ private:
     std::array<float, 6> anchor_ori_body_ = {};
     int action_dim_ = 0;
     bool reference_sample_ready_ = false;
+    bool playback_started_ = true;
+    double playback_start_elapsed_ = 0.0;
     std::vector<ReferenceActionBinding> reference_action_bindings_;
 };
 
@@ -1012,6 +1027,13 @@ Config LoadConfig(const std::string &yaml_path,
             yaml.Read<bool>(adapter_base + ".loop").value_or(false);
         config.loop_pause = yaml.Read<double>(
             adapter_base + ".loop_pause").value_or(0.0);
+        const auto start_mode = yaml.Read<std::string>(
+            adapter_base + ".start_mode").value_or("auto");
+        if (start_mode != "auto" && start_mode != "manual") {
+            throw std::runtime_error(
+                "[policy_adapter] start_mode 必须为 auto 或 manual");
+        }
+        config.manual_start = start_mode == "manual";
         config.anchor_body_index = yaml.Read<int>(
             adapter_base + ".anchor_body_index").value_or(-1);
         config.anchor_waist_joint_indices = yaml.Read<std::vector<int>>(
@@ -1069,6 +1091,11 @@ std::unique_ptr<PolicyAdapter> Create(
     const rl_policy::PolicyExecutorConfig &policy_config) {
     if (!config.Enabled()) {
         return nullptr;
+    }
+    if (config.manual_start && config.type != "mjlab" &&
+        config.type != "mjlab_tracking") {
+        throw std::runtime_error(
+            "[policy_adapter] manual start 当前仅支持 MJLab 参考播放");
     }
     if (config.type == "mjlab" || config.type == "mjlab_tracking") {
         return std::make_unique<MjlabPolicyAdapter>(config, policy_config);

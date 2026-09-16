@@ -374,6 +374,75 @@ void TestMjlabReferenceActionYaml() {
         "未加载 reference_action.residual_clip");
 }
 
+void TestManualReferencePlayback() {
+    const TempNpzReference reference;
+    Config config;
+    config.type = "mjlab";
+    config.reference_file = reference.Path().string();
+    config.anchor_body_index = 0;
+    config.manual_start = true;
+    // 测试夹具借用 reference_action 读回当前采样位置。
+    config.reference_action.joint_indices = {0, 1};
+    auto policy_config = MakeTwoDofPolicyConfig();
+    policy_config.action_scale = {1.0};
+    auto adapter = Create(config, policy_config);
+    const auto robot = MakeTwoDofRobot();
+    rl_policy::PolicyExecutor policy;
+    auto check_position = [&](double elapsed, double position) {
+        adapter->PrepareInputs(robot, elapsed, policy);
+        std::vector<double> action(2, 0.0);
+        adapter->OnAction(action);
+        Require(std::abs(action[1] - position) < 1.0e-6,
+            "手动参考播放位置不符");
+    };
+
+    adapter->Reset(robot);
+    check_position(0.0, 0.1);
+    check_position(100.0, 0.1);
+    Require(!adapter->StartPlayback(-1.0), "接受了负开始时间");
+    Require(adapter->StartPlayback(100.0), "首次开始失败");
+    Require(!adapter->StartPlayback(101.0), "重复开始重置了参考时钟");
+    check_position(100.01, 0.15);
+    check_position(101.0, 0.2);
+    adapter->Reset(robot);
+    check_position(200.0, 0.1);
+
+    config.manual_start = false;
+    adapter = Create(config, policy_config);
+    adapter->Reset(robot);
+    Require(!adapter->StartPlayback(10.0), "自动策略接受了手动开始");
+    check_position(0.01, 0.15);
+
+    for (const std::string mode : {"auto", "manual", "invalid"}) {
+        const TempReference yaml("manual_start_config",
+            "rl_policy:\n  onnx_infer:\n    policies:\n      probe:\n"
+            "        policy_adapter:\n          type: mjlab\n"
+            "          reference_file: motion.npz\n          start_mode: " + mode + "\n");
+        bool rejected = false;
+        try {
+            const auto parsed = LoadConfig(
+                yaml.Path().string(), "probe", "/tmp");
+            Require(parsed.manual_start == (mode == "manual"),
+                "start_mode 解析错误");
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        Require(rejected == (mode == "invalid"),
+            "start_mode 非法值校验错误");
+    }
+
+    config.type = "sonic";
+    config.manual_start = true;
+    bool rejected = false;
+    try {
+        (void)Create(config, policy_config);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    Require(rejected, "未拒绝不支持手动开始的适配器");
+    std::cout << "manual reference playback: PASS" << std::endl;
+}
+
 void TestSonicReferenceAndConfig() {
     constexpr int kTestJointCount = 7;
     const TempSonicReference reference(kTestJointCount);
@@ -580,6 +649,7 @@ int main(int argc, char **argv) {
         TestMjlabZip64AndUnicodeMetadata();
         TestMjlabReferenceResidualAction();
         TestMjlabReferenceActionYaml();
+        TestManualReferencePlayback();
         TestSonicReferenceAndConfig();
         TestSonicPrepareInputs();
         if (argc == 4) {

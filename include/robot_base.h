@@ -233,8 +233,10 @@ void NormalizeQuat(std::array<double, 4> &quat);
  *
  * 统一的行为控制指令，用于 HMI → control → behavior_manager 全链路传递。
  */
+constexpr int kCommandStartReference = 5;
+
 struct Command {
-    int key = 0;  ///< 状态切换指令（1=DAMP, 2=ZERO, 3=RL, 4=HOME, -1=POWER_OFF）
+    int key = 0;  ///< 按键指令（1-4/-1 切换状态，5 开始手动参考动作）
     float vx = 0.0f;            ///< 前进速度 (m/s)
     float vy = 0.0f;            ///< 横向速度 (m/s)
     float wz = 0.0f;            ///< 旋转角速度 (rad/s)

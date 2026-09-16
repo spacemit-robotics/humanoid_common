@@ -208,7 +208,7 @@ inline bool ValidControlModeValue(int8_t value) {
 }
 
 inline bool ValidCommandKey(int32_t key) {
-    return key == -1 || (key >= 0 && key <= 4);
+    return key == -1 || (key >= 0 && key <= robot_base::kCommandStartReference);
 }
 
 inline bool ValidFaultPacket(const FaultPacket &source) {

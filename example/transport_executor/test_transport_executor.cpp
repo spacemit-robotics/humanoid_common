@@ -133,6 +133,9 @@ bool TestPacketValidation() {
     hmi.key = 0;
     hmi.vx = std::numeric_limits<float>::quiet_NaN();
     if (transport::ValidHmiCmdPacket(hmi)) return false;
+    hmi.vx = 0.0F;
+    hmi.interaction_operation = 127;
+    if (transport::ValidHmiCmdPacket(hmi)) return false;
 
     transport::RobotStatePacket state{};
     state.header.type = static_cast<uint16_t>(transport::MsgType::ROBOT_STATE);
@@ -157,6 +160,9 @@ bool TestPacketValidation() {
     status.header.type = static_cast<uint16_t>(transport::MsgType::CONTROL_STATUS);
     if (!transport::ValidControlStatusPacket(status)) return false;
     status.hmi_connected = 2;
+    if (transport::ValidControlStatusPacket(status)) return false;
+    status.hmi_connected = 0;
+    status.interaction_request_accepted = 2;
     if (transport::ValidControlStatusPacket(status)) return false;
 
     transport::FaultPacket fault{};
@@ -183,7 +189,7 @@ bool TestPacketValidation() {
     long_fault.detail = std::string("invalid\0detail", 14);
     if (transport::CanEncodeFault(long_fault)) return false;
 
-    std::cout << "[test] V5 packet validation: PASS\n";
+    std::cout << "[test] V6 packet validation: PASS\n";
     return true;
 }
 
@@ -398,6 +404,10 @@ int main(int argc, char *argv[]) {
     hmi_cmd.vx = 0.5f;
     hmi_cmd.vy = 0.1f;
     hmi_cmd.wz = 0.2f;
+    hmi_cmd.interaction.sequence = 7;
+    hmi_cmd.interaction.operation =
+        robot_base::InteractionRequest::Operation::START;
+    hmi_cmd.interaction.action = "wave";
 
     if (!hmi->SendCommandV2(hmi_cmd, 42)) {
         std::cerr << "[test] 合法 HMI 命令发送失败\n";
@@ -412,6 +422,10 @@ int main(int argc, char *argv[]) {
                 << ", vy=" << recv_hmi.vy << ", wz=" << recv_hmi.wz << "\n";
         bool ok = (recv_hmi.key == 3) &&
             (std::abs(recv_hmi.vx - 0.5f) < 1e-4f) &&
+            recv_hmi.interaction.sequence == 7 &&
+            recv_hmi.interaction.operation ==
+                robot_base::InteractionRequest::Operation::START &&
+            recv_hmi.interaction.action == "wave" &&
             recv_fault_ack_sequence == 42;
         all_ok = all_ok && ok;
         std::cout << "[test] 命令数据验证: " << (ok ? "通过" : "失败") << "\n";
@@ -425,6 +439,11 @@ int main(int argc, char *argv[]) {
     bool invalid_hmi_rejected = !hmi->SendCommandV2(invalid_hmi_cmd, 0);
     invalid_hmi_cmd = hmi_cmd;
     invalid_hmi_cmd.switch_policy.assign(transport::kPolicyNameLength, 'x');
+    invalid_hmi_rejected = !hmi->SendCommandV2(invalid_hmi_cmd, 0) &&
+        invalid_hmi_rejected;
+    invalid_hmi_cmd = hmi_cmd;
+    invalid_hmi_cmd.interaction.action.assign(
+        transport::kInteractionNameLength, 'x');
     invalid_hmi_rejected = !hmi->SendCommandV2(invalid_hmi_cmd, 0) &&
         invalid_hmi_rejected;
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -462,6 +481,12 @@ int main(int argc, char *argv[]) {
     status.wz = 0.2f;
     status.rl_frequency_hz = 49.8f;
     status.active_policy = "test_policy";
+    status.interaction.sequence = 7;
+    status.interaction.request_accepted = true;
+    status.interaction.phase =
+        robot_base::InteractionStatus::Phase::PLAYING;
+    status.interaction.progress = 0.4F;
+    status.interaction.action = "wave";
     robot_base::FaultStatus status_fault;
     status_fault.latched = true;
     status_fault.source = robot_base::FaultSource::POLICY;
@@ -485,6 +510,13 @@ int main(int argc, char *argv[]) {
         recv_status.hmi_connected &&
         std::abs(recv_status.vx - status.vx) < 1e-4f &&
         recv_status.active_policy == status.active_policy &&
+        recv_status.interaction.sequence == status.interaction.sequence &&
+        recv_status.interaction.request_accepted ==
+            status.interaction.request_accepted &&
+        recv_status.interaction.phase == status.interaction.phase &&
+        std::abs(recv_status.interaction.progress -
+            status.interaction.progress) < 1.0e-4F &&
+        recv_status.interaction.action == status.interaction.action &&
         recv_status_fault.latched &&
         recv_status_fault.source == status_fault.source &&
         recv_status_fault.code == status_fault.code &&
@@ -502,6 +534,10 @@ int main(int argc, char *argv[]) {
     bool invalid_status_rejected = !control->SendStatusV2(invalid_status, status_fault);
     invalid_status = status;
     invalid_status.active_policy.assign(transport::kPolicyNameLength, 'x');
+    invalid_status_rejected = !control->SendStatusV2(invalid_status, status_fault) &&
+        invalid_status_rejected;
+    invalid_status = status;
+    invalid_status.interaction.progress = 1.5F;
     invalid_status_rejected = !control->SendStatusV2(invalid_status, status_fault) &&
         invalid_status_rejected;
     std::this_thread::sleep_for(std::chrono::milliseconds(10));

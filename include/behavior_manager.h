@@ -134,6 +134,11 @@ public:
     robot_base::FaultStatus CurrentFault() const;
 
     /**
+     * @brief 获取当前 RL 内部交互动作状态
+     */
+    robot_base::InteractionStatus CurrentInteractionStatus() const;
+
+    /**
      * @brief 是否正在运行
      */
     bool IsRunning() const;

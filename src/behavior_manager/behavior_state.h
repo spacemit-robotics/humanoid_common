@@ -34,6 +34,10 @@ public:
     virtual bool ReadyForRl() const { return false; }
     // 当前状态内部产生的安全故障（仅故障状态覆盖）
     virtual robot_base::FaultStatus CurrentFault() const { return {}; }
+    // 当前 RL 内部交互动作状态（其余状态返回 IDLE）
+    virtual robot_base::InteractionStatus CurrentInteractionStatus() const {
+        return {};
+    }
 
     StateName name;
 

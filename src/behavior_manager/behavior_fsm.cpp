@@ -117,6 +117,11 @@ robot_base::FaultStatus FSM::CurrentFault() const {
     return current_ ? current_->CurrentFault() : robot_base::FaultStatus{};
 }
 
+robot_base::InteractionStatus FSM::CurrentInteractionStatus() const {
+    return current_ ? current_->CurrentInteractionStatus()
+        : robot_base::InteractionStatus{};
+}
+
 void FSM::SwitchTo(StateName target) {
     auto it = states_.find(target);
     if (it == states_.end()) {

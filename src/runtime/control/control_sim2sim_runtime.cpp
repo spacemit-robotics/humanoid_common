@@ -2,7 +2,7 @@
  * Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * @file control_sim2sim_demo.cpp
+ * @file control_sim2sim_runtime.cpp
  * @brief 简化 sim2sim 控制演示程序（不经过 behavior FSM）
  *
  * 该程序是 control_demo 的精简版本：

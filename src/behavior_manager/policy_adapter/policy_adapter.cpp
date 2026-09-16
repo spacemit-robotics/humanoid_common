@@ -8,6 +8,8 @@
 
 #include "policy_adapter.h"
 
+#include "joint_trajectory_policy_adapter.h"
+
 #include <cnpy.h>
 
 #include <Eigen/Geometry>
@@ -1017,6 +1019,55 @@ Config LoadConfig(const std::string &yaml_path,
     }
     if (type) {
         config.type = *type;
+        if (config.type == "joint_trajectory") {
+            const std::string catalog_base = yaml.Read<std::string>(
+                adapter_base + ".catalog").value_or(adapter_base);
+            auto &trajectory = config.joint_trajectory;
+            trajectory.applied_action_term = yaml.Read<std::string>(
+                adapter_base + ".applied_action_term").value_or(
+                    "applied_action");
+            trajectory.blend_in_duration = yaml.Read<double>(
+                adapter_base + ".blend_in_duration").value_or(
+                    yaml.Read<double>(catalog_base + ".blend_in_duration")
+                        .value_or(0.25));
+            trajectory.blend_out_duration = yaml.Read<double>(
+                adapter_base + ".blend_out_duration").value_or(
+                    yaml.Read<double>(catalog_base + ".blend_out_duration")
+                        .value_or(0.25));
+            const double default_fps = yaml.Read<double>(
+                catalog_base + ".motion_fps").value_or(50.0);
+            const double default_speed = yaml.Read<double>(
+                catalog_base + ".playback_speed").value_or(1.0);
+            const bool default_hold = yaml.Read<bool>(
+                catalog_base + ".hold_last_frame").value_or(false);
+            const auto action_names = yaml.Read<std::vector<std::string>>(
+                catalog_base + ".action_names")
+                    .value_or(std::vector<std::string>{});
+            for (const auto &name : action_names) {
+                const std::string action_base =
+                    catalog_base + ".actions." + name;
+                JointTrajectoryActionConfig action;
+                action.name = name;
+                const auto file = yaml.Read<std::string>(
+                    action_base + ".file");
+                if (!file || file->empty()) {
+                    throw std::runtime_error(
+                        "[policy_adapter] 缺少 " + action_base + ".file");
+                }
+                action.file = ResolvePath(robot_dir, *file).string();
+                action.joint_indices = yaml.Read<std::vector<int>>(
+                    action_base + ".joint_indices")
+                        .value_or(std::vector<int>{});
+                action.motion_fps = yaml.Read<double>(
+                    action_base + ".motion_fps").value_or(default_fps);
+                action.playback_speed = yaml.Read<double>(
+                    action_base + ".playback_speed").value_or(default_speed);
+                action.hold_last_frame = yaml.Read<bool>(
+                    action_base + ".hold_last_frame").value_or(default_hold);
+                trajectory.actions.push_back(std::move(action));
+            }
+            return config;
+        }
         config.reference_file =
             ReadReferenceField(yaml, adapter_base, robot_dir);
         config.motion_fps =
@@ -1096,6 +1147,13 @@ std::unique_ptr<PolicyAdapter> Create(
         config.type != "mjlab_tracking") {
         throw std::runtime_error(
             "[policy_adapter] manual start 当前仅支持 MJLab 参考播放");
+    }
+    if (config.type == "joint_trajectory") {
+        if (config.reference_action.Enabled()) {
+            throw std::runtime_error(
+                "[policy_adapter] joint_trajectory 不支持 reference_action");
+        }
+        return CreateJointTrajectoryPolicyAdapter(config, policy_config);
     }
     if (config.type == "mjlab" || config.type == "mjlab_tracking") {
         return std::make_unique<MjlabPolicyAdapter>(config, policy_config);

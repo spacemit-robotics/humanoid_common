@@ -301,6 +301,7 @@ policy_adapter:
   playback_speed: 1.0
   loop: false
   loop_pause: 0.0
+  start_mode: auto           # auto / manual；manual 在 RL 中按 G 后开始
   anchor_body_index: 0
   anchor_waist_joint_indices: []
   anchor_yaw_align: true
@@ -323,6 +324,10 @@ policy_adapter:
 策略若配置
 `zero_target_pos`，ZERO 阶段先过渡到参考动作起始姿态。非循环动作播放完成后
 保持末帧，状态切换仍由 HMI/control 负责。
+
+MJLab 策略可配置 `start_mode: manual`。进入 RL 后策略继续按实时状态推理，但参考
+输入保持第 0 帧且参考速度为零；HMI 按 `G` 后开始时间轴。开始命令复用现有按键
+通道，不改变 SHM/UDP v5 数据包布局；未收到命令时保持等待，可再次按 `G`。
 
 MJLab 的 `reference_action` 未配置时保持标准策略行为。配置后，仅列出的机器人
 关节使用 `参考关节角 + residual_scale * clip(原始模型 action)`；其余关节仍按

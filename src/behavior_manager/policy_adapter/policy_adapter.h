@@ -43,6 +43,7 @@ struct Config {
     double playback_speed = 1.0;
     bool loop = false;
     double loop_pause = 0.0;
+    bool manual_start = false;
 
     int anchor_body_index = -1;
     std::vector<int> anchor_waist_joint_indices;
@@ -86,6 +87,9 @@ public:
      * action。PolicyExecutor 内部状态不受改写影响。
      */
     virtual void OnAction(std::vector<double> &action) {}
+
+    /** @brief 开始手动参考时间轴；重复请求不会重新计时。 */
+    virtual bool StartPlayback(double elapsed_s) { return false; }
 
     /** @brief 适配器类型，用于日志 */
     virtual const char *Type() const = 0;

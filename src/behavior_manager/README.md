@@ -115,6 +115,7 @@ cd ~/spacemit_robot
 - `rl_policy.onnx_infer.policies.<name>.entry_target_transition_duration`（可选）：进入 RL 后的目标位置过渡时间，默认 `0`
 - `rl_policy.onnx_infer.policies.<name>.prerequisite.policy / .duration`（可选）：进入目标策略前运行的策略及持续时间
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter`（可选）：参考动作和特殊模型输入适配；支持 `mjlab`、`protomotions`、`sonic`
+- `rl_policy.onnx_infer.policies.<name>.policy_adapter.start_mode`（MJLab 可选）：`auto`（默认）或 `manual`；手动模式进入 RL 后保持参考首帧，按 `G` 开始
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.reference_action`（MJLab 可选）：指定采用参考动作与残差合成的关节
 - `rl_policy.onnx_infer.policies.<name>.command.limits`（可选）：应用层声明该策略接受的 `min_vx/max_vx/min_vy/max_vy/min_wz/max_wz`；未配置 `min_*` 时默认为对应的 `-max_*`，整个 limits 未配置时 HMI 和 Control 均拒绝速度命令
 - `behavior_manager.damp_kd`：阻尼状态 kd（≈ policy kd / 5）

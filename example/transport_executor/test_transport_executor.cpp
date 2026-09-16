@@ -126,6 +126,11 @@ bool TestPacketValidation() {
     transport::HmiCmdPacket hmi{};
     hmi.header.type = static_cast<uint16_t>(transport::MsgType::HMI_CMD);
     if (!transport::ValidHmiCmdPacket(hmi)) return false;
+    hmi.key = robot_base::kCommandStartReference;
+    if (!transport::ValidHmiCmdPacket(hmi)) return false;
+    hmi.key += 1;
+    if (transport::ValidHmiCmdPacket(hmi)) return false;
+    hmi.key = 0;
     hmi.vx = std::numeric_limits<float>::quiet_NaN();
     if (transport::ValidHmiCmdPacket(hmi)) return false;
 

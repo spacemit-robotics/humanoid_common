@@ -66,6 +66,7 @@ public:
         }
 
         running_.store(false, std::memory_order_release);
+        start_reference_requested_.store(false, std::memory_order_release);
         has_action_ = false;
         cached_action_.clear();
         action_sequence_ = 0;
@@ -164,6 +165,10 @@ public:
         }
 
         // 基于控制循环时间的推理触发机制
+        if (command_->key == robot_base::kCommandStartReference) {
+            start_reference_requested_.store(true, std::memory_order_release);
+            command_->key = 0;
+        }
         time_since_last_infer_ += control_dt;
         if (time_since_last_infer_ >= rl_dt) {
             // 保留余数但丢弃已错过的整周期，避免连续追赶补发。
@@ -383,6 +388,12 @@ private:
             if (policy_adapter_) {
                 const auto elapsed = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t_enter_).count();
+                if (start_reference_requested_.exchange(
+                        false, std::memory_order_acq_rel) &&
+                    policy_adapter_->StartPlayback(elapsed)) {
+                    runtime_logging::Log(runtime_logging::Level::kInfo,
+                        "manual reference playback started", false);
+                }
                 robot_base::RobotData snapshot;
                 snapshot.num_dof = static_cast<int>(joint_pos.size());
                 snapshot.base_pos = base_pos;
@@ -481,6 +492,7 @@ private:
     // 策略输入协议适配器（policy_adapter.type 为空则不启用）
     std::unique_ptr<policy_adapter::PolicyAdapter> policy_adapter_;
     std::chrono::steady_clock::time_point t_enter_;
+    std::atomic<bool> start_reference_requested_{false};
 
     // 推理频率统计（推理线程内读写）
     int infer_count_window_ = 0;

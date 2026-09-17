@@ -38,9 +38,10 @@ namespace transport {
 // ==================== 协议常量 ====================
 
 static constexpr uint32_t kMagic = 0x484D5253;  ///< "HMRS" 魔数
-static constexpr uint16_t kVersion = 5;         ///< 协议版本
+static constexpr uint16_t kVersion = 6;         ///< 协议版本
 static constexpr int kMaxDof = 64;              ///< 最大自由度数
 static constexpr std::size_t kPolicyNameLength = 64;
+static constexpr std::size_t kInteractionNameLength = 64;
 static constexpr std::size_t kFaultDetailLength = 160;
 
 // ==================== 消息类型 ====================
@@ -89,6 +90,9 @@ struct HmiCmdPacket {
     float wz = 0.0f;
     uint64_t acknowledge_fault_sequence = 0;
     char switch_policy[kPolicyNameLength] = {};  ///< 策略切换请求，空字符串表示无切换
+    uint64_t interaction_sequence = 0;
+    uint8_t interaction_operation = 0;
+    char interaction_action[kInteractionNameLength] = {};
 };
 
 /**
@@ -146,6 +150,11 @@ struct ControlStatusPacket {
     float wz = 0.0f;
     float rl_frequency_hz = 0.0f;
     char active_policy[kPolicyNameLength] = {};
+    uint64_t interaction_sequence = 0;
+    uint8_t interaction_request_accepted = 0;
+    uint8_t interaction_phase = 0;
+    float interaction_progress = 0.0f;
+    char interaction_action[kInteractionNameLength] = {};
     FaultPacket fault{};
 };
 
@@ -194,6 +203,12 @@ inline bool HasNullTerminator(const char (&text)[Size]) {
     return std::find(std::begin(text), std::end(text), '\0') != std::end(text);
 }
 
+template <size_t Size>
+inline std::string DecodeText(const char (&source)[Size]) {
+    const auto end = std::find(std::begin(source), std::end(source), '\0');
+    return std::string(source, end);
+}
+
 inline bool ValidControlModeValue(int8_t value) {
     switch (static_cast<robot_base::ControlMode>(value)) {
     case robot_base::ControlMode::POWER_OFF:
@@ -209,6 +224,64 @@ inline bool ValidControlModeValue(int8_t value) {
 
 inline bool ValidCommandKey(int32_t key) {
     return key == -1 || (key >= 0 && key <= robot_base::kCommandStartReference);
+}
+
+inline bool ValidInteractionOperationValue(uint8_t value) {
+    using Operation = robot_base::InteractionRequest::Operation;
+    switch (static_cast<Operation>(value)) {
+    case Operation::NONE:
+    case Operation::START:
+    case Operation::CANCEL:
+        return true;
+    }
+    return false;
+}
+
+inline bool ValidInteractionPhaseValue(uint8_t value) {
+    using Phase = robot_base::InteractionStatus::Phase;
+    switch (static_cast<Phase>(value)) {
+    case Phase::IDLE:
+    case Phase::BLEND_IN:
+    case Phase::PLAYING:
+    case Phase::HOLDING:
+    case Phase::BLEND_OUT:
+    case Phase::FINISHED:
+    case Phase::REJECTED:
+        return true;
+    }
+    return false;
+}
+
+inline bool CanEncodeInteractionRequest(
+        const robot_base::InteractionRequest &request) {
+    if (!ValidInteractionOperationValue(
+            static_cast<uint8_t>(request.operation)) ||
+        request.action.size() >= kInteractionNameLength ||
+        request.action.find('\0') != std::string::npos) {
+        return false;
+    }
+    if (request.operation == robot_base::InteractionRequest::Operation::START) {
+        return request.sequence != 0 && !request.action.empty();
+    }
+    if (request.operation == robot_base::InteractionRequest::Operation::CANCEL) {
+        return request.sequence != 0 && request.action.empty();
+    }
+    return request.action.empty();
+}
+
+inline bool CanEncodeInteractionStatus(
+        const robot_base::InteractionStatus &status) {
+    if (!ValidInteractionPhaseValue(static_cast<uint8_t>(status.phase)) ||
+        !std::isfinite(status.progress) || status.progress < 0.0F ||
+        status.progress > 1.0F ||
+        status.action.size() >= kInteractionNameLength ||
+        status.action.find('\0') != std::string::npos) {
+        return false;
+    }
+    if (status.phase == robot_base::InteractionStatus::Phase::IDLE) {
+        return status.action.empty();
+    }
+    return status.sequence != 0 && !status.action.empty();
 }
 
 inline bool ValidFaultPacket(const FaultPacket &source) {
@@ -310,7 +383,9 @@ inline bool CanEncodeControl(const robot_base::ControlCmd &command) {
 inline bool CanEncodeCommand(const robot_base::Command &command) {
     return ValidCommandKey(command.key) && std::isfinite(command.vx) &&
         std::isfinite(command.vy) && std::isfinite(command.wz) &&
-        command.switch_policy.size() < kPolicyNameLength;
+        command.switch_policy.size() < kPolicyNameLength &&
+        command.switch_policy.find('\0') == std::string::npos &&
+        CanEncodeInteractionRequest(command.interaction);
 }
 
 inline bool CanEncodeStatus(const robot_base::ControlStatus &status,
@@ -320,6 +395,8 @@ inline bool CanEncodeStatus(const robot_base::ControlStatus &status,
         std::isfinite(status.wz) && std::isfinite(status.rl_frequency_hz) &&
         status.rl_frequency_hz >= 0.0f &&
         status.active_policy.size() < kPolicyNameLength &&
+        status.active_policy.find('\0') == std::string::npos &&
+        CanEncodeInteractionStatus(status.interaction) &&
         CanEncodeFault(fault);
 }
 
@@ -327,7 +404,14 @@ inline bool ValidHmiCmdPacket(const HmiCmdPacket &packet) {
     return ValidHeader(packet.header, MsgType::HMI_CMD) &&
         ValidCommandKey(packet.key) && std::isfinite(packet.vx) &&
         std::isfinite(packet.vy) && std::isfinite(packet.wz) &&
-        HasNullTerminator(packet.switch_policy);
+        HasNullTerminator(packet.switch_policy) &&
+        ValidInteractionOperationValue(packet.interaction_operation) &&
+        HasNullTerminator(packet.interaction_action) &&
+        CanEncodeInteractionRequest({
+            packet.interaction_sequence,
+            static_cast<robot_base::InteractionRequest::Operation>(
+                packet.interaction_operation),
+            DecodeText(packet.interaction_action)});
 }
 
 inline bool ValidRobotStatePacket(const RobotStatePacket &packet) {
@@ -376,6 +460,17 @@ inline bool ValidControlStatusPacket(const ControlStatusPacket &packet) {
         std::isfinite(packet.vx) && std::isfinite(packet.vy) &&
         std::isfinite(packet.wz) && std::isfinite(packet.rl_frequency_hz) &&
         packet.rl_frequency_hz >= 0.0f && HasNullTerminator(packet.active_policy) &&
+        packet.interaction_request_accepted <= 1 &&
+        ValidInteractionPhaseValue(packet.interaction_phase) &&
+        std::isfinite(packet.interaction_progress) &&
+        HasNullTerminator(packet.interaction_action) &&
+        CanEncodeInteractionStatus({
+            packet.interaction_sequence,
+            packet.interaction_request_accepted != 0,
+            static_cast<robot_base::InteractionStatus::Phase>(
+                packet.interaction_phase),
+            packet.interaction_progress,
+            DecodeText(packet.interaction_action)}) &&
         ValidFaultPacket(packet.fault);
 }
 
@@ -411,12 +506,6 @@ inline bool DecodeFault(
         std::begin(source.detail), std::end(source.detail), '\0');
     destination->detail.assign(source.detail, detail_end);
     return true;
-}
-
-template <size_t Size>
-inline std::string DecodeText(const char (&source)[Size]) {
-    const auto end = std::find(std::begin(source), std::end(source), '\0');
-    return std::string(source, end);
 }
 
 }  // namespace transport

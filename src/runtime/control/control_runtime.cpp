@@ -2,7 +2,7 @@
  * Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * @file control_demo.cpp
+ * @file control_runtime.cpp
  * @brief 主要控制演示程序
  *
  * 该程序是应用层的核心控制循环，集成 behavior_manager 模块实现机器人行为状态机管理。
@@ -348,6 +348,8 @@ int main(int argc, char *argv[]) {
         const bool hmi_connected = has_hmi &&
             std::chrono::duration<double>(now - last_hmi_time).count()
                 <= hmi_command_timeout;
+        const bool hmi_just_disconnected =
+            previous_hmi_connected && !hmi_connected;
         if (hmi_connected != previous_hmi_connected) {
             runtime_logging::Log(
                 hmi_connected ? runtime_logging::Level::kInfo
@@ -364,6 +366,15 @@ int main(int argc, char *argv[]) {
             cmd.vy = 0.0f;
             cmd.wz = 0.0f;
             cmd.switch_policy.clear();
+            if (hmi_just_disconnected) {
+                ++cmd.interaction.sequence;
+                if (cmd.interaction.sequence == 0) {
+                    ++cmd.interaction.sequence;
+                }
+                cmd.interaction.operation =
+                    robot_base::InteractionRequest::Operation::CANCEL;
+                cmd.interaction.action.clear();
+            }
             fault_ack_sequence = 0;
         }
         if (bm.CurrentState() == behavior_manager::StateName::RL) {
@@ -491,6 +502,7 @@ int main(int argc, char *argv[]) {
             status.wz = cmd.wz;
             status.rl_frequency_hz = static_cast<float>(bm.GetRlFreq());
             status.active_policy = bm.CurrentPolicyName();
+            status.interaction = bm.CurrentInteractionStatus();
             const bool sent = transport->SendStatusV2(status, bm.CurrentFault());
             if (!sent && !status_send_failed) {
                 runtime_logging::Log(runtime_logging::Level::kWarning,

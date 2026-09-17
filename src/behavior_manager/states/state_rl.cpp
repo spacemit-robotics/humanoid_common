@@ -64,6 +64,10 @@ public:
             std::lock_guard<std::mutex> lock(mutex_fault_);
             fault_ = {};
         }
+        {
+            std::lock_guard<std::mutex> lock(mutex_interaction_status_);
+            interaction_status_ = {};
+        }
 
         running_.store(false, std::memory_order_release);
         start_reference_requested_.store(false, std::memory_order_release);
@@ -84,6 +88,8 @@ public:
         policy_apply_trace_stream_.clear();
         policy_trace_header_.clear();
         policy_apply_trace_header_.clear();
+        entry_interaction_sequence_ = command_
+            ? command_->interaction.sequence : 0;
         if (config_.rl_freq_hz) {
             config_.rl_freq_hz->store(0.0, std::memory_order_relaxed);
         }
@@ -98,6 +104,11 @@ public:
             if (!config_.policy_adapter.reference_file.empty()) {
                 runtime_logging::RecordArtifact("policy_reference",
                     config_.policy_name, config_.policy_adapter.reference_file);
+            }
+            for (const auto &action :
+                    config_.policy_adapter.joint_trajectory.actions) {
+                runtime_logging::RecordArtifact(
+                    "interaction_action", action.name, action.file);
             }
             if (config_.runtime_observer) {
                 config_.runtime_observer->OnRuntimeInitialized(
@@ -195,6 +206,12 @@ public:
                 sample_cmd_vx_ = command_->vx;
                 sample_cmd_vy_ = command_->vy;
                 sample_cmd_wz_ = command_->wz;
+                sample_interaction_request_ = command_->interaction;
+                if (sample_interaction_request_.sequence ==
+                        entry_interaction_sequence_) {
+                    sample_interaction_request_.operation =
+                        robot_base::InteractionRequest::Operation::NONE;
+                }
                 sample_rl_dt_ = rl_dt;
                 new_data_ready_ = true;
             }
@@ -297,6 +314,11 @@ public:
         return fault_;
     }
 
+    robot_base::InteractionStatus CurrentInteractionStatus() const override {
+        std::lock_guard<std::mutex> lock(mutex_interaction_status_);
+        return interaction_status_;
+    }
+
 private:
     bool runtime_prepared_ = false;
 
@@ -341,6 +363,7 @@ private:
         std::array<double, 4> base_quat;
         std::vector<double> joint_pos, joint_vel;
         double cmd_vx, cmd_vy, cmd_wz;
+        robot_base::InteractionRequest interaction_request;
         double device_time;
         float rl_dt;
         std::uint64_t release_sequence = 0;
@@ -374,6 +397,7 @@ private:
             cmd_vx = sample_cmd_vx_;
             cmd_vy = sample_cmd_vy_;
             cmd_wz = sample_cmd_wz_;
+            interaction_request = sample_interaction_request_;
             rl_dt = sample_rl_dt_;
         }
         NotifyRuntimeEvent(RLRuntimeEventType::INFERENCE_START,
@@ -394,6 +418,8 @@ private:
                     runtime_logging::Log(runtime_logging::Level::kInfo,
                         "manual reference playback started", false);
                 }
+                policy_adapter_->HandleInteractionRequest(
+                    interaction_request, elapsed);
                 robot_base::RobotData snapshot;
                 snapshot.num_dof = static_cast<int>(joint_pos.size());
                 snapshot.base_pos = base_pos;
@@ -427,6 +453,11 @@ private:
                 policy_.Infer(obs, action);
             }
             if (policy_adapter_) policy_adapter_->OnAction(action);
+            if (policy_adapter_) {
+                std::lock_guard<std::mutex> lock(mutex_interaction_status_);
+                interaction_status_ =
+                    policy_adapter_->GetInteractionStatus();
+            }
         } catch (const std::exception &error) {
             if (!running_.load(std::memory_order_acquire)) return false;
             ReportFault(robot_base::FaultCode::INTERNAL_ERROR,
@@ -488,6 +519,8 @@ private:
     std::atomic<bool> safety_triggered_{false};
     mutable std::mutex mutex_fault_;
     robot_base::FaultStatus fault_;
+    mutable std::mutex mutex_interaction_status_;
+    robot_base::InteractionStatus interaction_status_;
 
     // 策略输入协议适配器（policy_adapter.type 为空则不启用）
     std::unique_ptr<policy_adapter::PolicyAdapter> policy_adapter_;
@@ -518,6 +551,8 @@ private:
     double sample_cmd_vx_ = 0;
     double sample_cmd_vy_ = 0;
     double sample_cmd_wz_ = 0;
+    robot_base::InteractionRequest sample_interaction_request_;
+    uint64_t entry_interaction_sequence_ = 0;
     float sample_rl_dt_ = 0.02f;
 
     // 动作缓存（推理线程写，主线程读）

@@ -957,6 +957,11 @@ robot_base::FaultStatus BehaviorManagerClass::CurrentFault() const {
     return impl_->fault;
 }
 
+robot_base::InteractionStatus
+BehaviorManagerClass::CurrentInteractionStatus() const {
+    return impl_->fsm.CurrentInteractionStatus();
+}
+
 bool BehaviorManagerClass::IsRunning() const {
     return impl_->initialized;
 }

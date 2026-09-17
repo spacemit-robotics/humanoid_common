@@ -68,6 +68,15 @@ const char kSonicReferenceProbeOnnx[] =
     "ZmVyZW5jZV9vYnMSDwoNCAESCQoCCAEKAwjiDVoVCgNvYnMSDgoMCAESCAoCCAEKAggDYhgK"
     "BmFjdGlvbhIOCgwIARIICgIIAQoCCB1CBAoAEA0";
 
+// NumPy float32 [[1.2, -0.6], [1.4, -0.4]], stored in column-major order.
+const char kColumnMajorJointTrajectoryNpz[] =
+    "UEsDBBQAAAAAAAAAIQDr+0TZkAAAAJAAAAANABQAam9pbnRfcG9zLm5weQEAEACQAAAAAAAA"
+    "AJAAAAAAAAAAk05VTVBZAQB2AHsnZGVzY3InOiAnPGY0JywgJ2ZvcnRyYW5fb3JkZXInOiBU"
+    "cnVlLCAnc2hhcGUnOiAoMiwgMiksIH0gICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI"
+    "CAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIAqamZk/MzOzP5qZGb/NzMy+UEsBAhQDFA"
+    "AAAAAAAAAhAOv7RNmQAAAAkAAAAA0AAAAAAAAAAAAAAIABAAAAAGpvaW50X3Bvcy5ucHlQSwUG"
+    "AAAAAAEAAQA7AAAAzwAAAAAA";
+
 std::vector<unsigned char> DecodeBase64(const std::string &encoded) {
     static const char kAlphabet[] =
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -136,6 +145,43 @@ public:
     }
 
     ~TempNpzReference() {
+        std::error_code error;
+        fs::remove(path_, error);
+    }
+
+    const fs::path &Path() const { return path_; }
+
+private:
+    fs::path path_;
+};
+
+class TempJointTrajectory {
+public:
+    explicit TempJointTrajectory(bool column_major = false) {
+        const auto nonce = std::chrono::steady_clock::now()
+            .time_since_epoch().count();
+        path_ = fs::temp_directory_path() /
+            ("joint_trajectory_" + std::to_string(nonce) + ".npz");
+        if (column_major) {
+            const auto bytes = DecodeBase64(kColumnMajorJointTrajectoryNpz);
+            std::ofstream output(path_, std::ios::binary);
+            output.write(reinterpret_cast<const char *>(bytes.data()),
+                static_cast<std::streamsize>(bytes.size()));
+            if (!output) {
+                throw std::runtime_error("无法写入列优先 NPZ 参考动作");
+            }
+            return;
+        }
+        const std::vector<float> joint_pos = {
+            1.2F, -0.6F,
+            1.4F, -0.4F,
+        };
+        const std::vector<std::size_t> shape = {2, 2};
+        cnpy::npz_save(path_.string(), "joint_pos",
+            joint_pos.data(), shape, "w");
+    }
+
+    ~TempJointTrajectory() {
         std::error_code error;
         fs::remove(path_, error);
     }
@@ -553,6 +599,199 @@ void TestSonicPrepareInputs() {
     }
 }
 
+void TestJointTrajectoryTakeover(bool column_major = false) {
+    const TempJointTrajectory trajectory(column_major);
+    Config config;
+    config.type = "joint_trajectory";
+    config.joint_trajectory.applied_action_term = "applied_action";
+    config.joint_trajectory.blend_in_duration = 0.0;
+    config.joint_trajectory.blend_out_duration = 0.0;
+    behavior_manager::policy_adapter::JointTrajectoryActionConfig action_config;
+    action_config.name = "wave";
+    action_config.file = trajectory.Path().string();
+    action_config.joint_indices = {1, 3};
+    action_config.motion_fps = 50.0;
+    action_config.hold_last_frame = true;
+    config.joint_trajectory.actions.push_back(action_config);
+
+    rl_policy::PolicyExecutorConfig policy_config;
+    policy_config.rl_default_pos = {0.0, 0.2, 0.0, -0.1};
+    policy_config.action_joint_index = {0, 1, 2, 3};
+    policy_config.action_scale = {1.0, 2.0, 1.0, 0.5};
+    auto adapter = Create(config, policy_config);
+    Require(adapter && std::string(adapter->Type()) == "joint_trajectory",
+        "未创建 joint_trajectory adapter");
+
+    robot_base::RobotData robot;
+    robot.num_dof = 4;
+    robot.joint_pos = policy_config.rl_default_pos;
+    robot.joint_vel.assign(4, 0.0);
+    adapter->Reset(robot);
+    robot_base::InteractionRequest request;
+    request.sequence = 1;
+    request.operation = robot_base::InteractionRequest::Operation::START;
+    request.action = "wave";
+    adapter->HandleInteractionRequest(request, 0.0);
+
+    rl_policy::PolicyExecutor policy;
+    std::vector<double> policy_action = {0.1, 0.2, 0.3, 0.4};
+    adapter->PrepareInputs(robot, 0.0, policy);
+    adapter->OnAction(policy_action);
+    Require(std::abs(policy_action[0] - 0.1) < 1.0e-9 &&
+            std::abs(policy_action[2] - 0.3) < 1.0e-9,
+        "joint_trajectory 改写了未接管关节");
+    Require(std::abs(policy_action[1] - 0.5) < 1.0e-6 &&
+            std::abs(policy_action[3] + 1.0) < 1.0e-6,
+        "joint_trajectory 首帧目标换算错误");
+
+    adapter->PrepareInputs(robot, 0.01, policy);
+    adapter->OnAction(policy_action);
+    Require(std::abs(policy_action[1] - 0.55) < 1.0e-6 &&
+            std::abs(policy_action[3] + 0.8) < 1.0e-6,
+        "joint_trajectory 帧间插值错误");
+
+    policy_action = {0.11, 0.22, 0.33, 0.44};
+    adapter->PrepareInputs(robot, 0.02, policy);
+    adapter->OnAction(policy_action);
+    Require(std::abs(policy_action[1] - 0.6) < 1.0e-6 &&
+            std::abs(policy_action[3] + 0.6) < 1.0e-6,
+        "joint_trajectory 插值或末帧保持错误");
+    Require(adapter->GetInteractionStatus().phase ==
+            robot_base::InteractionStatus::Phase::HOLDING &&
+            adapter->GetInteractionStatus().request_accepted,
+        "joint_trajectory 未进入 HOLDING");
+
+    request.sequence = 2;
+    request.operation = robot_base::InteractionRequest::Operation::START;
+    request.action = "wave";
+    adapter->HandleInteractionRequest(request, 0.025);
+    Require(adapter->GetInteractionStatus().sequence == 2 &&
+            !adapter->GetInteractionStatus().request_accepted &&
+            adapter->GetInteractionStatus().phase ==
+                robot_base::InteractionStatus::Phase::HOLDING,
+        "joint_trajectory 未明确拒绝执行中的重复 START");
+
+    request.sequence = 3;
+    request.operation = robot_base::InteractionRequest::Operation::CANCEL;
+    request.action.clear();
+    adapter->HandleInteractionRequest(request, 0.03);
+    policy_action = {0.12, 0.23, 0.34, 0.45};
+    adapter->PrepareInputs(robot, 0.03, policy);
+    adapter->OnAction(policy_action);
+    Require(std::abs(policy_action[1] - 0.23) < 1.0e-9 &&
+            std::abs(policy_action[3] - 0.45) < 1.0e-9 &&
+            adapter->GetInteractionStatus().phase ==
+                robot_base::InteractionStatus::Phase::FINISHED,
+        "joint_trajectory 未平滑交还策略控制权");
+
+    const TempReference yaml("joint_trajectory_yaml",
+        "interaction_catalog:\n"
+        "  action_names: [wave]\n"
+        "  motion_fps: 50\n"
+        "  actions:\n"
+        "    wave:\n"
+        "      file: " + trajectory.Path().string() + "\n"
+        "      joint_indices: [1, 3]\n"
+        "rl_policy:\n"
+        "  onnx_infer:\n"
+        "    policies:\n"
+        "      stand:\n"
+        "        policy_adapter:\n"
+        "          type: joint_trajectory\n"
+        "          catalog: interaction_catalog\n"
+        "          applied_action_term: applied_action\n");
+    const auto loaded = LoadConfig(yaml.Path().string(), "stand",
+        fs::temp_directory_path().string());
+    Require(loaded.joint_trajectory.actions.size() == 1 &&
+            loaded.joint_trajectory.actions[0].name == "wave" &&
+            loaded.joint_trajectory.actions[0].joint_indices ==
+                std::vector<int>({1, 3}),
+        "joint_trajectory YAML catalog 加载错误");
+}
+
+void TestJointTrajectoryBlendAndCancel() {
+    const TempJointTrajectory trajectory;
+    Config config;
+    config.type = "joint_trajectory";
+    config.joint_trajectory.applied_action_term = "applied_action";
+    config.joint_trajectory.blend_in_duration = 0.2;
+    config.joint_trajectory.blend_out_duration = 0.2;
+    behavior_manager::policy_adapter::JointTrajectoryActionConfig action_config;
+    action_config.name = "wave";
+    action_config.file = trajectory.Path().string();
+    action_config.joint_indices = {1, 3};
+    action_config.motion_fps = 50.0;
+    config.joint_trajectory.actions.push_back(action_config);
+
+    rl_policy::PolicyExecutorConfig policy_config;
+    policy_config.rl_default_pos = {0.0, 0.2, 0.0, -0.1};
+    policy_config.action_joint_index = {0, 1, 2, 3};
+    policy_config.action_scale = {1.0, 2.0, 1.0, 0.5};
+    auto adapter = Create(config, policy_config);
+
+    robot_base::RobotData robot;
+    robot.num_dof = 4;
+    robot.joint_pos = policy_config.rl_default_pos;
+    robot.joint_vel.assign(4, 0.0);
+    adapter->Reset(robot);
+    rl_policy::PolicyExecutor policy;
+
+    const std::vector<double> policy_action = {0.1, 0.2, 0.3, 0.4};
+    auto action = policy_action;
+    adapter->PrepareInputs(robot, 0.0, policy);
+    adapter->OnAction(action);
+
+    robot_base::InteractionRequest request;
+    request.sequence = 1;
+    request.operation = robot_base::InteractionRequest::Operation::START;
+    request.action = "wave";
+    adapter->HandleInteractionRequest(request, 1.0);
+
+    action = policy_action;
+    adapter->PrepareInputs(robot, 1.0, policy);
+    adapter->OnAction(action);
+    Require(std::abs(action[1] - 0.2) < 1.0e-9 &&
+            std::abs(action[3] - 0.4) < 1.0e-9,
+        "joint_trajectory blend-in 起点未保持策略输出");
+
+    action = policy_action;
+    adapter->PrepareInputs(robot, 1.1, policy);
+    adapter->OnAction(action);
+    Require(std::abs(action[1] - 0.35) < 1.0e-6 &&
+            std::abs(action[3] + 0.3) < 1.0e-6,
+        "joint_trajectory blend-in 中点错误");
+
+    action = policy_action;
+    adapter->PrepareInputs(robot, 1.21, policy);
+    adapter->OnAction(action);
+    Require(std::abs(action[0] - policy_action[0]) < 1.0e-9 &&
+            std::abs(action[2] - policy_action[2]) < 1.0e-9 &&
+            std::abs(action[1] - 0.55) < 1.0e-6 &&
+            std::abs(action[3] + 0.8) < 1.0e-6,
+        "joint_trajectory blend-in 后的轨迹插值错误");
+
+    request.sequence = 2;
+    request.operation = robot_base::InteractionRequest::Operation::CANCEL;
+    request.action.clear();
+    adapter->HandleInteractionRequest(request, 1.21);
+
+    action = policy_action;
+    adapter->PrepareInputs(robot, 1.31, policy);
+    adapter->OnAction(action);
+    Require(std::abs(action[1] - 0.375) < 1.0e-6 &&
+            std::abs(action[3] + 0.2) < 1.0e-6,
+        "joint_trajectory blend-out 中点错误");
+
+    action = policy_action;
+    adapter->PrepareInputs(robot, 1.41, policy);
+    adapter->OnAction(action);
+    Require(std::abs(action[1] - policy_action[1]) < 1.0e-9 &&
+            std::abs(action[3] - policy_action[3]) < 1.0e-9 &&
+            adapter->GetInteractionStatus().phase ==
+                robot_base::InteractionStatus::Phase::FINISHED,
+        "joint_trajectory blend-out 未平滑交还策略控制权");
+}
+
 void TestConfiguredPolicy(const std::string &yaml_path,
     const std::string &robot_dir,
     const std::string &policy_name) {
@@ -627,12 +866,67 @@ void TestConfiguredPolicy(const std::string &yaml_path,
         Require(max_reference_error < 1.0e-5,
             "reference_action 最终关节目标与训练公式不一致");
     }
+    double max_interaction_error = 0.0;
+    std::size_t interaction_frames_checked = 0;
+    if (adapter_config.joint_trajectory.Enabled()) {
+        std::vector<double> policy_only_target;
+        policy.MapActionToTargetPos(raw_action, policy_only_target);
+        for (const auto &clip_config :
+                adapter_config.joint_trajectory.actions) {
+            adapter->Reset(robot);
+            robot_base::InteractionRequest request;
+            request.sequence = 1;
+            request.operation =
+                robot_base::InteractionRequest::Operation::START;
+            request.action = clip_config.name;
+            adapter->HandleInteractionRequest(request, 0.0);
+
+            const auto positions =
+                cnpy::npz_load(clip_config.file, "joint_pos");
+            for (std::size_t frame = 0; frame < positions.shape[0]; ++frame) {
+                const double sample_time =
+                    adapter_config.joint_trajectory.blend_in_duration +
+                    frame / (clip_config.motion_fps *
+                        clip_config.playback_speed);
+                adapter->PrepareInputs(robot, sample_time, policy);
+                auto interaction_action = raw_action;
+                adapter->OnAction(interaction_action);
+                policy.MapActionToTargetPos(interaction_action, target_pos);
+                std::vector<bool> overridden(target_pos.size(), false);
+                for (std::size_t column = 0;
+                    column < clip_config.joint_indices.size(); ++column) {
+                    const int joint = clip_config.joint_indices[column];
+                    overridden[joint] = true;
+                    const std::size_t offset = positions.fortran_order
+                        ? column * positions.shape[0] + frame
+                        : frame * positions.shape[1] + column;
+                    const double expected = positions.word_size == sizeof(float)
+                        ? static_cast<double>(positions.data<float>()[offset])
+                        : positions.data<double>()[offset];
+                    max_interaction_error = std::max(max_interaction_error,
+                        std::abs(target_pos[joint] - expected));
+                }
+                for (std::size_t joint = 0; joint < target_pos.size(); ++joint) {
+                    if (!overridden[joint]) {
+                        Require(std::abs(target_pos[joint] -
+                                policy_only_target[joint]) < 1.0e-9,
+                            "joint_trajectory 改写了未接管关节");
+                    }
+                }
+                ++interaction_frames_checked;
+            }
+        }
+        Require(max_interaction_error < 1.0e-5,
+            "joint_trajectory 最终关节目标与轨迹不一致");
+    }
     std::cout << "已验证策略配置: " << policy_name
         << ", type=" << adapter->Type()
         << ", robot_dof=" << robot.num_dof
         << ", obs=" << observation.size()
         << ", action=" << raw_action.size()
         << ", reference_action_max_error=" << max_reference_error
+        << ", interaction_max_error=" << max_interaction_error
+        << ", interaction_frames_checked=" << interaction_frames_checked
         << std::endl;
 }
 
@@ -652,6 +946,9 @@ int main(int argc, char **argv) {
         TestManualReferencePlayback();
         TestSonicReferenceAndConfig();
         TestSonicPrepareInputs();
+        TestJointTrajectoryTakeover();
+        TestJointTrajectoryTakeover(true);
+        TestJointTrajectoryBlendAndCancel();
         if (argc == 4) {
             TestConfiguredPolicy(argv[1], argv[2], argv[3]);
         }

@@ -175,6 +175,7 @@ if(BUILD_RL)
         src/behavior_manager/behavior_manager.cpp
         src/behavior_manager/rl_state_config.cpp
         src/behavior_manager/policy_adapter/policy_adapter.cpp
+        src/behavior_manager/policy_adapter/joint_trajectory_policy_adapter.cpp
         src/behavior_manager/states/state_power_off.cpp
         src/behavior_manager/states/state_damp.cpp
         src/behavior_manager/states/state_home.cpp
@@ -228,13 +229,17 @@ endif()
 
 # control_runtime（实机控制：behavior FSM + transport，依赖 rl）
 if(BUILD_RL)
-    add_executable(control_runtime src/runtime/control_runtime.cpp)
-    target_include_directories(control_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_executable(control_runtime src/runtime/control/control_runtime.cpp)
+    target_include_directories(control_runtime PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/common
+    )
     target_link_libraries(control_runtime PRIVATE behavior_manager transport_executor robot_base)
     install(TARGETS control_runtime RUNTIME DESTINATION bin)
 
     # control_sim2sim_runtime（sim2sim：直接调 RL，无 FSM）
-    add_executable(control_sim2sim_runtime src/runtime/control_sim2sim_runtime.cpp)
+    add_executable(control_sim2sim_runtime
+        src/runtime/control/control_sim2sim_runtime.cpp)
     target_include_directories(control_sim2sim_runtime PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${RL_INCLUDE_DIR}
@@ -245,33 +250,42 @@ if(BUILD_RL)
 endif()
 
 # hmi_runtime（HMI 进程：仅 transport）
-add_executable(hmi_runtime src/runtime/hmi_runtime.cpp)
-target_include_directories(hmi_runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_executable(hmi_runtime
+    src/runtime/hmi/hmi_runtime.cpp
+    src/runtime/hmi/interaction.cpp
+)
+target_include_directories(hmi_runtime PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/hmi
+)
 target_link_libraries(hmi_runtime PRIVATE transport_executor robot_base)
 install(TARGETS hmi_runtime RUNTIME DESTINATION bin)
 
 # driver_runtime（按 YAML 选择已编译的 MuJoCo / whole_body backend）
 if(BUILD_MUJOCO_BACKEND OR BUILD_WHOLE_BODY_BACKEND)
     set(DRIVER_RUNTIME_SOURCES
-        src/runtime/driver_runtime.cpp
-        src/runtime/driver_backend_factory.cpp
+        src/runtime/driver/driver_runtime.cpp
+        src/runtime/driver/driver_backend_factory.cpp
     )
     set(DRIVER_RUNTIME_INCLUDE_DIRS
         ${CMAKE_CURRENT_SOURCE_DIR}/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/common
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/driver
     )
     set(DRIVER_RUNTIME_LIBRARIES transport_executor robot_base)
     if(BUILD_MUJOCO_BACKEND)
-        list(APPEND DRIVER_RUNTIME_SOURCES src/runtime/backends/mujoco_backend.cpp)
+        list(APPEND DRIVER_RUNTIME_SOURCES
+            src/runtime/driver/backends/mujoco_backend.cpp)
         list(APPEND DRIVER_RUNTIME_INCLUDE_DIRS ${MUJOCO_SIM_INCLUDE_DIR})
         list(APPEND DRIVER_RUNTIME_LIBRARIES ${MUJOCO_SIM_LIB})
         list(APPEND DRIVER_RUNTIME_DEFINITIONS HAS_MUJOCO_BACKEND)
     endif()
     if(BUILD_WHOLE_BODY_BACKEND)
         list(APPEND DRIVER_RUNTIME_SOURCES
-            src/runtime/backends/whole_body_adapter.cpp
-            src/runtime/backends/whole_body_diagnostics.cpp
-            src/runtime/backends/whole_body_backend.cpp
+            src/runtime/driver/backends/whole_body_adapter.cpp
+            src/runtime/driver/backends/whole_body_diagnostics.cpp
+            src/runtime/driver/backends/whole_body_backend.cpp
         )
         list(APPEND DRIVER_RUNTIME_INCLUDE_DIRS ${WHOLE_BODY_INCLUDE_DIR})
         list(APPEND DRIVER_RUNTIME_LIBRARIES ${WHOLE_BODY_LIB})
@@ -303,7 +317,7 @@ add_executable(test_policy_command_limits
     example/runtime/test_policy_command_limits.cpp)
 target_include_directories(test_policy_command_limits PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/common)
 target_compile_definitions(test_policy_command_limits PRIVATE
     "POLICY_COMMAND_LIMITS_TEST_CONFIG=\"${CMAKE_CURRENT_SOURCE_DIR}/example/runtime/policy_command_limits.yaml\"")
 target_link_libraries(test_policy_command_limits PRIVATE robot_base)
@@ -312,7 +326,7 @@ add_test(NAME policy_command_limits COMMAND test_policy_command_limits)
 
 add_executable(test_runtime_timing example/runtime/test_runtime_timing.cpp)
 target_include_directories(test_runtime_timing PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/common)
 add_test(NAME runtime_timing COMMAND test_runtime_timing)
 install(TARGETS test_runtime_timing RUNTIME DESTINATION bin)
 
@@ -329,17 +343,19 @@ set(DRIVER_RUNTIME_EXAMPLE_CONFIG
     ${CMAKE_CURRENT_SOURCE_DIR}/example/driver_runtime/config_example.yaml)
 add_executable(test_driver_runtime
     example/driver_runtime/test_driver_runtime.cpp
-    src/runtime/driver_backend_factory.cpp
+    src/runtime/driver/driver_backend_factory.cpp
 )
 target_include_directories(test_driver_runtime PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/driver
 )
 if(BUILD_WHOLE_BODY_BACKEND)
     target_sources(test_driver_runtime PRIVATE
-        src/runtime/backends/whole_body_adapter.cpp
+        src/runtime/driver/backends/whole_body_adapter.cpp
     )
     target_include_directories(test_driver_runtime PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/driver/backends
         ${WHOLE_BODY_INCLUDE_DIR}
     )
 endif()

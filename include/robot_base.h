@@ -229,6 +229,21 @@ void RpyToQuat(const std::array<double, 3> &rpy, std::array<double, 4> &quat);
 void NormalizeQuat(std::array<double, 4> &quat);
 
 /**
+ * @brief RL 状态内部交互动作请求
+ */
+struct InteractionRequest {
+    enum class Operation : uint8_t {
+        NONE = 0,
+        START = 1,
+        CANCEL = 2,
+    };
+
+    uint64_t sequence = 0;  ///< 请求序号；Control 对相同序号只处理一次
+    Operation operation = Operation::NONE;
+    std::string action;     ///< START 对应的 YAML 动作名
+};
+
+/**
  * @brief 行为控制命令
  *
  * 统一的行为控制指令，用于 HMI → control → behavior_manager 全链路传递。
@@ -241,6 +256,28 @@ struct Command {
     float vy = 0.0f;            ///< 横向速度 (m/s)
     float wz = 0.0f;            ///< 旋转角速度 (rad/s)
     std::string switch_policy;  ///< 策略切换请求，空字符串表示无切换
+    InteractionRequest interaction;
+};
+
+/**
+ * @brief RL 状态内部交互动作的执行状态
+ */
+struct InteractionStatus {
+    enum class Phase : uint8_t {
+        IDLE = 0,
+        BLEND_IN = 1,
+        PLAYING = 2,
+        HOLDING = 3,
+        BLEND_OUT = 4,
+        FINISHED = 5,
+        REJECTED = 6,
+    };
+
+    uint64_t sequence = 0;  ///< 最近一次已处理请求的序号
+    bool request_accepted = false;  ///< 最近一次请求是否被执行器接受
+    Phase phase = Phase::IDLE;
+    float progress = 0.0f;  ///< 播放进度 [0, 1]
+    std::string action;
 };
 
 /**
@@ -273,6 +310,7 @@ struct ControlStatus {
     float wz = 0.0f;                            ///< Control 实际采用的转向角速度 (rad/s)
     float rl_frequency_hz = 0.0f;               ///< RL 当前推理频率 (Hz)
     std::string active_policy;                  ///< 当前实际生效策略
+    InteractionStatus interaction;              ///< RL 内部交互动作状态
 };
 
 /**

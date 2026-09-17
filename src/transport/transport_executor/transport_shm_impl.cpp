@@ -309,6 +309,10 @@ bool TransportShmImpl::SendCommandV2(const robot_base::Command &cmd,
     p.acknowledge_fault_sequence = acknowledge_fault_sequence;
     std::strncpy(p.switch_policy, cmd.switch_policy.c_str(), 63);
     p.switch_policy[63] = '\0';
+    p.interaction_sequence = cmd.interaction.sequence;
+    p.interaction_operation = static_cast<uint8_t>(cmd.interaction.operation);
+    std::strncpy(p.interaction_action, cmd.interaction.action.c_str(),
+        sizeof(p.interaction_action) - 1);
 
     if (!ValidHmiCmdPacket(p)) return false;
     if (!hmi_writer_->Write(&p, sizeof(p))) return false;
@@ -339,6 +343,11 @@ bool TransportShmImpl::RecvCommandV2(robot_base::Command &cmd,
     cmd.wz = p.wz;
     acknowledge_fault_sequence = p.acknowledge_fault_sequence;
     cmd.switch_policy = DecodeText(p.switch_policy);
+    cmd.interaction.sequence = p.interaction_sequence;
+    cmd.interaction.operation =
+        static_cast<robot_base::InteractionRequest::Operation>(
+            p.interaction_operation);
+    cmd.interaction.action = DecodeText(p.interaction_action);
 
     return true;
 }
@@ -365,6 +374,13 @@ bool TransportShmImpl::SendStatusV2(const robot_base::ControlStatus &status,
     p.rl_frequency_hz = status.rl_frequency_hz;
     std::strncpy(p.active_policy, status.active_policy.c_str(),
         sizeof(p.active_policy) - 1);
+    p.interaction_sequence = status.interaction.sequence;
+    p.interaction_request_accepted =
+        status.interaction.request_accepted ? 1 : 0;
+    p.interaction_phase = static_cast<uint8_t>(status.interaction.phase);
+    p.interaction_progress = status.interaction.progress;
+    std::strncpy(p.interaction_action, status.interaction.action.c_str(),
+        sizeof(p.interaction_action) - 1);
     EncodeFault(fault, &p.fault);
 
     if (!ValidControlStatusPacket(p)) return false;
@@ -399,6 +415,14 @@ bool TransportShmImpl::RecvStatusV2(robot_base::ControlStatus &status,
     status.wz = p.wz;
     status.rl_frequency_hz = p.rl_frequency_hz;
     status.active_policy = DecodeText(p.active_policy);
+    status.interaction.sequence = p.interaction_sequence;
+    status.interaction.request_accepted =
+        p.interaction_request_accepted != 0;
+    status.interaction.phase =
+        static_cast<robot_base::InteractionStatus::Phase>(
+            p.interaction_phase);
+    status.interaction.progress = p.interaction_progress;
+    status.interaction.action = DecodeText(p.interaction_action);
     return DecodeFault(p.fault, &fault);
 }
 

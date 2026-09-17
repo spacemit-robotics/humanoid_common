@@ -183,7 +183,7 @@ driver、传输、安全监控和策略故障，阻止重新上电并通过 v2 �
 ### Runtime 日志
 
 日志落盘实现是 common 内部能力，不额外扩展对外数据接口；上节所述结构化故障由
-`TransportBaseV2` 在 SHM/UDP v5 协议中与原有数据并行传递。
+`TransportBaseV2` 在 SHM/UDP v6 协议中与原有数据并行传递。
 机型 YAML 可按需启用：
 
 ```yaml
@@ -279,7 +279,7 @@ rl_policy:
 
 调度流程：HMI 选择 `dance` → behavior_manager 命中 map → 内部先把 active 切到 `stand`，进 RL 跑满 2s 后自动切到 `dance`（StateRL 会重新 OnEnter 重置 LSTM）。HMI 单次确认，用户无感。详见 [`src/behavior_manager/README.md`](src/behavior_manager/README.md)。
 
-### Motion tracking 策略
+### 策略协议适配
 
 需要外置参考动作或特殊模型输入的策略，在机型 YAML 的策略段配置
 `policy_adapter`。它是 `behavior_manager` 的内部子模块，不是与
@@ -333,6 +333,39 @@ MJLab 的 `reference_action` 未配置时保持标准策略行为。配置后，
 关节使用 `参考关节角 + residual_scale * clip(原始模型 action)`；其余关节仍按
 通用 `rl_default_pos + action_scale * action` 映射。关节列表属于应用层机型参数，
 common 不固定自由度或手臂索引。
+
+`joint_trajectory` adapter 用于在 RL 保持运行时临时接管 YAML 声明的关节。
+未接管的关节仍采用当前策略输出；接管后的最终 action 通过自定义观测项回写给
+下一帧策略，避免策略历史与实际执行命令不一致。动作目录和关节范围均由机型配置：
+
+```yaml
+policy_adapter:
+  type: joint_trajectory
+  catalog: interaction_actions
+  applied_action_term: applied_action
+
+custom_array_dims:
+  applied_action: 28
+observation:
+  segment_0_terms: [ang_vel, projected_gravity, command, dof_pos,
+                    dof_vel, applied_action]
+
+interaction_actions:
+  action_names: [wave]
+  blend_in_duration: 0.25
+  blend_out_duration: 0.25
+  actions:
+    wave:
+      display_name: "挥手"
+      file: policy/stand/interactions/wave.npz
+      joint_indices: [14, 15]
+```
+
+轨迹 NPZ 的 `joint_pos` 为 float32/float64 `[T,K]`，列顺序与对应动作的
+`joint_indices` 一致；`display_name` 仅用于 HMI 展示，控制协议继续使用稳定的
+动作 key。HMI 仅在当前 RL 策略注册了动作目录时显示 `A/C`：
+按 `A` 打开动作页后可连续选择动作，执行进度和完成状态在页内持续显示，按
+`C` 平滑取消。MJLab 手动参考策略则只显示 `G` 启动提示。
 
 ### ControlMode 数据流（control → driver）
 

@@ -31,6 +31,30 @@ struct ReferenceActionConfig {
 };
 
 /**
+ * @brief 一条外部关节轨迹及其控制权范围
+ */
+struct JointTrajectoryActionConfig {
+    std::string name;
+    std::string file;
+    std::vector<int> joint_indices;
+    double motion_fps = 50.0;
+    double playback_speed = 1.0;
+    bool hold_last_frame = false;
+};
+
+/**
+ * @brief RL 内部关节轨迹接管配置
+ */
+struct JointTrajectoryConfig {
+    std::string applied_action_term;
+    double blend_in_duration = 0.25;
+    double blend_out_duration = 0.25;
+    std::vector<JointTrajectoryActionConfig> actions;
+
+    bool Enabled() const { return !actions.empty(); }
+};
+
+/**
  * @brief 单个策略的适配器配置
  *
  * 该结构仅在 behavior_manager 内部使用。机型仓库通过 YAML 提供参数，
@@ -54,6 +78,7 @@ struct Config {
     std::vector<int> future_steps;
 
     ReferenceActionConfig reference_action;
+    JointTrajectoryConfig joint_trajectory;
 
     bool Enabled() const { return !type.empty(); }
 };
@@ -90,6 +115,19 @@ public:
 
     /** @brief 开始手动参考时间轴；重复请求不会重新计时。 */
     virtual bool StartPlayback(double elapsed_s) { return false; }
+
+    /** @brief 接收一次带序号的交互动作请求 */
+    virtual void HandleInteractionRequest(
+        const robot_base::InteractionRequest &request,
+        double elapsed_s) {
+        (void)request;
+        (void)elapsed_s;
+    }
+
+    /** @brief 返回最近一次交互动作执行状态 */
+    virtual robot_base::InteractionStatus GetInteractionStatus() const {
+        return {};
+    }
 
     /** @brief 适配器类型，用于日志 */
     virtual const char *Type() const = 0;

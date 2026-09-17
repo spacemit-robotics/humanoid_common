@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 
+#include "interaction.h"
 #include "policy_command_limits.h"
 #include "robot_base.h"
 #include "runtime_logger.h"
@@ -35,6 +36,10 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 using robot_base::ControlMode;
+using hmi_runtime::InteractionAction;
+using hmi_runtime::InteractionActionMap;
+using hmi_runtime::InteractionIsBusy;
+using hmi_runtime::InteractionPhaseName;
 
 volatile std::sig_atomic_t g_running = 1;
 bool g_color_enabled = true;
@@ -187,6 +192,7 @@ struct UiConfig {
     HmiConfig hmi;
     std::vector<std::string> policies;
     std::vector<std::string> manual_reference_policies;
+    InteractionActionMap interaction_actions;
     runtime_config::PolicyCommandLimitMap command_limits;
     int default_policy_idx = 0;
 };
@@ -222,6 +228,8 @@ UiConfig LoadUiConfig(const std::string &yaml_path) {
             config.manual_reference_policies.push_back(policy);
         }
     }
+    config.interaction_actions =
+        hmi_runtime::LoadInteractionActions(yaml, config.policies);
 
     const auto finite_at_least = [](double value, double minimum,
             const char *path) {
@@ -259,6 +267,7 @@ UiConfig LoadUiConfig(const std::string &yaml_path) {
 enum class HmiPage {
     MAIN,
     POLICY_SELECT,
+    INTERACTION_SELECT,
     VELOCITY,
 };
 
@@ -281,9 +290,11 @@ struct UiState {
     PendingTransition transition;
     std::vector<std::string> policies;
     std::vector<std::string> manual_reference_policies;
+    InteractionActionMap interaction_actions;
     runtime_config::PolicyCommandLimitMap command_limits;
     int active_policy_idx = 0;
     int policy_cursor_idx = 0;
+    int interaction_cursor_idx = 0;
     std::string pending_policy;
     uint64_t fault_ack_sequence = 0;
     bool reference_start_pulse = false;
@@ -291,6 +302,7 @@ struct UiState {
     Clock::time_point reference_start_until{};
     std::string policy_source;
     Clock::time_point policy_requested_at{};
+    Clock::time_point interaction_requested_at{};
     std::string last_action = "等待 Control 状态回传";
     bool command_send_failed = false;
     int highlighted_key = -1;
@@ -301,6 +313,64 @@ bool IsManualReferencePolicy(const UiState &state) {
     return std::find(state.manual_reference_policies.begin(),
         state.manual_reference_policies.end(), state.status.active_policy) !=
         state.manual_reference_policies.end();
+}
+
+const std::vector<InteractionAction> *ActiveInteractionActions(
+        const UiState &state) {
+    return hmi_runtime::FindInteractionActions(
+        state.interaction_actions, state.status.active_policy);
+}
+
+std::string InteractionDisplayName(const UiState &state,
+        const std::string &key) {
+    const auto *actions = ActiveInteractionActions(state);
+    if (actions) {
+        const auto action = std::find_if(actions->begin(), actions->end(),
+            [&key](const InteractionAction &candidate) {
+                return candidate.key == key;
+            });
+        if (action != actions->end()) return action->display_name;
+    }
+    return key;
+}
+
+bool ActiveRlHasInteractions(const UiState &state) {
+    const auto *actions = ActiveInteractionActions(state);
+    return state.status_online && state.status.hmi_connected &&
+        state.status.mode == ControlMode::RL && actions && !actions->empty();
+}
+
+Color InteractionColor(robot_base::InteractionStatus::Phase phase) {
+    using Phase = robot_base::InteractionStatus::Phase;
+    if (phase == Phase::REJECTED) return Color::BRIGHT_RED;
+    if (phase == Phase::FINISHED) return Color::BRIGHT_GREEN;
+    return Color::BRIGHT_CYAN;
+}
+
+void PrintInteractionProgress(const UiState &state, int width) {
+    using Phase = robot_base::InteractionStatus::Phase;
+    const Phase phase = state.status.interaction.phase;
+    const float progress = std::clamp(
+        state.status.interaction.progress, 0.0F, 1.0F);
+    const int thumb = static_cast<int>(std::round(
+        progress * std::max(width - 1, 0)));
+    const Color fill_color = phase == Phase::FINISHED ? Color::GREEN :
+        (phase == Phase::REJECTED ? Color::RED : Color::CYAN);
+    ResetAttr();
+    for (int index = 0; index < width; ++index) {
+        SetFg(index <= thumb ? fill_color : Color::GRAY);
+        if (index == thumb) {
+            printf("●");
+        } else if (index == 0 || index == width - 1) {
+            printf("•");
+        } else {
+            printf("%s", index < thumb ? "━" : "─");
+        }
+    }
+    ResetAttr();
+    SetFg(fill_color);
+    printf("  %3.0f%%", progress * 100.0F);
+    ResetAttr();
 }
 
 const runtime_config::PolicyCommandLimits *ActiveCommandLimits(
@@ -446,6 +516,17 @@ void RenderMainPage(const UiState &state) {
         printf("%s", state.reference_start_requested ?
             "开始命令已发送；未动作可再次按 [G]" :
             "RL 已接管，等待人工确认    [G] 开始动作");
+    } else if (ActiveRlHasInteractions(state)) {
+        SetFg(Color::BRIGHT_CYAN);
+        SetBold();
+        if (InteractionIsBusy(state.status.interaction.phase)) {
+            printf("手臂动作执行中    [A] 动作列表    [C] 平滑取消");
+        } else if (state.status.interaction.phase ==
+                robot_base::InteractionStatus::Phase::FINISHED) {
+            printf("手臂动作已完成    [A] 选择下一个动作");
+        } else {
+            printf("站立策略已接管    [A] 选择手臂动作");
+        }
     } else {
         SetDim();
         printf("← 后退；→ 前进；从 RL 按 ← 直接退回 DAMP");
@@ -498,8 +579,27 @@ void RenderMainPage(const UiState &state) {
     ResetAttr();
     printf(" POWER_OFF    [Space] 速度清零    [Ctrl+C] 退出");
     MoveTo(20, layout.content_left);
+    const bool manual_reference_active = state.status_online &&
+        state.status.hmi_connected && state.status.mode == ControlMode::RL &&
+        IsManualReferencePolicy(state);
+    const bool interaction_active = ActiveRlHasInteractions(state);
+    if (manual_reference_active) {
+        SetFg(Color::BRIGHT_CYAN);
+        SetBold();
+        printf("[G] 开始动作    ");
+        ResetAttr();
+    }
+    if (interaction_active) {
+        SetFg(Color::BRIGHT_CYAN);
+        SetBold();
+        printf("[A] 手臂动作    ");
+        if (InteractionIsBusy(state.status.interaction.phase)) {
+            printf("[C] 取消动作    ");
+        }
+        ResetAttr();
+    }
     SetDim();
-    printf("[G] 手动动作    快捷: o=DAMP z=ZERO r=RL x=故障确认");
+    printf("o=DAMP z=ZERO r=RL x=确认");
     ResetAttr();
 
     PrintLastAction(layout, 22, state.last_action);
@@ -553,6 +653,91 @@ void RenderPolicySelectPage(const UiState &state) {
     ResetAttr();
 
     PrintLastAction(layout, operation_row + 5, state.last_action);
+    fflush(stdout);
+}
+
+int InteractionVisibleRows(const UiState &state) {
+    const auto *actions = ActiveInteractionActions(state);
+    return std::min(9, std::max(1,
+        actions ? static_cast<int>(actions->size()) : 0));
+}
+
+void RenderInteractionSelectPage(const UiState &state) {
+    const Layout layout = GetLayout();
+    ClearScreen();
+    PrintHeader(layout, state, "交互动作");
+
+    const auto *actions = ActiveInteractionActions(state);
+    constexpr int kVisibleRows = 9;
+    const int count = actions ? static_cast<int>(actions->size()) : 0;
+    const int cursor = count == 0 ? 0 : std::clamp(
+        state.interaction_cursor_idx, 0, count - 1);
+    const int first = std::clamp(cursor - kVisibleRows / 2, 0,
+        std::max(0, count - kVisibleRows));
+    const int shown = InteractionVisibleRows(state);
+    DrawBox(4, layout.left, layout.width, shown + 3);
+    MoveTo(5, layout.content_left);
+    SetDim();
+    printf("策略: %s    动作 %d/%d",
+        state.status.active_policy.c_str(), count == 0 ? 0 : cursor + 1, count);
+    ResetAttr();
+    if (count == 0) {
+        MoveTo(6, layout.content_left);
+        printf("(当前策略没有注册交互动作)");
+    } else {
+        for (int row = 0; row < shown; ++row) {
+            const int index = first + row;
+            MoveTo(6 + row, layout.content_left);
+            if (index == cursor) {
+                SetBg(Color::BLUE);
+                SetFg(Color::WHITE);
+                SetBold();
+            }
+            const auto &action = (*actions)[index];
+            const bool current_action = state.status.interaction.action ==
+                action.key;
+            if (current_action) {
+                printf("%s ", state.status.interaction.phase ==
+                        robot_base::InteractionStatus::Phase::FINISHED
+                    ? "✓" : "▶");
+            } else {
+                printf("  ");
+            }
+            printf("%-44s", action.display_name.c_str());
+            ResetAttr();
+        }
+    }
+
+    const int operation_row = 4 + shown + 3;
+    DrawBox(operation_row, layout.left, layout.width, 7);
+    MoveTo(operation_row + 1, layout.content_left);
+    const std::string current_action = InteractionDisplayName(
+        state, state.status.interaction.action);
+    printf("当前: %s", state.status.interaction.action.empty()
+        ? "尚未播放" : current_action.c_str());
+    printf("   ·   ");
+    SetFg(InteractionColor(state.status.interaction.phase));
+    SetBold();
+    printf("%s", state.status.interaction.phase ==
+            robot_base::InteractionStatus::Phase::FINISHED
+        ? "✓ 已完成" : InteractionPhaseName(state.status.interaction.phase));
+    ResetAttr();
+    MoveTo(operation_row + 2, layout.content_left);
+    PrintInteractionProgress(state, layout.width - 14);
+    MoveTo(operation_row + 3, layout.content_left);
+    printf("↑/↓ 或 j/k 移动    Enter 播放    C 取消    Esc/A 返回");
+    MoveTo(operation_row + 4, layout.content_left);
+    SetFg(InteractionColor(state.status.interaction.phase));
+    if (InteractionIsBusy(state.status.interaction.phase)) {
+        printf("执行中；可浏览其他动作，完成后按 Enter 播放下一项");
+    } else if (state.status.interaction.phase ==
+            robot_base::InteractionStatus::Phase::FINISHED) {
+        printf("动作已完成，可以直接选择并播放下一项");
+    } else {
+        printf("双腿始终由当前站立策略控制");
+    }
+    ResetAttr();
+    PrintLastAction(layout, operation_row + 7, state.last_action);
     fflush(stdout);
 }
 
@@ -638,6 +823,9 @@ void Render(const UiState &state) {
     switch (state.page) {
     case HmiPage::POLICY_SELECT:
         RenderPolicySelectPage(state);
+        break;
+    case HmiPage::INTERACTION_SELECT:
+        RenderInteractionSelectPage(state);
         break;
     case HmiPage::VELOCITY:
         RenderVelocityPage(state);
@@ -867,6 +1055,61 @@ bool RequestFaultAcknowledgement(UiState *state) {
     return true;
 }
 
+uint64_t NextInteractionSequence(const UiState &state) {
+    uint64_t sequence = std::max(
+        state.target_command.interaction.sequence,
+        state.status.interaction.sequence) + 1;
+    return sequence == 0 ? 1 : sequence;
+}
+
+bool RequestInteractionStart(UiState *state,
+        const InteractionAction &action,
+        const Clock::time_point &now) {
+    if (!state->status_online || !state->status.hmi_connected ||
+        state->status.mode != ControlMode::RL || state->fault.latched) {
+        state->last_action = "交互动作未发送：RL 链路或安全状态不满足";
+        return false;
+    }
+    using Phase = robot_base::InteractionStatus::Phase;
+    const Phase phase = state->status.interaction.phase;
+    if (phase == Phase::BLEND_IN || phase == Phase::PLAYING ||
+        phase == Phase::HOLDING || phase == Phase::BLEND_OUT) {
+        state->last_action = "已有动作执行中，请先按 C 平滑取消";
+        return false;
+    }
+    state->target_command.interaction.sequence =
+        NextInteractionSequence(*state);
+    state->target_command.interaction.operation =
+        robot_base::InteractionRequest::Operation::START;
+    state->target_command.interaction.action = action.key;
+    state->interaction_requested_at = now;
+    state->last_action = "请求播放交互动作 → " + action.display_name;
+    return true;
+}
+
+bool RequestInteractionCancel(UiState *state,
+        const Clock::time_point &now) {
+    if (!ActiveRlHasInteractions(*state)) {
+        state->last_action =
+            "取消请求未发送：当前 RL 策略没有注册手臂动作";
+        return false;
+    }
+    if (!InteractionIsBusy(state->status.interaction.phase) &&
+        state->target_command.interaction.operation ==
+            robot_base::InteractionRequest::Operation::NONE) {
+        state->last_action = "当前没有执行中的手臂动作";
+        return false;
+    }
+    state->target_command.interaction.sequence =
+        NextInteractionSequence(*state);
+    state->target_command.interaction.operation =
+        robot_base::InteractionRequest::Operation::CANCEL;
+    state->target_command.interaction.action.clear();
+    state->interaction_requested_at = now;
+    state->last_action = "请求平滑取消交互动作";
+    return true;
+}
+
 void UpdateActivePolicy(UiState *state) {
     const auto it = std::find(state->policies.begin(), state->policies.end(),
         state->status.active_policy);
@@ -884,6 +1127,13 @@ bool StatusChanged(const UiState &state,
         state.status.zero_ready != status.zero_ready ||
         state.status.hmi_connected != status.hmi_connected ||
         state.status.active_policy != status.active_policy ||
+        state.status.interaction.sequence != status.interaction.sequence ||
+        state.status.interaction.request_accepted !=
+            status.interaction.request_accepted ||
+        state.status.interaction.phase != status.interaction.phase ||
+        std::abs(state.status.interaction.progress -
+            status.interaction.progress) > 0.0005F ||
+        state.status.interaction.action != status.interaction.action ||
         state.fault.active != fault.active ||
         state.fault.latched != fault.latched ||
         state.fault.sequence != fault.sequence ||
@@ -899,6 +1149,7 @@ void ProcessStatus(UiState *state, const robot_base::ControlStatus &status,
     const uint64_t previous_fault_sequence = state->fault.sequence;
     const auto previous_mode = state->status.mode;
     const std::string previous_policy = state->status.active_policy;
+    const auto previous_interaction = state->status.interaction;
     state->status = status;
     state->fault = fault;
     state->has_status = true;
@@ -911,6 +1162,31 @@ void ProcessStatus(UiState *state, const robot_base::ControlStatus &status,
         if (state->reference_start_pulse) *send_immediately = true;
         state->reference_start_pulse = false;
         state->reference_start_requested = false;
+    }
+
+    if (state->target_command.interaction.operation !=
+            robot_base::InteractionRequest::Operation::NONE &&
+        status.interaction.sequence ==
+            state->target_command.interaction.sequence) {
+        state->target_command.interaction.operation =
+            robot_base::InteractionRequest::Operation::NONE;
+        state->target_command.interaction.action.clear();
+        state->last_action = !status.interaction.request_accepted ||
+                status.interaction.phase ==
+                    robot_base::InteractionStatus::Phase::REJECTED
+            ? "Control 拒绝了交互动作请求"
+            : std::string("Control 已接收交互动作请求: ") +
+                InteractionPhaseName(status.interaction.phase);
+        *send_immediately = true;
+    } else if (previous_interaction.phase != status.interaction.phase &&
+        (status.interaction.phase ==
+                robot_base::InteractionStatus::Phase::FINISHED ||
+            status.interaction.phase ==
+                robot_base::InteractionStatus::Phase::REJECTED)) {
+        state->last_action = status.interaction.phase ==
+                robot_base::InteractionStatus::Phase::FINISHED
+            ? "交互动作完成，控制权已交还站立策略"
+            : "交互动作请求被拒绝";
     }
 
     if (fault.latched && fault.sequence != previous_fault_sequence) {
@@ -968,6 +1244,21 @@ void ProcessStatus(UiState *state, const robot_base::ControlStatus &status,
             : "已离开 RL，速度清零并返回主界面";
         *send_immediately = true;
     }
+    if (state->page == HmiPage::INTERACTION_SELECT &&
+        !ActiveRlHasInteractions(*state)) {
+        state->page = HmiPage::MAIN;
+        state->last_action = status.mode == ControlMode::RL
+            ? "当前策略没有注册手臂动作，已返回主界面"
+            : "已离开 RL，手臂动作页已关闭";
+    }
+    if (status.mode != ControlMode::RL &&
+        state->target_command.interaction.operation !=
+            robot_base::InteractionRequest::Operation::NONE) {
+        state->target_command.interaction.operation =
+            robot_base::InteractionRequest::Operation::NONE;
+        state->target_command.interaction.action.clear();
+        *send_immediately = true;
+    }
 }
 
 }  // namespace
@@ -1018,6 +1309,7 @@ int main(int argc, char *argv[]) {
     UiState state;
     state.policies = config.policies;
     state.manual_reference_policies = config.manual_reference_policies;
+    state.interaction_actions = config.interaction_actions;
     state.command_limits = config.command_limits;
     state.active_policy_idx = config.default_policy_idx;
     state.policy_cursor_idx = config.default_policy_idx;
@@ -1046,7 +1338,9 @@ int main(int argc, char *argv[]) {
         }
 
         const bool waiting_for_ack = state.transition.active ||
-            !state.pending_policy.empty();
+            !state.pending_policy.empty() ||
+            state.target_command.interaction.operation !=
+                robot_base::InteractionRequest::Operation::NONE;
         const double effective_status_timeout = waiting_for_ack
             ? std::max(config.hmi.status_timeout, config.hmi.request_timeout)
             : config.hmi.status_timeout;
@@ -1062,8 +1356,14 @@ int main(int argc, char *argv[]) {
                 state.fault_ack_sequence = 0;
                 state.reference_start_pulse = false;
                 state.reference_start_requested = false;
+                state.target_command.interaction.operation =
+                    robot_base::InteractionRequest::Operation::NONE;
+                state.target_command.interaction.action.clear();
                 ZeroVelocity(&state);
-                if (state.page == HmiPage::VELOCITY) state.page = HmiPage::MAIN;
+                if (state.page == HmiPage::VELOCITY ||
+                    state.page == HmiPage::INTERACTION_SELECT) {
+                    state.page = HmiPage::MAIN;
+                }
                 state.last_action = "Control 状态回传超时，速度已清零";
                 send_immediately = true;
             } else {
@@ -1087,6 +1387,18 @@ int main(int argc, char *argv[]) {
             send_immediately = true;
             dirty = true;
         }
+        if (state.target_command.interaction.operation !=
+                robot_base::InteractionRequest::Operation::NONE &&
+            std::chrono::duration<double>(
+                now - state.interaction_requested_at).count() >
+                config.hmi.request_timeout) {
+            state.target_command.interaction.operation =
+                robot_base::InteractionRequest::Operation::NONE;
+            state.target_command.interaction.action.clear();
+            state.last_action = "交互动作请求超时，已停止重发";
+            send_immediately = true;
+            dirty = true;
+        }
 
         if (state.highlighted_key >= 0 && now >= state.highlight_until) {
             state.highlighted_key = -1;
@@ -1098,7 +1410,6 @@ int main(int argc, char *argv[]) {
             send_immediately = true;
             dirty = true;
         }
-
         const int key = ReadUiKey();
         if (key >= 0) {
             dirty = true;
@@ -1107,6 +1418,9 @@ int main(int argc, char *argv[]) {
                     send_immediately;
             } else if (key == 'x') {
                 send_immediately = RequestFaultAcknowledgement(&state) ||
+                    send_immediately;
+            } else if (key == 'c') {
+                send_immediately = RequestInteractionCancel(&state, now) ||
                     send_immediately;
             } else if (state.page == HmiPage::POLICY_SELECT) {
                 if ((key == kKeyUp || key == 'k') && !state.policies.empty()) {
@@ -1145,6 +1459,24 @@ int main(int argc, char *argv[]) {
                     state.policy_cursor_idx = state.active_policy_idx;
                     state.page = HmiPage::MAIN;
                     state.last_action = "取消策略选择";
+                }
+            } else if (state.page == HmiPage::INTERACTION_SELECT) {
+                const auto *actions = ActiveInteractionActions(state);
+                const int count = actions
+                    ? static_cast<int>(actions->size()) : 0;
+                if ((key == kKeyUp || key == 'k') && count > 0) {
+                    state.interaction_cursor_idx =
+                        (state.interaction_cursor_idx - 1 + count) % count;
+                } else if ((key == kKeyDown || key == 'j') && count > 0) {
+                    state.interaction_cursor_idx =
+                        (state.interaction_cursor_idx + 1) % count;
+                } else if ((key == '\r' || key == '\n') && count > 0) {
+                    const bool started = RequestInteractionStart(&state,
+                        (*actions)[state.interaction_cursor_idx], now);
+                    send_immediately = started || send_immediately;
+                } else if (key == kKeyEscape || key == 'a') {
+                    state.page = HmiPage::MAIN;
+                    state.last_action = "取消交互动作选择";
                 }
             } else if (state.page == HmiPage::VELOCITY) {
                 const auto *limits = ActiveCommandLimits(state);
@@ -1224,6 +1556,19 @@ int main(int argc, char *argv[]) {
                         state.page = HmiPage::POLICY_SELECT;
                         state.last_action = "选择策略";
                     }
+                } else if (key == 'a') {
+                    const auto *actions = ActiveInteractionActions(state);
+                    if (!actions || actions->empty()) {
+                        state.last_action = "当前策略没有注册交互动作";
+                    } else if (!state.status_online ||
+                        !state.status.hmi_connected ||
+                        state.status.mode != ControlMode::RL) {
+                        state.last_action =
+                            "交互动作页仅在真实 FSM=RL 且心跳正常时开放";
+                    } else {
+                        state.page = HmiPage::INTERACTION_SELECT;
+                        state.last_action = "选择交互动作";
+                    }
                 } else if (key == 'v' || key == '\r' || key == '\n') {
                     if (state.status_online && state.status.hmi_connected &&
                         state.status.mode == ControlMode::RL &&
@@ -1283,6 +1628,11 @@ int main(int argc, char *argv[]) {
     state.fault_ack_sequence = 0;
     state.reference_start_pulse = false;
     state.reference_start_requested = false;
+    state.target_command.interaction.sequence =
+        NextInteractionSequence(state);
+    state.target_command.interaction.operation =
+        robot_base::InteractionRequest::Operation::CANCEL;
+    state.target_command.interaction.action.clear();
     ZeroVelocity(&state);
     (void)SendCommand(transport.get(), &state);
     runtime_logging::Log(

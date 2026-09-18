@@ -194,15 +194,19 @@ private:
 
 class TempSonicReference {
 public:
-    explicit TempSonicReference(int joint_count)
+    explicit TempSonicReference(int joint_count,
+        double position_scale = 0.01,
+        double velocity_scale = 0.02)
         : joint_count_(joint_count) {
         const auto nonce = std::chrono::steady_clock::now()
             .time_since_epoch().count();
         path_ = fs::temp_directory_path() /
             ("sonic_reference_" + std::to_string(nonce));
         fs::create_directories(path_);
-        WriteJointCsv(path_ / "joint_pos.csv", "joint_", 0.01);
-        WriteJointCsv(path_ / "joint_vel.csv", "joint_vel_", 0.02);
+        WriteJointCsv(
+            path_ / "joint_pos.csv", "joint_", position_scale);
+        WriteJointCsv(
+            path_ / "joint_vel.csv", "joint_vel_", velocity_scale);
 
         std::ofstream body_quat(path_ / "body_quat.csv");
         if (!body_quat) {
@@ -308,6 +312,31 @@ rl_policy::PolicyExecutorConfig MakeSonicPolicyConfig(int joint_count) {
     for (int joint = 0; joint < joint_count; ++joint) {
         config.action_joint_index.push_back(joint);
     }
+    return config;
+}
+
+rl_policy::PolicyExecutorConfig MakeSonicProbePolicyConfig(
+    int joint_count,
+    const fs::path &model_path) {
+    auto config = MakeSonicPolicyConfig(joint_count);
+    config.model_path = model_path.string();
+    config.action_scale = {1.0};
+    config.strict_obs_dim_check = true;
+    config.obs_segments.emplace_back();
+    config.obs_segments.back().terms = {"gravity"};
+
+    rl_policy::ModelInputBindingConfig input;
+    input.name = "reference_obs";
+    input.source = rl_policy::ModelInputSource::EXTERNAL;
+    config.model_io.inputs.push_back(input);
+    input.name = "obs";
+    input.source = rl_policy::ModelInputSource::OBSERVATION;
+    config.model_io.inputs.push_back(input);
+
+    rl_policy::ModelOutputBindingConfig output;
+    output.name = "action";
+    output.target = rl_policy::ModelOutputTarget::ACTION;
+    config.model_io.outputs.push_back(output);
     return config;
 }
 
@@ -492,6 +521,7 @@ void TestManualReferencePlayback() {
 void TestSonicReferenceAndConfig() {
     constexpr int kTestJointCount = 7;
     const TempSonicReference reference(kTestJointCount);
+    const TempSonicReference second_reference(kTestJointCount, 0.1, 0.2);
     Config config;
     config.type = "sonic";
     config.reference_file = reference.Path().string();
@@ -535,6 +565,37 @@ void TestSonicReferenceAndConfig() {
         fs::temp_directory_path().string());
     Require(loaded.future_frames == 10 && loaded.future_step == 5,
         "未加载 SONIC future window 配置");
+
+    const TempReference catalog_yaml("sonic_catalog_yaml",
+        "sonic_actions:\n"
+        "  action_names: [idle, gesture]\n"
+        "  default_action: idle\n"
+        "  transition_duration: 0.4\n"
+        "  actions:\n"
+        "    idle:\n"
+        "      file: " + reference.Path().string() + "\n"
+        "    gesture:\n"
+        "      file: " + second_reference.Path().string() + "\n"
+        "      playback_speed: 0.5\n"
+        "rl_policy:\n"
+        "  onnx_infer:\n"
+        "    policies:\n"
+        "      sonic:\n"
+        "        policy_adapter:\n"
+        "          type: sonic\n"
+        "          catalog: sonic_actions\n"
+        "          future_frames: 10\n"
+        "          future_step: 5\n");
+    const auto catalog = LoadConfig(catalog_yaml.Path().string(), "sonic",
+        fs::temp_directory_path().string());
+    Require(catalog.reference_motion_catalog.actions.size() == 2 &&
+            catalog.reference_motion_catalog.default_action == "idle" &&
+            std::abs(catalog.reference_motion_catalog.transition_duration -
+                0.4) < 1.0e-12 &&
+            std::abs(catalog.reference_motion_catalog.actions[1]
+                .playback_speed - 0.5) < 1.0e-12 &&
+            catalog.reference_file == reference.Path().string(),
+        "未正确加载 SONIC 多动作目录");
 }
 
 void TestSonicPrepareInputs() {
@@ -548,26 +609,8 @@ void TestSonicPrepareInputs() {
     config.future_frames = 10;
     config.future_step = 5;
 
-    auto policy_config = MakeSonicPolicyConfig(kG1JointCount);
-    policy_config.model_path = model.Path().string();
-    policy_config.action_scale = {1.0};
-    policy_config.strict_obs_dim_check = true;
-    policy_config.obs_segments.emplace_back();
-    policy_config.obs_segments.back().terms = {"gravity"};
-
-    rl_policy::ModelInputBindingConfig input;
-    input.name = "reference_obs";
-    input.source = rl_policy::ModelInputSource::EXTERNAL;
-    policy_config.model_io.inputs.push_back(input);
-
-    input.name = "obs";
-    input.source = rl_policy::ModelInputSource::OBSERVATION;
-    policy_config.model_io.inputs.push_back(input);
-
-    rl_policy::ModelOutputBindingConfig output;
-    output.name = "action";
-    output.target = rl_policy::ModelOutputTarget::ACTION;
-    policy_config.model_io.outputs.push_back(output);
+    auto policy_config = MakeSonicProbePolicyConfig(
+        kG1JointCount, model.Path());
 
     auto adapter = Create(config, policy_config);
     robot_base::RobotData robot;
@@ -597,6 +640,104 @@ void TestSonicPrepareInputs() {
             "SONIC reference_obs 字段拼接顺序错误: index=" +
             std::to_string(index));
     }
+}
+
+void TestSonicMotionCatalogPlayback() {
+    constexpr int kJointCount = 29;
+    const TempSonicReference idle_reference(kJointCount);
+    const TempSonicReference gesture_reference(kJointCount, 0.1, 0.2);
+    const TempSonicOnnx model;
+
+    Config config;
+    config.type = "sonic";
+    config.reference_file = idle_reference.Path().string();
+    config.future_frames = 10;
+    config.future_step = 5;
+    config.reference_motion_catalog.default_action = "idle";
+    config.reference_motion_catalog.transition_duration = 0.2;
+
+    behavior_manager::policy_adapter::ReferenceMotionConfig idle;
+    idle.name = "idle";
+    idle.file = idle_reference.Path().string();
+    config.reference_motion_catalog.actions.push_back(idle);
+    behavior_manager::policy_adapter::ReferenceMotionConfig gesture;
+    gesture.name = "gesture";
+    gesture.file = gesture_reference.Path().string();
+    config.reference_motion_catalog.actions.push_back(gesture);
+
+    auto policy_config = MakeSonicProbePolicyConfig(
+        kJointCount, model.Path());
+    auto adapter = Create(config, policy_config);
+    robot_base::RobotData robot;
+    robot.num_dof = kJointCount;
+    robot.base_quat = {1.0, 0.0, 0.0, 0.0};
+    robot.joint_pos.assign(kJointCount, 0.0);
+    robot.joint_vel.assign(kJointCount, 0.0);
+    adapter->Reset(robot);
+    Require(adapter->GetInteractionStatus().phase ==
+            robot_base::InteractionStatus::Phase::IDLE,
+        "SONIC 多动作模式进入 RL 后未等待动作选择");
+
+    rl_policy::PolicyExecutor policy;
+    policy.Init(policy_config);
+    robot_base::InteractionRequest request;
+    request.sequence = 1;
+    request.operation = robot_base::InteractionRequest::Operation::START;
+    request.action = "gesture";
+    adapter->HandleInteractionRequest(request, 1.0);
+    Require(adapter->GetInteractionStatus().request_accepted &&
+            adapter->GetInteractionStatus().phase ==
+                robot_base::InteractionStatus::Phase::BLEND_IN,
+        "SONIC 未接受目录中的动作");
+
+    adapter->PrepareInputs(robot, 1.0, policy);
+    Eigen::VectorXf observation = Eigen::VectorXf::Zero(policy.ObsDim());
+    std::vector<double> action;
+    policy.Infer(observation, action);
+    Require(action.size() > 1 && std::abs(action[1]) < 1.0e-6,
+        "SONIC 动作切换起点未保持原参考序列: " +
+        (action.size() > 1 ? std::to_string(action[1]) : "missing"));
+
+    adapter->PrepareInputs(robot, 1.1, policy);
+    policy.Infer(observation, action);
+    Require(std::abs(action[1] - 0.05) < 1.0e-6,
+        "SONIC 动作切换中点未平滑插值: " +
+        std::to_string(action[1]));
+
+    adapter->PrepareInputs(robot, 1.2, policy);
+    policy.Infer(observation, action);
+    Require(std::abs(action[1] - 0.1) < 1.0e-6 &&
+            adapter->GetInteractionStatus().phase ==
+                robot_base::InteractionStatus::Phase::PLAYING,
+        "SONIC 动作切换后仍在使用默认参考序列");
+
+    adapter->PrepareInputs(robot, 1.25, policy);
+    Require(adapter->GetInteractionStatus().phase ==
+            robot_base::InteractionStatus::Phase::FINISHED &&
+            std::abs(adapter->GetInteractionStatus().progress - 1.0F) <
+                1.0e-6F,
+        "SONIC 动作结束状态错误");
+
+    request.sequence = 2;
+    request.action = "missing";
+    adapter->HandleInteractionRequest(request, 1.3);
+    Require(!adapter->GetInteractionStatus().request_accepted &&
+            adapter->GetInteractionStatus().phase ==
+                robot_base::InteractionStatus::Phase::REJECTED,
+        "SONIC 未拒绝目录外动作");
+
+    request.sequence = 3;
+    request.action = "gesture";
+    adapter->HandleInteractionRequest(request, 1.4);
+    request.sequence = 4;
+    request.operation = robot_base::InteractionRequest::Operation::CANCEL;
+    request.action.clear();
+    adapter->HandleInteractionRequest(request, 1.41);
+    adapter->PrepareInputs(robot, 1.61, policy);
+    Require(adapter->GetInteractionStatus().request_accepted &&
+            adapter->GetInteractionStatus().phase ==
+                robot_base::InteractionStatus::Phase::FINISHED,
+        "SONIC 取消动作后未回到默认参考");
 }
 
 void TestJointTrajectoryTakeover(bool column_major = false) {
@@ -868,6 +1009,7 @@ void TestConfiguredPolicy(const std::string &yaml_path,
     }
     double max_interaction_error = 0.0;
     std::size_t interaction_frames_checked = 0;
+    std::size_t reference_actions_checked = 0;
     if (adapter_config.joint_trajectory.Enabled()) {
         std::vector<double> policy_only_target;
         policy.MapActionToTargetPos(raw_action, policy_only_target);
@@ -919,6 +1061,33 @@ void TestConfiguredPolicy(const std::string &yaml_path,
         Require(max_interaction_error < 1.0e-5,
             "joint_trajectory 最终关节目标与轨迹不一致");
     }
+    if (adapter_config.reference_motion_catalog.Enabled()) {
+        for (const auto &motion :
+                adapter_config.reference_motion_catalog.actions) {
+            adapter->Reset(robot);
+            robot_base::InteractionRequest request;
+            request.sequence = 1;
+            request.operation =
+                robot_base::InteractionRequest::Operation::START;
+            request.action = motion.name;
+            adapter->HandleInteractionRequest(request, 0.0);
+            Require(adapter->GetInteractionStatus().request_accepted,
+                "reference motion catalog 未接受动作: " + motion.name);
+            const double sample_time =
+                adapter_config.reference_motion_catalog.transition_duration +
+                0.02;
+            adapter->PrepareInputs(robot, sample_time, policy);
+            policy.Infer(observation, action);
+            adapter->OnAction(action);
+            policy.MapActionToTargetPos(action, target_pos);
+            Require(target_pos.size() ==
+                    loaded.exec_cfg.rl_default_pos.size() &&
+                    std::all_of(target_pos.begin(), target_pos.end(),
+                        [](double value) { return std::isfinite(value); }),
+                "reference motion catalog 动作输出非法: " + motion.name);
+            ++reference_actions_checked;
+        }
+    }
     std::cout << "已验证策略配置: " << policy_name
         << ", type=" << adapter->Type()
         << ", robot_dof=" << robot.num_dof
@@ -927,6 +1096,7 @@ void TestConfiguredPolicy(const std::string &yaml_path,
         << ", reference_action_max_error=" << max_reference_error
         << ", interaction_max_error=" << max_interaction_error
         << ", interaction_frames_checked=" << interaction_frames_checked
+        << ", reference_actions_checked=" << reference_actions_checked
         << std::endl;
 }
 
@@ -946,6 +1116,7 @@ int main(int argc, char **argv) {
         TestManualReferencePlayback();
         TestSonicReferenceAndConfig();
         TestSonicPrepareInputs();
+        TestSonicMotionCatalogPlayback();
         TestJointTrajectoryTakeover();
         TestJointTrajectoryTakeover(true);
         TestJointTrajectoryBlendAndCancel();

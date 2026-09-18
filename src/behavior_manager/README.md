@@ -117,6 +117,7 @@ cd ~/spacemit_robot
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter`（可选）：参考动作、特殊模型输入或 RL 内关节轨迹接管；支持 `mjlab`、`protomotions`、`sonic`、`joint_trajectory`
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.start_mode`（MJLab 可选）：`auto`（默认）或 `manual`；手动模式进入 RL 后保持参考首帧，按 `G` 开始
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.reference_action`（MJLab 可选）：指定采用参考动作与残差合成的关节
+- `rl_policy.onnx_infer.policies.<name>.policy_adapter.catalog`（SONIC 可选）：为同一全身策略注册多个参考动作；HMI 选择动作后仅切换 `reference_obs`，不覆盖模型 action
 - `rl_policy.onnx_infer.policies.<name>.command.limits`（可选）：应用层声明该策略接受的 `min_vx/max_vx/min_vy/max_vy/min_wz/max_wz`；未配置 `min_*` 时默认为对应的 `-max_*`，整个 limits 未配置时 HMI 和 Control 均拒绝速度命令
 - `behavior_manager.damp_kd`：阻尼状态 kd（≈ policy kd / 5）
 - `behavior_manager.home.gain_ramp_duration / move_duration`：HOME 建立增益和移动时长，`move_duration` 默认 3 秒
@@ -153,6 +154,7 @@ HMI 的 `x` 才能清除锁存。重复收到同一条已确认的恢复状态�
 - **通用模型 I/O：** `PolicyExecutorConfig` 整体透传给 RL 组件；多输入输出、feedback、external 等拓扑由策略 YAML `model_io` 声明，common 无需复制底层字段
 - **策略协议适配：** `policy_adapter` 是 behavior_manager 的私有子模块；机器人自由度、关节映射和自定义观测维度由机型 YAML 透传，common 不固定具体机型维度
 - **交互动作接管：** `joint_trajectory` adapter 在 RL 状态内部合并选择性关节轨迹，最终 applied action 回写策略观测；不会创建与 RL 并列的 FSM 状态
+- **SONIC 多动作：** 多个参考目录在进入 RL 前统一校验并加载；进入 RL 后保持默认参考首帧，HMI 选择动作时平滑切换参考输入，全身 action 始终由同一个 SONIC 模型输出
 - **动态策略切换：** 仅在 `POWER_OFF` / `DAMP` 状态接受 `Command.switch_policy`；进入 `ZERO` 后策略锁定（ZERO 目标位置取自当前策略，增益使用独立安全配置）
 - **前置策略链调度：** 目标策略可在 yaml 配置 `prerequisite: { policy, duration }`，behavior_manager 收到切换请求后自动先切前置策略，在 RL 状态运行 `duration` 秒后再切目标策略；用户感知层面只发一次切换命令。典型场景：`dance` / `kungfu` 配 `prerequisite: stand`，先用 LocoMode 站稳并预热 LSTM，再进 dance/kungfu，避免直接从 PD 锁位的 ZERO 切动态动作时摔倒
 - **安全保护：** driver 故障、状态超时、无效数据、姿态超限和 RL 推理/action 超时统一触发安全状态并跨进程锁存

@@ -55,6 +55,29 @@ struct JointTrajectoryConfig {
 };
 
 /**
+ * @brief 一条由策略完整跟踪的参考动作
+ */
+struct ReferenceMotionConfig {
+    std::string name;
+    std::string file;
+    double motion_fps = 50.0;
+    double playback_speed = 1.0;
+    bool loop = false;
+    double loop_pause = 0.0;
+};
+
+/**
+ * @brief 同一策略可选择的参考动作目录
+ */
+struct ReferenceMotionCatalogConfig {
+    std::string default_action;
+    double transition_duration = 0.25;
+    std::vector<ReferenceMotionConfig> actions;
+
+    bool Enabled() const { return !actions.empty(); }
+};
+
+/**
  * @brief 单个策略的适配器配置
  *
  * 该结构仅在 behavior_manager 内部使用。机型仓库通过 YAML 提供参数，
@@ -79,6 +102,7 @@ struct Config {
 
     ReferenceActionConfig reference_action;
     JointTrajectoryConfig joint_trajectory;
+    ReferenceMotionCatalogConfig reference_motion_catalog;
 
     bool Enabled() const { return !type.empty(); }
 };

@@ -317,9 +317,31 @@ policy_adapter:
 - MJLab：`reference_file` 指向单个 NPZ；
 - ProtoMotions：`reference_file` 指向单个预处理 CSV，使用
   `future_steps`；
-- SONIC：`reference_file` 指向参考动作目录；目录内必须包含
-  `joint_pos.csv`、`joint_vel.csv` 和 `body_quat.csv`，使用
-  `future_frames` 和 `future_step`。
+- SONIC：单动作配置用 `reference_file`；多动作配置用 `catalog`，目录中的
+  每个 `file` 都指向包含 `joint_pos.csv`、`joint_vel.csv` 和
+  `body_quat.csv` 的参考动作目录。两种配置均使用 `future_frames` 和
+  `future_step`。
+
+SONIC 多动作模式复用 HMI 的交互动作页，但与 `joint_trajectory` 的局部关节
+接管不同：切换动作只更新策略的 `reference_obs`，ONNX 输出仍控制全部策略关节。
+进入 RL 后先保持 `default_action` 的首帧，选择动作时按
+`transition_duration` 平滑切换参考序列。
+
+```yaml
+sonic_actions:
+  action_names: [gesture_a, gesture_b]
+  default_action: gesture_a
+  transition_duration: 1.0
+  actions:
+    gesture_a: {file: policy/sonic/gesture_a, display_name: "动作 A"}
+    gesture_b: {file: policy/sonic/gesture_b, display_name: "动作 B"}
+
+policy_adapter:
+  type: sonic
+  catalog: sonic_actions
+  future_frames: 10
+  future_step: 5
+```
 
 策略若配置
 `zero_target_pos`，ZERO 阶段先过渡到参考动作起始姿态。非循环动作播放完成后

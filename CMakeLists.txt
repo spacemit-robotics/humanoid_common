@@ -395,6 +395,26 @@ if(BUILD_RL)
         behavior_manager robot_base Eigen3::Eigen ${RL_LIB} cnpy)
     install(TARGETS test_policy_adapter RUNTIME DESTINATION bin)
 
+    if(BUILD_TESTS)
+        add_executable(test_rl_target_limits
+            example/behavior_manager/test_rl_target_limits.cpp)
+        target_include_directories(test_rl_target_limits PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager
+            ${RL_INCLUDE_DIR})
+        target_link_libraries(test_rl_target_limits PRIVATE
+            behavior_manager robot_base Eigen3::Eigen)
+        add_test(NAME rl_target_limits COMMAND test_rl_target_limits)
+
+        add_executable(test_rl_inference_logging
+            example/behavior_manager/test_rl_inference_logging.cpp)
+        target_include_directories(test_rl_inference_logging PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager
+            ${RL_INCLUDE_DIR})
+        target_link_libraries(test_rl_inference_logging PRIVATE
+            behavior_manager robot_base Eigen3::Eigen)
+        add_test(NAME rl_inference_logging COMMAND test_rl_inference_logging)
+    endif()
+
     # StateRL 异步运行时：复用生产 FSM/StateRL/ThreadLoop，以 synthetic
     # 传感器驱动；不包含 transport、关节总线或执行器闭环。
     add_executable(benchmark_humanoid_policy

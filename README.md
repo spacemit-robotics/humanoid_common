@@ -234,6 +234,24 @@ driver 终端以固定屏限频刷新，
 推理发布时序和动作被控制线程采用后的最终关节目标。该流不受 `telemetry.rate_hz`
 降采样，用于复现实机策略发散链路。
 
+推理超过 `inference_deadline_s` 时仍记录该帧，`result=inference_timeout`，
+不会发布或采用该动作；成功帧为 `result=published`。失败帧的
+`action_published_time_s`、`finish_to_publish_ms`、`release_to_publish_ms` 为 `nan`，
+并且没有对应的 apply 行。按发布动作统计时须筛选 `result=published`。
+新增列追加在原观测/action 列之后，包括 `release_to_finish_ms`、
+`inference_deadline_ms`、传感器快照 `snapshot_ms`、参考输入准备
+`prepare_inputs_ms`、观测组装 `assemble_obs_ms`、策略执行器调用
+`policy_infer_ms`、后处理及交互状态更新 `postprocess_ms`，以及交互动作状态和请求。
+交互阶段/请求操作使用 `robot_base::InteractionStatus::Phase` /
+`InteractionRequest::Operation` 的枚举数值。
+
+上述阶段使用实际经过时间，包含线程被抢占或等待的时间；`policy_infer_ms` 包含
+PolicyExecutor 的输入/输出处理，并非单独的 ONNX Run。
+`inference_thread_cpu_ms` 仅统计当前推理线程消耗的 CPU 时间，读取失败为 `nan`；
+它不包含 ONNX/EP 工作线程的 CPU 时间，多线程推理时不能简单用差值推断调度等待。
+超时的 `events.log` 错误也包含耗时、阈值、策略、帧序号及交互动作上下文，
+不依赖 debug 或 telemetry 开关。
+
 ### 执行器模式
 
 `ControlMode` 和 `ActuationMode` 是两个正交的语义层：

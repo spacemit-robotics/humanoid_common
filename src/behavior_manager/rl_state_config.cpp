@@ -14,7 +14,36 @@
 #include <string>
 #include <vector>
 
+#include <yaml-cpp/yaml.h>
+
 namespace behavior_manager {
+
+void ValidateRLTargetPositionLimits(const RLConfig &config) {
+    const std::string prefix = "[BehaviorManager] policy '" +
+        config.policy_name + "' target position limits: ";
+    const double margin = config.target_limit_margin;
+    if (!std::isfinite(margin) || margin < 0.0) {
+        throw std::runtime_error(prefix + "target_limit_margin must be finite and nonnegative");
+    }
+    const auto &lower = config.target_position_lower;
+    const auto &upper = config.target_position_upper;
+    if (lower.empty() && upper.empty() && margin == 0.0) return;
+    const std::size_t num_dof = config.policy.rl_default_pos.size();
+    if (num_dof == 0 || lower.size() != num_dof || upper.size() != num_dof) {
+        throw std::runtime_error(prefix +
+            "target_position_lower/upper must both match rl_default_pos dimensions");
+    }
+    for (std::size_t i = 0; i < num_dof; ++i) {
+        const double safe_lower = lower[i] + margin;
+        const double safe_upper = upper[i] - margin;
+        if (!std::isfinite(lower[i]) || !std::isfinite(upper[i]) ||
+            !std::isfinite(safe_lower) || !std::isfinite(safe_upper) ||
+            safe_lower >= safe_upper) {
+            throw std::runtime_error(prefix + "invalid range or margin at joint " +
+                std::to_string(i));
+        }
+    }
+}
 
 RLConfig LoadRLStateConfig(const std::string &yaml_path,
     const std::string &policy_name,
@@ -73,6 +102,30 @@ RLConfig LoadRLStateConfig(const std::string &yaml_path,
             "[BehaviorManager] " + base +
             ".entry_target_transition_duration 配置无效");
     }
+
+    // YamlFile::Read treats conversion errors as missing fields. Safety limits
+    // require strict parsing so malformed values cannot disable protection.
+    try {
+        const auto policy = YAML::LoadFile(yaml_path)["rl_policy"]
+            ["onnx_infer"]["policies"][policy_name];
+        const auto lower = policy["target_position_lower"];
+        const auto upper = policy["target_position_upper"];
+        if (static_cast<bool>(lower) != static_cast<bool>(upper)) {
+            throw std::runtime_error("[BehaviorManager] " + base +
+                ": target_position_lower and target_position_upper must be configured together");
+        }
+        if (lower) {
+            config.target_position_lower = lower.as<std::vector<double>>();
+            config.target_position_upper = upper.as<std::vector<double>>();
+        }
+        if (policy["target_limit_margin"]) {
+            config.target_limit_margin = policy["target_limit_margin"].as<double>();
+        }
+    } catch (const YAML::Exception &error) {
+        throw std::runtime_error("[BehaviorManager] " + base +
+            ": invalid target position limits: " + error.what());
+    }
+    ValidateRLTargetPositionLimits(config);
     return config;
 }
 

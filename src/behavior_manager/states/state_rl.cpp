@@ -11,6 +11,7 @@
  */
 
 #include <Eigen/Dense>
+#include <time.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -19,6 +20,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -37,7 +39,10 @@ class StateRL : public State {
 public:
     ~StateRL() override { StopInference(); }
 
-    void SetConfig(const RLConfig &cfg) { config_ = cfg; }
+    void SetConfig(const RLConfig &cfg) {
+        ValidateRLTargetPositionLimits(cfg);
+        config_ = cfg;
+    }
 
     void PrepareRuntime() {
         policy_adapter_.reset();
@@ -258,6 +263,8 @@ public:
                 ApplyEntryTargetTransition(
                     target_pos, rl_dt,
                     action_sequence_ - applied_action_sequence_);
+                if (!ClampTargetPosition(target_pos)) return;
+                output_->target_pos = std::move(target_pos);
                 applied_action_sequence_ = action_sequence_;
                 int ndof = static_cast<int>(output_->target_pos.size());
                 output_->target_vel.assign(ndof, 0.0);
@@ -336,24 +343,40 @@ private:
         infer_loop_.Stop();
     }
 
-    void ApplyEntryTargetTransition(const std::vector<double> &raw_target,
+    void ApplyEntryTargetTransition(std::vector<double> &target,
                                     float rl_dt,
                                     std::uint64_t inference_steps) {
         const double duration = config_.entry_target_transition_duration;
-        if (duration <= 0.0 || output_->target_pos.size() != raw_target.size()) {
-            output_->target_pos = raw_target;
-            return;
-        }
+        if (duration <= 0.0 || output_->target_pos.size() != target.size()) return;
 
         entry_target_transition_elapsed_ = std::min(duration,
             entry_target_transition_elapsed_ +
                 std::max(0.0, static_cast<double>(rl_dt)) * inference_steps);
         const double progress = entry_target_transition_elapsed_ / duration;
         const double alpha = progress * progress;
-        for (std::size_t i = 0; i < raw_target.size(); ++i) {
-            output_->target_pos[i] =
-                (1.0 - alpha) * output_->target_pos[i] + alpha * raw_target[i];
+        for (std::size_t i = 0; i < target.size(); ++i) {
+            target[i] = (1.0 - alpha) * output_->target_pos[i] + alpha * target[i];
         }
+    }
+
+    bool ClampTargetPosition(std::vector<double> &target) {
+        if (config_.target_position_lower.empty()) return true;
+        if (target.size() != config_.target_position_lower.size()) {
+            ReportFault(robot_base::FaultCode::INVALID_DATA,
+                "RL target position dimensions do not match configured limits");
+            return false;
+        }
+        for (std::size_t i = 0; i < target.size(); ++i) {
+            if (!std::isfinite(target[i])) {
+                ReportFault(robot_base::FaultCode::INVALID_DATA,
+                    "RL target position is not finite at joint " + std::to_string(i));
+                return false;
+            }
+            target[i] = std::clamp(target[i],
+                config_.target_position_lower[i] + config_.target_limit_margin,
+                config_.target_position_upper[i] - config_.target_limit_margin);
+        }
+        return true;
     }
 
     // ==================== 推理线程回调 ====================
@@ -363,12 +386,13 @@ private:
         std::array<double, 4> base_quat;
         std::vector<double> joint_pos, joint_vel;
         double cmd_vx, cmd_vy, cmd_wz;
-        robot_base::InteractionRequest interaction_request;
+        InferenceDiagnostics diagnostics;
         double device_time;
         float rl_dt;
         std::uint64_t release_sequence = 0;
         RLRuntimeClock::time_point release_time;
         RLRuntimeClock::time_point inference_start;
+        double cpu_start_s = 0.0;
 
         // 等待控制循环的主线程发来通知（严格同步到 control_dt 驱动的时钟）
         {
@@ -381,6 +405,7 @@ private:
                 return false;  // 退出线程
             }
             inference_start = RLRuntimeClock::now();
+            cpu_start_s = ThreadCpuSeconds();
             new_data_ready_ = false;
             release_sequence = sample_release_sequence_;
             release_time = sample_release_time_;
@@ -397,9 +422,11 @@ private:
             cmd_vx = sample_cmd_vx_;
             cmd_vy = sample_cmd_vy_;
             cmd_wz = sample_cmd_wz_;
-            interaction_request = sample_interaction_request_;
+            diagnostics.request = sample_interaction_request_;
             rl_dt = sample_rl_dt_;
         }
+        auto stage_start = RLRuntimeClock::now();
+        diagnostics.snapshot_ms = DurationMilliseconds(stage_start, inference_start);
         NotifyRuntimeEvent(RLRuntimeEventType::INFERENCE_START,
             release_sequence, inference_start);
 
@@ -419,7 +446,7 @@ private:
                         "manual reference playback started", false);
                 }
                 policy_adapter_->HandleInteractionRequest(
-                    interaction_request, elapsed);
+                    diagnostics.request, elapsed);
                 robot_base::RobotData snapshot;
                 snapshot.num_dof = static_cast<int>(joint_pos.size());
                 snapshot.base_pos = base_pos;
@@ -433,6 +460,9 @@ private:
                 snapshot.joint_vel = joint_vel;
                 policy_adapter_->PrepareInputs(snapshot, elapsed, policy_);
             }
+            auto stage_finish = RLRuntimeClock::now();
+            diagnostics.prepare_inputs_ms = DurationMilliseconds(stage_finish, stage_start);
+            stage_start = stage_finish;
 
             // 组装观测 + 推理
             policy_.AssembleObs(gyro,
@@ -446,17 +476,23 @@ private:
                                 base_vel,
                                 rl_dt,
                                 obs);
+            stage_finish = RLRuntimeClock::now();
+            diagnostics.assemble_obs_ms = DurationMilliseconds(stage_finish, stage_start);
+            stage_start = stage_finish;
             if (policy_trace_enabled_) {
                 policy_.Infer(obs, action, &raw_action);
                 executor_action = action;
             } else {
                 policy_.Infer(obs, action);
             }
+            stage_finish = RLRuntimeClock::now();
+            diagnostics.policy_infer_ms = DurationMilliseconds(stage_finish, stage_start);
+            stage_start = stage_finish;
             if (policy_adapter_) policy_adapter_->OnAction(action);
             if (policy_adapter_) {
+                diagnostics.interaction = policy_adapter_->GetInteractionStatus();
                 std::lock_guard<std::mutex> lock(mutex_interaction_status_);
-                interaction_status_ =
-                    policy_adapter_->GetInteractionStatus();
+                interaction_status_ = diagnostics.interaction;
             }
         } catch (const std::exception &error) {
             if (!running_.load(std::memory_order_acquire)) return false;
@@ -465,6 +501,10 @@ private:
             return false;
         }
         const auto inference_finish = RLRuntimeClock::now();
+        diagnostics.postprocess_ms = DurationMilliseconds(inference_finish, stage_start);
+        diagnostics.thread_cpu_ms = (ThreadCpuSeconds() - cpu_start_s) * 1000.0;
+        PolicyTiming timing{release_sequence, release_time, inference_start,
+            inference_finish, {}};
         NotifyRuntimeEvent(RLRuntimeEventType::INFERENCE_FINISH,
             release_sequence, inference_finish);
         UpdateRlFreq();
@@ -474,7 +514,10 @@ private:
                 inference_finish - release_time).count() >
                 config_.inference_deadline_s) {
             ReportFault(robot_base::FaultCode::INFERENCE_TIMEOUT,
-                "RL inference missed its release-to-finish deadline");
+                InferenceTimeoutDetail(timing, diagnostics));
+            RecordPolicyTrace(obs, raw_action, executor_action, action,
+                device_time, timing, diagnostics, cmd_vx, cmd_vy, cmd_wz,
+                false);
             return false;
         }
         if (action.size() != static_cast<size_t>(policy_.ActionDim()) ||
@@ -487,22 +530,20 @@ private:
 
         // 写入动作缓存
         RLRuntimeClock::time_point action_published;
-        PolicyTiming timing;
         {
             std::lock_guard<std::mutex> lock(mutex_action_);
             cached_action_ = action;
             has_action_ = true;
             cached_release_sequence_ = release_sequence;
             action_published = RLRuntimeClock::now();
-            timing = {release_sequence, release_time, inference_start,
-                inference_finish, action_published};
+            timing.action_published = action_published;
             cached_timing_ = timing;
             ++action_sequence_;
         }
         NotifyRuntimeEvent(RLRuntimeEventType::ACTION_PUBLISHED,
             release_sequence, action_published);
         RecordPolicyTrace(obs, raw_action, executor_action, action,
-            device_time, timing, cmd_vx, cmd_vy, cmd_wz);
+            device_time, timing, diagnostics, cmd_vx, cmd_vy, cmd_wz, true);
 
         return true;  // 继续循环
     }
@@ -581,6 +622,17 @@ private:
         RLRuntimeClock::time_point action_published;
     };
 
+    struct InferenceDiagnostics {
+        double snapshot_ms = 0.0;
+        double prepare_inputs_ms = 0.0;
+        double assemble_obs_ms = 0.0;
+        double policy_infer_ms = 0.0;
+        double postprocess_ms = 0.0;
+        double thread_cpu_ms = std::numeric_limits<double>::quiet_NaN();
+        robot_base::InteractionRequest request;
+        robot_base::InteractionStatus interaction;
+    };
+
     PolicyTiming cached_timing_;
     RLRuntimeClock::time_point entered_at_;
 
@@ -612,6 +664,39 @@ private:
         return std::chrono::duration<double, std::milli>(finish - start).count();
     }
 
+    static double ThreadCpuSeconds() {
+        timespec timestamp{};
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &timestamp) != 0) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        return static_cast<double>(timestamp.tv_sec) + timestamp.tv_nsec * 1.0e-9;
+    }
+
+    std::string InferenceTimeoutDetail(const PolicyTiming &timing,
+        const InferenceDiagnostics &diagnostics) const {
+        std::ostringstream detail;
+        detail << std::fixed << std::setprecision(3)
+            << "RL inference missed its release-to-finish deadline"
+            << ": policy=" << std::quoted(config_.policy_name)
+            << ", release_sequence=" << timing.release_sequence
+            << ", total_ms=" << DurationMilliseconds(timing.inference_finish, timing.release)
+            << ", deadline_ms=" << config_.inference_deadline_s * 1000.0
+            << ", wait_ms=" << DurationMilliseconds(timing.inference_start, timing.release)
+            << ", snapshot_ms=" << diagnostics.snapshot_ms
+            << ", prepare_inputs_ms=" << diagnostics.prepare_inputs_ms
+            << ", assemble_obs_ms=" << diagnostics.assemble_obs_ms
+            << ", policy_infer_ms=" << diagnostics.policy_infer_ms
+            << ", postprocess_ms=" << diagnostics.postprocess_ms
+            << ", inference_thread_cpu_ms=" << diagnostics.thread_cpu_ms
+            << ", interaction_sequence=" << diagnostics.interaction.sequence
+            << ", interaction_action=" << std::quoted(diagnostics.interaction.action)
+            << ", interaction_phase=" << static_cast<int>(diagnostics.interaction.phase)
+            << ", request_sequence=" << diagnostics.request.sequence
+            << ", request_operation=" << static_cast<int>(diagnostics.request.operation)
+            << ", request_action=" << std::quoted(diagnostics.request.action);
+        return detail.str();
+    }
+
     void ConfigurePolicyTrace() {
         const auto logging_config = runtime_logging::GetConfig();
         policy_trace_enabled_ = logging_config.telemetry_enabled &&
@@ -639,6 +724,10 @@ private:
         for (int i = 0; i < policy_.ActionDim(); ++i) {
             header << ",adapter_action_" << i;
         }
+        header << ",result,release_to_finish_ms,inference_deadline_ms,snapshot_ms,"
+            "prepare_inputs_ms,assemble_obs_ms,policy_infer_ms,postprocess_ms,"
+            "inference_thread_cpu_ms,interaction_sequence,interaction_action,interaction_phase,"
+            "request_sequence,request_operation,request_action";
         policy_trace_header_ = header.str();
 
         std::ostringstream apply_header;
@@ -655,26 +744,30 @@ private:
                             const std::vector<double> &adapter_action,
                             double device_time,
                             const PolicyTiming &timing,
+                            const InferenceDiagnostics &diagnostics,
                             double cmd_vx,
                             double cmd_vy,
-                            double cmd_wz) const {
+                            double cmd_wz,
+                            bool published) const {
         if (!policy_trace_enabled_) return;
 
         const double wall_time = std::chrono::duration<double>(
             std::chrono::system_clock::now().time_since_epoch()).count();
+        const double unavailable = std::numeric_limits<double>::quiet_NaN();
         std::ostringstream row;
         row << std::fixed << std::setprecision(9)
             << wall_time << "," << device_time << "," << timing.release_sequence
             << "," << ClockSeconds(timing.release)
             << "," << ClockSeconds(timing.inference_start)
             << "," << ClockSeconds(timing.inference_finish)
-            << "," << ClockSeconds(timing.action_published)
+            << "," << (published ? ClockSeconds(timing.action_published) : unavailable)
             << "," << DurationMilliseconds(timing.inference_start, timing.release)
             << "," << DurationMilliseconds(
                 timing.inference_finish, timing.inference_start)
-            << "," << DurationMilliseconds(
-                timing.action_published, timing.inference_finish)
-            << "," << DurationMilliseconds(timing.action_published, timing.release)
+            << "," << (published ? DurationMilliseconds(
+                timing.action_published, timing.inference_finish) : unavailable)
+            << "," << (published ? DurationMilliseconds(
+                timing.action_published, timing.release) : unavailable)
             << "," << cmd_vx << "," << cmd_vy << "," << cmd_wz;
         for (int i = 0; i < obs.size(); ++i) {
             row << "," << obs[i];
@@ -688,6 +781,21 @@ private:
         for (double value : adapter_action) {
             row << "," << value;
         }
+        row << "," << (published ? "published" : "inference_timeout")
+            << "," << DurationMilliseconds(timing.inference_finish, timing.release)
+            << "," << config_.inference_deadline_s * 1000.0
+            << "," << diagnostics.snapshot_ms
+            << "," << diagnostics.prepare_inputs_ms
+            << "," << diagnostics.assemble_obs_ms
+            << "," << diagnostics.policy_infer_ms
+            << "," << diagnostics.postprocess_ms
+            << "," << diagnostics.thread_cpu_ms
+            << "," << diagnostics.interaction.sequence
+            << "," << std::quoted(diagnostics.interaction.action, '"', '"')
+            << "," << static_cast<int>(diagnostics.interaction.phase)
+            << "," << diagnostics.request.sequence
+            << "," << static_cast<int>(diagnostics.request.operation)
+            << "," << std::quoted(diagnostics.request.action, '"', '"');
         runtime_logging::RecordCsv(
             policy_trace_stream_, policy_trace_header_, row.str());
     }

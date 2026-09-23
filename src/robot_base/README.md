@@ -37,12 +37,13 @@
 
 配置字段为 public，`Start()` 前直接赋值；`Apply()` 可单独调用以配置调用线程自身（如 application 主线程）。
 
-支持拷贝构造/赋值，**仅复制配置字段**（`name/cpu_id/sched/priority`），不复制线程运行状态，因此可作为配置载体嵌入其他可拷贝结构体。
+支持拷贝构造/赋值，**仅复制配置字段**，不复制线程运行状态，因此可作为配置载体嵌入其他可拷贝结构体。
 
 | 接口 | 说明 |
 | :--- | :--- |
 | `name` | 线程名（最长 15 字符，用于 `ps`/`htop` 中识别） |
 | `cpu_id` | CPU 亲和性，`-1` 不绑定 |
+| `cpu_affinity` | 可迁移的 Linux CPU 编号列表；非空时不能再配 `cpu_id` |
 | `sched` | 调度策略：`"other"`（CFS 默认）\| `"fifo"` \| `"rr"` |
 | `priority` | 优先级（`fifo`/`rr`: 1~99；`other` 忽略） |
 | `FromYaml(yaml, name)` | 静态工厂：从 `robot_base.threads.{name}` 加载配置，返回未启动的 ThreadLoop |
@@ -58,7 +59,7 @@ YAML 配置位于 `robot_base.threads`，按线程名独立配置，各模块按
 robot_base:
   threads:
     rl_infer:       # RL 推理线程
-      cpu_id: 2
+      cpu_affinity: [4, 5, 6, 7]
       sched: fifo   # other（默认）| fifo | rr（需 root）
       priority: 80
     control_main:   # control_demo 主控制循环

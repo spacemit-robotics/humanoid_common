@@ -84,6 +84,11 @@ struct RLConfig {
     std::vector<double> zero_target_pos;  // ZERO 阶段目标位姿（可选，空则用 rl_default_pos）
     double entry_target_transition_duration = 0.0;  // RL 入场目标位置过渡时长（秒）
 
+    // 可选目标位置限位，按机器人关节顺序，单位 rad；两组为空时禁用。
+    std::vector<double> target_position_lower;
+    std::vector<double> target_position_upper;
+    double target_limit_margin = 0.0;
+
     // ---- RL 策略增益 ----
     std::vector<double> kp;
     std::vector<double> kd;
@@ -99,6 +104,8 @@ struct RLConfig {
 RLConfig LoadRLStateConfig(const std::string &yaml_path,
     const std::string &policy_name,
     const std::string &robot_dir);
+
+void ValidateRLTargetPositionLimits(const RLConfig &config);
 
 // 工厂函数
 std::unique_ptr<State> CreateStatePowerOff();

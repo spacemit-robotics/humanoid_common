@@ -19,6 +19,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -52,6 +53,16 @@ std::int64_t ToNanoseconds(RLRuntimeClock::time_point timestamp) {
 
 double NanosecondsToMilliseconds(std::int64_t nanoseconds) {
     return static_cast<double>(nanoseconds) / 1.0e6;
+}
+
+std::string FormatInferenceCpuConfig(const robot_base::ThreadLoop &config) {
+    if (config.cpu_affinity.empty()) return std::to_string(config.cpu_id);
+    std::ostringstream output;
+    for (std::size_t index = 0; index < config.cpu_affinity.size(); ++index) {
+        if (index != 0) output << ',';
+        output << config.cpu_affinity[index];
+    }
+    return output.str();
 }
 
 void StoreMaximum(
@@ -826,7 +837,7 @@ int main(int argc, char *argv[]) {
         std::cout << ", before-init=" << affinity_before_init;
         std::cout << ", after-init=" << affinity_after_init << "\n";
         std::cout << "Inference thread: cpu=";
-        std::cout << config.infer_thread_cfg.cpu_id;
+        std::cout << FormatInferenceCpuConfig(config.infer_thread_cfg);
         std::cout << ", sched=" << config.infer_thread_cfg.sched;
         std::cout << ", priority=" << config.infer_thread_cfg.priority << "\n";
         std::cout << "Reference loop: " << reference_loop << "\n";

@@ -23,6 +23,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -49,24 +50,27 @@ fs::path ResolvePath(const std::string &robot_dir, const std::string &path) {
 
 PlaybackSample SamplePlayback(double elapsed_s,
     int num_frames,
-    const Config &config) {
+    double motion_fps,
+    double playback_speed,
+    bool loop,
+    double loop_pause) {
     if (num_frames <= 0) {
         throw std::runtime_error("[policy_adapter] 参考动作没有帧");
     }
-    if (config.motion_fps <= 0.0 || config.playback_speed <= 0.0) {
+    if (motion_fps <= 0.0 || playback_speed <= 0.0) {
         throw std::runtime_error("[policy_adapter] fps 和 playback_speed 必须大于 0");
     }
-    if (config.loop_pause < 0.0) {
+    if (loop_pause < 0.0) {
         throw std::runtime_error("[policy_adapter] loop_pause 不能小于 0");
     }
 
-    const double frame_dt = 1.0 / config.motion_fps;
+    const double frame_dt = 1.0 / motion_fps;
     const double duration = num_frames * frame_dt;
-    const double active_wall_duration = duration / config.playback_speed;
+    const double active_wall_duration = duration / playback_speed;
     double cycle_elapsed = std::max(elapsed_s, 0.0);
     bool hold_last_frame = false;
-    if (config.loop) {
-        const double cycle_duration = active_wall_duration + config.loop_pause;
+    if (loop) {
+        const double cycle_duration = active_wall_duration + loop_pause;
         cycle_elapsed = std::fmod(cycle_elapsed, cycle_duration);
         hold_last_frame = cycle_elapsed >= active_wall_duration;
     } else {
@@ -75,7 +79,7 @@ PlaybackSample SamplePlayback(double elapsed_s,
 
     const double motion_time = hold_last_frame
         ? duration
-        : std::clamp(cycle_elapsed * config.playback_speed, 0.0, duration);
+        : std::clamp(cycle_elapsed * playback_speed, 0.0, duration);
     const double frame_position =
         std::min(motion_time / frame_dt, num_frames - 1.0);
     PlaybackSample sample;
@@ -84,6 +88,13 @@ PlaybackSample SamplePlayback(double elapsed_s,
     sample.alpha = static_cast<float>(frame_position - sample.frame0);
     sample.hold_last_frame = hold_last_frame;
     return sample;
+}
+
+PlaybackSample SamplePlayback(double elapsed_s,
+    int num_frames,
+    const Config &config) {
+    return SamplePlayback(elapsed_s, num_frames, config.motion_fps,
+        config.playback_speed, config.loop, config.loop_pause);
 }
 
 Eigen::Quaternionf RobotQuaternion(const robot_base::RobotData &robot) {
@@ -144,6 +155,11 @@ void AppendQuaternionXyzw(
 
 void AppendZeros(int count, std::vector<float> &output) {
     output.insert(output.end(), count, 0.0F);
+}
+
+double SmoothStep01(double value) {
+    const double x = std::clamp(value, 0.0, 1.0);
+    return x * x * (3.0 - 2.0 * x);
 }
 
 class MjlabPolicyAdapter final : public PolicyAdapter {
@@ -735,6 +751,11 @@ struct SonicFrame {
     Eigen::Quaternionf root_quat = Eigen::Quaternionf::Identity();
 };
 
+struct SonicClip {
+    ReferenceMotionConfig config;
+    std::vector<SonicFrame> frames;
+};
+
 /**
  * @brief SONIC 机器人关节参考动作编码适配器
  *
@@ -751,23 +772,36 @@ public:
             ? static_cast<int>(policy_config.rl_default_pos.size())
             : static_cast<int>(policy_config.action_joint_index.size());
         ValidateConfig();
-        LoadReference();
+        LoadReferences();
     }
 
     const char *Type() const override { return "sonic"; }
 
     void Reset(const robot_base::RobotData &robot) override {
-        heading_offset_ = YawQuaternion(
-            QuaternionYaw(RobotQuaternion(robot)) -
-            QuaternionYaw(motion_[0].root_quat));
-        heading_offset_.normalize();
+        active_clip_index_ = default_clip_index_;
+        playback_start_elapsed_ = 0.0;
+        transition_start_elapsed_ = 0.0;
+        last_request_sequence_ = 0;
+        transition_active_ = false;
+        canceling_ = false;
+        playback_active_ = !interactive_;
+        status_ = {};
+        last_robot_quat_ = RobotQuaternion(robot);
+        UpdateHeadingOffset();
     }
 
     void PrepareInputs(const robot_base::RobotData &robot,
         double elapsed_s,
         rl_policy::PolicyExecutor &policy) override {
-        const PlaybackSample sample = SamplePlayback(
-            elapsed_s, static_cast<int>(motion_.size()), config_);
+        if (!std::isfinite(elapsed_s) || elapsed_s < 0.0) {
+            throw std::runtime_error(
+                "[policy_adapter] SONIC elapsed_s 非法");
+        }
+        last_robot_quat_ = RobotQuaternion(robot);
+        UpdateInteractionStatus(elapsed_s);
+
+        const PlaybackSample sample = ActiveSample(elapsed_s);
+        const double transition_alpha = TransitionAlpha(elapsed_s);
 
         std::vector<float> values;
         const std::size_t reference_obs_dim = ReferenceObsDim();
@@ -775,14 +809,14 @@ public:
 
         // encoder_mode_4：G1 mode_id=0，其余三维为 padding。
         AppendZeros(kEncoderModeDim, values);
-        AppendFutureDof(sample, false, values);
-        AppendFutureDof(sample, true, values);
+        AppendFutureDof(sample, false, transition_alpha, values);
+        AppendFutureDof(sample, true, transition_alpha, values);
 
         // 以下字段属于其他 encoder mode，在 G1 mode 下按官方 masking 置零。
         AppendZeros(config_.future_frames, values);  // future root z
         AppendZeros(1, values);    // motion_root_z_position
         AppendZeros(kOrientationDim, values);  // motion_anchor_orientation
-        AppendFutureOrientation(robot, sample, values);
+        AppendFutureOrientation(robot, sample, transition_alpha, values);
         AppendZeros(kLowerBodyDofCount * config_.future_frames, values);
         AppendZeros(kLowerBodyDofCount * config_.future_frames, values);
         AppendZeros(kVrPositionDim, values);
@@ -800,6 +834,64 @@ public:
         }
         policy.SetModelInput(
             "reference_obs", values.data(), values.size());
+    }
+
+    void HandleInteractionRequest(
+        const robot_base::InteractionRequest &request,
+        double elapsed_s) override {
+        if (!interactive_ ||
+            request.operation ==
+                robot_base::InteractionRequest::Operation::NONE ||
+            request.sequence == 0 ||
+            request.sequence <= last_request_sequence_) {
+            return;
+        }
+        last_request_sequence_ = request.sequence;
+
+        using Operation = robot_base::InteractionRequest::Operation;
+        using Phase = robot_base::InteractionStatus::Phase;
+        const bool busy = status_.phase == Phase::BLEND_IN ||
+            status_.phase == Phase::PLAYING ||
+            status_.phase == Phase::HOLDING ||
+            status_.phase == Phase::BLEND_OUT;
+        if (request.operation == Operation::CANCEL) {
+            status_.sequence = request.sequence;
+            if (!busy) {
+                status_.request_accepted = false;
+                status_.phase = Phase::REJECTED;
+                status_.progress = 0.0F;
+                if (status_.action.empty()) status_.action = "cancel";
+                return;
+            }
+            status_.request_accepted = true;
+            BeginTransition(default_clip_index_, elapsed_s, false, true);
+            return;
+        }
+
+        if (busy) {
+            status_.sequence = request.sequence;
+            status_.request_accepted = false;
+            return;
+        }
+        const auto clip = clips_by_name_.find(request.action);
+        if (clip == clips_by_name_.end()) {
+            status_.sequence = request.sequence;
+            status_.request_accepted = false;
+            status_.phase = Phase::REJECTED;
+            status_.progress = 0.0F;
+            status_.action = request.action;
+            return;
+        }
+
+        status_.sequence = request.sequence;
+        status_.request_accepted = true;
+        status_.progress = 0.0F;
+        status_.action = request.action;
+        BeginTransition(clip->second, elapsed_s, true, false);
+    }
+
+    robot_base::InteractionStatus GetInteractionStatus() const override {
+        return status_;
     }
 
 private:
@@ -821,6 +913,12 @@ private:
             throw std::runtime_error(
                 "[policy_adapter] SONIC future_frames 和 future_step "
                 "必须大于 0");
+        }
+        if (!std::isfinite(
+                config_.reference_motion_catalog.transition_duration) ||
+            config_.reference_motion_catalog.transition_duration < 0.0) {
+            throw std::runtime_error(
+                "[policy_adapter] SONIC transition_duration 不能小于 0");
         }
     }
 
@@ -887,8 +985,23 @@ private:
         return rows;
     }
 
-    void LoadReference() {
-        const fs::path reference_dir(config_.reference_file);
+    std::vector<SonicFrame> LoadReference(
+        const ReferenceMotionConfig &reference) {
+        if (reference.file.empty()) {
+            throw std::runtime_error(
+                "[policy_adapter] SONIC 参考动作路径不能为空");
+        }
+        if (!std::isfinite(reference.motion_fps) ||
+            reference.motion_fps <= 0.0 ||
+            !std::isfinite(reference.playback_speed) ||
+            reference.playback_speed <= 0.0 ||
+            !std::isfinite(reference.loop_pause) ||
+            reference.loop_pause < 0.0) {
+            throw std::runtime_error(
+                "[policy_adapter] SONIC 参考动作播放参数非法: " +
+                reference.name);
+        }
+        const fs::path reference_dir(reference.file);
         const auto joint_pos = LoadCsv(
             reference_dir / "joint_pos.csv", model_dof_count_, true);
         const auto joint_vel = LoadCsv(
@@ -902,7 +1015,8 @@ private:
                 "帧数不一致");
         }
 
-        motion_.reserve(joint_pos.size());
+        std::vector<SonicFrame> motion;
+        motion.reserve(joint_pos.size());
         for (std::size_t frame_index = 0;
             frame_index < joint_pos.size(); ++frame_index) {
             SonicFrame frame;
@@ -925,34 +1039,236 @@ private:
                     "[policy_adapter] SONIC body_quat 包含零四元数");
             }
             frame.root_quat.normalize();
-            motion_.push_back(std::move(frame));
+            motion.push_back(std::move(frame));
         }
-        std::cout << "[policy_adapter] SONIC: " << motion_.size()
+        std::cout << "[policy_adapter] SONIC: " << motion.size()
             << " 帧, model_dof=" << model_dof_count_
-            << ", reference=" << config_.reference_file << std::endl;
+            << ", reference=" << reference.file << std::endl;
+        return motion;
     }
 
-    const SonicFrame &FrameAt(int index) const {
-        return motion_[std::clamp(
-            index, 0, static_cast<int>(motion_.size()) - 1)];
+    void LoadReferences() {
+        const auto &catalog = config_.reference_motion_catalog;
+        interactive_ = catalog.Enabled();
+        if (interactive_) {
+            for (const auto &reference : catalog.actions) {
+                if (reference.name.empty() ||
+                    clips_by_name_.find(reference.name) !=
+                        clips_by_name_.end()) {
+                    throw std::runtime_error(
+                        "[policy_adapter] SONIC 动作名为空或重复: " +
+                        reference.name);
+                }
+                SonicClip clip;
+                clip.config = reference;
+                clip.frames = LoadReference(reference);
+                clips_by_name_[reference.name] = clips_.size();
+                clips_.push_back(std::move(clip));
+            }
+            const auto default_clip = clips_by_name_.find(
+                catalog.default_action);
+            if (default_clip == clips_by_name_.end()) {
+                throw std::runtime_error(
+                    "[policy_adapter] SONIC default_action 不存在: " +
+                    catalog.default_action);
+            }
+            default_clip_index_ = default_clip->second;
+            return;
+        }
+
+        ReferenceMotionConfig reference;
+        reference.file = config_.reference_file;
+        reference.motion_fps = config_.motion_fps;
+        reference.playback_speed = config_.playback_speed;
+        reference.loop = config_.loop;
+        reference.loop_pause = config_.loop_pause;
+        SonicClip clip;
+        clip.config = reference;
+        clip.frames = LoadReference(reference);
+        clips_.push_back(std::move(clip));
+    }
+
+    const SonicClip &ActiveClip() const {
+        return clips_.at(active_clip_index_);
+    }
+
+    const SonicFrame &FrameAt(const SonicClip &clip, int index) const {
+        return clip.frames[std::clamp(
+            index, 0, static_cast<int>(clip.frames.size()) - 1)];
+    }
+
+    double PlaybackElapsed(double elapsed_s) const {
+        return playback_active_
+            ? std::max(0.0, elapsed_s - playback_start_elapsed_)
+            : 0.0;
+    }
+
+    PlaybackSample ActiveSample(double elapsed_s) const {
+        const auto &clip = ActiveClip();
+        return SamplePlayback(PlaybackElapsed(elapsed_s),
+            static_cast<int>(clip.frames.size()), clip.config.motion_fps,
+            clip.config.playback_speed, clip.config.loop,
+            clip.config.loop_pause);
+    }
+
+    double TransitionAlpha(double elapsed_s) const {
+        if (!transition_active_) return 1.0;
+        const double duration =
+            config_.reference_motion_catalog.transition_duration;
+        return duration <= 0.0 ? 1.0 : SmoothStep01(
+            (elapsed_s - transition_start_elapsed_) / duration);
+    }
+
+    SonicFrame CurrentReference(double elapsed_s) const {
+        const auto &clip = ActiveClip();
+        const PlaybackSample sample = ActiveSample(elapsed_s);
+        const SonicFrame &frame0 = FrameAt(clip, sample.frame0);
+        const SonicFrame &frame1 = FrameAt(clip, sample.frame1);
+        const float alpha = sample.alpha;
+        const double transition_alpha = TransitionAlpha(elapsed_s);
+
+        SonicFrame current;
+        current.dof_pos.resize(model_dof_count_);
+        current.dof_vel.resize(model_dof_count_);
+        for (int joint = 0; joint < model_dof_count_; ++joint) {
+            const float position = (1.0F - alpha) *
+                frame0.dof_pos[joint] + alpha * frame1.dof_pos[joint];
+            const float velocity = !playback_active_ ||
+                    sample.hold_last_frame
+                ? 0.0F
+                : ((1.0F - alpha) * frame0.dof_vel[joint] +
+                    alpha * frame1.dof_vel[joint]) *
+                    static_cast<float>(clip.config.playback_speed);
+            current.dof_pos[joint] = transition_active_
+                ? static_cast<float>((1.0 - transition_alpha) *
+                    transition_source_.dof_pos[joint] +
+                    transition_alpha * position)
+                : position;
+            current.dof_vel[joint] = transition_active_
+                ? static_cast<float>((1.0 - transition_alpha) *
+                    transition_source_.dof_vel[joint] +
+                    transition_alpha * velocity)
+                : velocity;
+        }
+        const Eigen::Quaternionf target =
+            (heading_offset_ * frame0.root_quat.slerp(
+                alpha, frame1.root_quat)).normalized();
+        current.root_quat = transition_active_
+            ? transition_source_.root_quat.slerp(
+                static_cast<float>(transition_alpha), target).normalized()
+            : target;
+        return current;
+    }
+
+    void UpdateHeadingOffset() {
+        const auto &first = ActiveClip().frames.front();
+        heading_offset_ = YawQuaternion(
+            QuaternionYaw(last_robot_quat_) -
+            QuaternionYaw(first.root_quat));
+        heading_offset_.normalize();
+    }
+
+    void BeginTransition(std::size_t clip_index,
+        double elapsed_s,
+        bool start_playback,
+        bool canceling) {
+        transition_source_ = CurrentReference(elapsed_s);
+        active_clip_index_ = clip_index;
+        UpdateHeadingOffset();
+        transition_start_elapsed_ = elapsed_s;
+        playback_start_elapsed_ = elapsed_s +
+            config_.reference_motion_catalog.transition_duration;
+        transition_active_ =
+            config_.reference_motion_catalog.transition_duration > 0.0;
+        playback_active_ = start_playback;
+        canceling_ = canceling;
+        status_.phase = canceling
+            ? robot_base::InteractionStatus::Phase::BLEND_OUT
+            : (transition_active_
+                ? robot_base::InteractionStatus::Phase::BLEND_IN
+                : robot_base::InteractionStatus::Phase::PLAYING);
+        if (!transition_active_ && canceling_) {
+            playback_active_ = false;
+            canceling_ = false;
+            status_.phase = robot_base::InteractionStatus::Phase::FINISHED;
+            status_.progress = 1.0F;
+        }
+    }
+
+    void UpdateInteractionStatus(double elapsed_s) {
+        if (!interactive_) return;
+        using Phase = robot_base::InteractionStatus::Phase;
+        if (transition_active_) {
+            status_.progress = 0.0F;
+            if (TransitionAlpha(elapsed_s) < 1.0) return;
+            transition_active_ = false;
+            if (canceling_) {
+                canceling_ = false;
+                playback_active_ = false;
+                status_.phase = Phase::FINISHED;
+                status_.progress = 1.0F;
+                return;
+            }
+            status_.phase = Phase::PLAYING;
+        }
+        if (!playback_active_) return;
+
+        const auto &clip = ActiveClip();
+        const double active_duration = clip.frames.size() /
+            (clip.config.motion_fps * clip.config.playback_speed);
+        const double elapsed = PlaybackElapsed(elapsed_s);
+        if (!clip.config.loop && elapsed >= active_duration) {
+            status_.phase = Phase::FINISHED;
+            status_.progress = 1.0F;
+            return;
+        }
+        if (clip.config.loop) {
+            const double cycle_duration =
+                active_duration + clip.config.loop_pause;
+            const double cycle_elapsed = std::fmod(elapsed, cycle_duration);
+            status_.phase = cycle_elapsed >= active_duration
+                ? Phase::HOLDING : Phase::PLAYING;
+            status_.progress = active_duration <= 0.0
+                ? 1.0F
+                : static_cast<float>(std::clamp(
+                    cycle_elapsed / active_duration, 0.0, 1.0));
+            return;
+        }
+        status_.phase = Phase::PLAYING;
+        status_.progress = active_duration <= 0.0
+            ? 1.0F
+            : static_cast<float>(std::clamp(
+                elapsed / active_duration, 0.0, 1.0));
     }
 
     void AppendFutureDof(const PlaybackSample &sample,
         bool velocity,
+        double transition_alpha,
         std::vector<float> &output) const {
+        const auto &clip = ActiveClip();
         for (int future = 0; future < config_.future_frames; ++future) {
-            const int offset = future * config_.future_step;
-            const auto &frame0 = FrameAt(sample.frame0 + offset);
-            const auto &frame1 = FrameAt(sample.frame1 + offset);
+            const int offset = playback_active_
+                ? future * config_.future_step : 0;
+            const auto &frame0 = FrameAt(clip, sample.frame0 + offset);
+            const auto &frame1 = FrameAt(clip, sample.frame1 + offset);
             const auto &value0 = velocity ? frame0.dof_vel : frame0.dof_pos;
             const auto &value1 = velocity ? frame1.dof_vel : frame1.dof_pos;
             for (int joint = 0; joint < model_dof_count_; ++joint) {
                 float value = (1.0F - sample.alpha) * value0[joint] +
                     sample.alpha * value1[joint];
                 if (velocity) {
-                    value = sample.hold_last_frame
+                    value = !playback_active_ || sample.hold_last_frame
                         ? 0.0F
-                        : value * static_cast<float>(config_.playback_speed);
+                        : value * static_cast<float>(
+                            clip.config.playback_speed);
+                }
+                if (transition_active_) {
+                    const float source = velocity
+                        ? transition_source_.dof_vel[joint]
+                        : transition_source_.dof_pos[joint];
+                    value = static_cast<float>(
+                        (1.0 - transition_alpha) * source +
+                        transition_alpha * value);
                 }
                 output.push_back(value);
             }
@@ -961,15 +1277,23 @@ private:
 
     void AppendFutureOrientation(const robot_base::RobotData &robot,
         const PlaybackSample &sample,
+        double transition_alpha,
         std::vector<float> &output) const {
         const Eigen::Quaternionf robot_quat = RobotQuaternion(robot);
+        const auto &clip = ActiveClip();
         for (int future = 0; future < config_.future_frames; ++future) {
-            const int offset = future * config_.future_step;
+            const int offset = playback_active_
+                ? future * config_.future_step : 0;
             Eigen::Quaternionf reference =
-                FrameAt(sample.frame0 + offset).root_quat.slerp(
+                FrameAt(clip, sample.frame0 + offset).root_quat.slerp(
                     sample.alpha,
-                    FrameAt(sample.frame1 + offset).root_quat);
+                    FrameAt(clip, sample.frame1 + offset).root_quat);
             reference = (heading_offset_ * reference).normalized();
+            if (transition_active_) {
+                reference = transition_source_.root_quat.slerp(
+                    static_cast<float>(transition_alpha), reference)
+                        .normalized();
+            }
             const Eigen::Matrix3f rotation =
                 (robot_quat.conjugate() * reference)
                     .normalized()
@@ -985,7 +1309,20 @@ private:
 
     Config config_;
     int model_dof_count_ = 0;
-    std::vector<SonicFrame> motion_;
+    std::vector<SonicClip> clips_;
+    std::unordered_map<std::string, std::size_t> clips_by_name_;
+    std::size_t default_clip_index_ = 0;
+    std::size_t active_clip_index_ = 0;
+    bool interactive_ = false;
+    bool playback_active_ = false;
+    bool transition_active_ = false;
+    bool canceling_ = false;
+    double playback_start_elapsed_ = 0.0;
+    double transition_start_elapsed_ = 0.0;
+    uint64_t last_request_sequence_ = 0;
+    robot_base::InteractionStatus status_;
+    SonicFrame transition_source_;
+    Eigen::Quaternionf last_robot_quat_ = Eigen::Quaternionf::Identity();
     Eigen::Quaternionf heading_offset_ = Eigen::Quaternionf::Identity();
 };
 
@@ -1068,8 +1405,6 @@ Config LoadConfig(const std::string &yaml_path,
             }
             return config;
         }
-        config.reference_file =
-            ReadReferenceField(yaml, adapter_base, robot_dir);
         config.motion_fps =
             yaml.Read<double>(adapter_base + ".motion_fps").value_or(50.0);
         config.playback_speed = yaml.Read<double>(
@@ -1078,6 +1413,73 @@ Config LoadConfig(const std::string &yaml_path,
             yaml.Read<bool>(adapter_base + ".loop").value_or(false);
         config.loop_pause = yaml.Read<double>(
             adapter_base + ".loop_pause").value_or(0.0);
+        const auto catalog = yaml.Read<std::string>(
+            adapter_base + ".catalog");
+        if (config.type == "sonic" && catalog && !catalog->empty()) {
+            const std::string catalog_base = *catalog;
+            auto &motion_catalog = config.reference_motion_catalog;
+            motion_catalog.transition_duration = yaml.Read<double>(
+                adapter_base + ".transition_duration").value_or(
+                    yaml.Read<double>(
+                        catalog_base + ".transition_duration")
+                            .value_or(0.25));
+            const double default_fps = yaml.Read<double>(
+                catalog_base + ".motion_fps").value_or(config.motion_fps);
+            const double default_speed = yaml.Read<double>(
+                catalog_base + ".playback_speed").value_or(
+                    config.playback_speed);
+            const bool default_loop = yaml.Read<bool>(
+                catalog_base + ".loop").value_or(config.loop);
+            const double default_loop_pause = yaml.Read<double>(
+                catalog_base + ".loop_pause").value_or(config.loop_pause);
+            const auto action_names = yaml.Read<std::vector<std::string>>(
+                catalog_base + ".action_names")
+                    .value_or(std::vector<std::string>{});
+            if (action_names.empty()) {
+                throw std::runtime_error(
+                    "[policy_adapter] SONIC 动作目录不能为空: " +
+                    catalog_base);
+            }
+            motion_catalog.default_action = yaml.Read<std::string>(
+                adapter_base + ".default_action").value_or(
+                    yaml.Read<std::string>(
+                        catalog_base + ".default_action")
+                            .value_or(action_names.front()));
+            for (const auto &name : action_names) {
+                const std::string action_base =
+                    catalog_base + ".actions." + name;
+                ReferenceMotionConfig action;
+                action.name = name;
+                const auto file = yaml.Read<std::string>(
+                    action_base + ".file");
+                if (!file || file->empty()) {
+                    throw std::runtime_error(
+                        "[policy_adapter] 缺少 " + action_base + ".file");
+                }
+                action.file = ResolvePath(robot_dir, *file).string();
+                action.motion_fps = yaml.Read<double>(
+                    action_base + ".motion_fps").value_or(default_fps);
+                action.playback_speed = yaml.Read<double>(
+                    action_base + ".playback_speed").value_or(default_speed);
+                action.loop = yaml.Read<bool>(
+                    action_base + ".loop").value_or(default_loop);
+                action.loop_pause = yaml.Read<double>(
+                    action_base + ".loop_pause").value_or(
+                        default_loop_pause);
+                if (action.name == motion_catalog.default_action) {
+                    config.reference_file = action.file;
+                }
+                motion_catalog.actions.push_back(std::move(action));
+            }
+            if (config.reference_file.empty()) {
+                throw std::runtime_error(
+                    "[policy_adapter] SONIC default_action 不在动作目录中: " +
+                    motion_catalog.default_action);
+            }
+        } else {
+            config.reference_file =
+                ReadReferenceField(yaml, adapter_base, robot_dir);
+        }
         const auto start_mode = yaml.Read<std::string>(
             adapter_base + ".start_mode").value_or("auto");
         if (start_mode != "auto" && start_mode != "manual") {

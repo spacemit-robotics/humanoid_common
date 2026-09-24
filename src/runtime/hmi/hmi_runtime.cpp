@@ -520,12 +520,12 @@ void RenderMainPage(const UiState &state) {
         SetFg(Color::BRIGHT_CYAN);
         SetBold();
         if (InteractionIsBusy(state.status.interaction.phase)) {
-            printf("手臂动作执行中    [A] 动作列表    [C] 平滑取消");
+            printf("交互动作执行中    [A] 动作列表    [C] 平滑取消");
         } else if (state.status.interaction.phase ==
                 robot_base::InteractionStatus::Phase::FINISHED) {
-            printf("手臂动作已完成    [A] 选择下一个动作");
+            printf("交互动作已完成    [A] 选择下一个动作");
         } else {
-            printf("站立策略已接管    [A] 选择手臂动作");
+            printf("RL 策略已接管    [A] 选择交互动作");
         }
     } else {
         SetDim();
@@ -592,7 +592,7 @@ void RenderMainPage(const UiState &state) {
     if (interaction_active) {
         SetFg(Color::BRIGHT_CYAN);
         SetBold();
-        printf("[A] 手臂动作    ");
+        printf("[A] 交互动作    ");
         if (InteractionIsBusy(state.status.interaction.phase)) {
             printf("[C] 取消动作    ");
         }
@@ -734,7 +734,7 @@ void RenderInteractionSelectPage(const UiState &state) {
             robot_base::InteractionStatus::Phase::FINISHED) {
         printf("动作已完成，可以直接选择并播放下一项");
     } else {
-        printf("双腿始终由当前站立策略控制");
+        printf("动作由当前 RL 策略及其适配器执行");
     }
     ResetAttr();
     PrintLastAction(layout, operation_row + 7, state.last_action);
@@ -1091,13 +1091,13 @@ bool RequestInteractionCancel(UiState *state,
         const Clock::time_point &now) {
     if (!ActiveRlHasInteractions(*state)) {
         state->last_action =
-            "取消请求未发送：当前 RL 策略没有注册手臂动作";
+            "取消请求未发送：当前 RL 策略没有注册交互动作";
         return false;
     }
     if (!InteractionIsBusy(state->status.interaction.phase) &&
         state->target_command.interaction.operation ==
             robot_base::InteractionRequest::Operation::NONE) {
-        state->last_action = "当前没有执行中的手臂动作";
+        state->last_action = "当前没有执行中的交互动作";
         return false;
     }
     state->target_command.interaction.sequence =
@@ -1185,7 +1185,7 @@ void ProcessStatus(UiState *state, const robot_base::ControlStatus &status,
                 robot_base::InteractionStatus::Phase::REJECTED)) {
         state->last_action = status.interaction.phase ==
                 robot_base::InteractionStatus::Phase::FINISHED
-            ? "交互动作完成，控制权已交还站立策略"
+            ? "交互动作完成，当前 RL 策略继续接管"
             : "交互动作请求被拒绝";
     }
 
@@ -1248,8 +1248,8 @@ void ProcessStatus(UiState *state, const robot_base::ControlStatus &status,
         !ActiveRlHasInteractions(*state)) {
         state->page = HmiPage::MAIN;
         state->last_action = status.mode == ControlMode::RL
-            ? "当前策略没有注册手臂动作，已返回主界面"
-            : "已离开 RL，手臂动作页已关闭";
+            ? "当前策略没有注册交互动作，已返回主界面"
+            : "已离开 RL，交互动作页已关闭";
     }
     if (status.mode != ControlMode::RL &&
         state->target_command.interaction.operation !=

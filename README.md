@@ -234,6 +234,19 @@ driver 终端以固定屏限频刷新，
 推理发布时序和动作被控制线程采用后的最终关节目标。该流不受 `telemetry.rate_hz`
 降采样，用于复现实机策略发散链路。
 
+每次推理在 `result` 列标记为 `published` 或 `inference_timeout`。超时动作不会发布，
+也不会产生对应的 apply 行；该行的 `action_published_time_s`、
+`finish_to_publish_ms`、`release_to_publish_ms` 为 `nan`。统计已发布动作时应筛选
+`result=published`。
+
+CSV 还记录 `release_to_finish_ms`、`inference_deadline_ms`、传感器快照
+`snapshot_ms`、参考输入准备 `prepare_inputs_ms`、观测组装 `assemble_obs_ms`、
+执行器调用 `policy_infer_ms`、后处理 `postprocess_ms`，以及交互动作和请求状态。
+阶段耗时按经过时间统计，包含线程等待；`policy_infer_ms` 包含 PolicyExecutor 的
+输入输出处理，并非纯 ONNX Run。`inference_thread_cpu_ms` 仅统计推理线程自身的
+CPU 时间，不包含 ONNX/EP 工作线程。超时原因也会写入 `events.log`，不依赖
+debug 或 telemetry 开关。
+
 ### 执行器模式
 
 `ControlMode` 和 `ActuationMode` 是两个正交的语义层：
@@ -317,9 +330,37 @@ policy_adapter:
 - MJLab：`reference_file` 指向单个 NPZ；
 - ProtoMotions：`reference_file` 指向单个预处理 CSV，使用
   `future_steps`；
-- SONIC：`reference_file` 指向参考动作目录；目录内必须包含
-  `joint_pos.csv`、`joint_vel.csv` 和 `body_quat.csv`，使用
-  `future_frames` 和 `future_step`。
+- SONIC：单动作配置用 `reference_file`；多动作配置用 `catalog`，目录中的
+  每个 `file` 都指向包含 `joint_pos.csv`、`joint_vel.csv` 和
+  `body_quat.csv` 的参考动作目录。两种配置均使用 `future_frames` 和
+  `future_step`。
+
+SONIC 多动作模式复用 HMI 的交互动作页，但与 `joint_trajectory` 的局部关节
+接管不同：切换动作只更新策略的 `reference_obs`，ONNX 输出仍控制全部策略关节。
+进入 RL 后先保持 `default_action` 的首帧，选择动作时按
+`transition_duration` 平滑切换参考序列。
+
+下例中 `sonic_actions` 位于 YAML 根节点，`policy_adapter` 位于对应策略节点：
+
+```yaml
+sonic_actions:
+  action_names: [gesture_a, gesture_b]
+  default_action: gesture_a
+  transition_duration: 1.0
+  actions:
+    gesture_a: {file: policy/sonic/gesture_a, display_name: "动作 A"}
+    gesture_b: {file: policy/sonic/gesture_b, display_name: "动作 B"}
+
+rl_policy:
+  onnx_infer:
+    policies:
+      sonic:
+        policy_adapter:
+          type: sonic
+          catalog: sonic_actions
+          future_frames: 10
+          future_step: 5
+```
 
 策略若配置
 `zero_target_pos`，ZERO 阶段先过渡到参考动作起始姿态。非循环动作播放完成后

@@ -104,6 +104,7 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             std::cout << "FromYaml: name=" << tl.name << ", cpu_id=" << tl.cpu_id
+                << ", cpu_affinity.size()=" << tl.cpu_affinity.size()
                 << ", sched=" << tl.sched << ", priority=" << tl.priority << std::endl;
             std::cout << "ThreadLoop::FromYaml ✓" << std::endl;
         } else {
@@ -256,13 +257,14 @@ int main(int argc, char *argv[]) {
         {
             ThreadLoop src;
             src.name = "src_thread";
-            src.cpu_id = 2;
+            src.cpu_affinity = {2, 3};
             src.sched = "fifo";
             src.priority = 80;
 
             // 拷贝构造：新对象继承配置，处于未启动状态
             ThreadLoop dst(src);
-            if (dst.name != src.name || dst.cpu_id != src.cpu_id || dst.sched != src.sched ||
+            if (dst.name != src.name || dst.cpu_id != src.cpu_id ||
+                dst.cpu_affinity != src.cpu_affinity || dst.sched != src.sched ||
                 dst.priority != src.priority || dst.IsRunning()) {
                 std::cerr << "[错误] ThreadLoop 拷贝构造字段不一致或意外启动\n";
                 return 1;
@@ -271,7 +273,8 @@ int main(int argc, char *argv[]) {
             // 赋值：覆盖配置，不影响线程状态
             ThreadLoop dst2;
             dst2 = src;
-            if (dst2.name != src.name || dst2.cpu_id != src.cpu_id) {
+            if (dst2.name != src.name || dst2.cpu_id != src.cpu_id ||
+                dst2.cpu_affinity != src.cpu_affinity) {
                 std::cerr << "[错误] ThreadLoop 赋值字段不一致\n";
                 return 1;
             }

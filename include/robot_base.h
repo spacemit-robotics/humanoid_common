@@ -358,18 +358,21 @@ class ThreadLoop {
 public:
     std::string name = "thread";  ///< 线程名（最长 15 字符）
     int cpu_id = -1;              ///< CPU 亲和性，-1 不绑定
+    std::vector<int> cpu_affinity;  ///< 可迁移的 CPU 集合；非空时代替 cpu_id
     std::string sched = "other";  ///< 调度策略："other" | "fifo" | "rr"
     int priority = 0;             ///< 优先级（fifo/rr: 1~99；other 忽略）
 
     ThreadLoop() = default;
     ~ThreadLoop();
 
-    /// 拷贝构造/赋值：仅复制配置字段（name/cpu_id/sched/priority），不复制线程状态
+    /// 拷贝构造/赋值：仅复制配置字段，不复制线程状态
     ThreadLoop(const ThreadLoop &other)
-        : name(other.name), cpu_id(other.cpu_id), sched(other.sched), priority(other.priority) {}
+        : name(other.name), cpu_id(other.cpu_id), cpu_affinity(other.cpu_affinity),
+            sched(other.sched), priority(other.priority) {}
     ThreadLoop &operator=(const ThreadLoop &other) {
         name = other.name;
         cpu_id = other.cpu_id;
+        cpu_affinity = other.cpu_affinity;
         sched = other.sched;
         priority = other.priority;
         return *this;

@@ -20,12 +20,19 @@ InteractionActionMap LoadInteractionActions(
     for (const auto &policy : policies) {
         const std::string adapter_base =
             "rl_policy.onnx_infer.policies." + policy + ".policy_adapter";
-        if (yaml.Read<std::string>(adapter_base + ".type")
-                .value_or("") != "joint_trajectory") {
+        const std::string type = yaml.Read<std::string>(
+            adapter_base + ".type").value_or("");
+        if (type != "joint_trajectory" && type != "sonic") {
             continue;
         }
-        const std::string catalog = yaml.Read<std::string>(
-            adapter_base + ".catalog").value_or(adapter_base);
+        const auto configured_catalog = yaml.Read<std::string>(
+            adapter_base + ".catalog");
+        if (type == "sonic" &&
+            (!configured_catalog || configured_catalog->empty())) {
+            continue;
+        }
+        const std::string catalog =
+            configured_catalog.value_or(adapter_base);
         const auto action_names = yaml.Read<std::vector<std::string>>(
             catalog + ".action_names").value_or(std::vector<std::string>{});
         auto &actions = actions_by_policy[policy];

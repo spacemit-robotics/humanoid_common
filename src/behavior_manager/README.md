@@ -113,8 +113,8 @@ cd ~/spacemit_robot
 **关键参数：**
 - `rl_policy.onnx_infer.policies.<name>.kp/kd`：各策略的 PD 增益
 - `rl_policy.onnx_infer.policies.<name>.entry_target_transition_duration`（可选）：进入 RL 后的目标位置过渡时间，默认 `0`
-- `rl_policy.onnx_infer.policies.<name>.target_position_lower / target_position_upper`（可选）：按机器人关节顺序给出目标位置上下限（rad），两组长度必须与 `rl_default_pos` 一致；同时省略或为空时禁用
-- `rl_policy.onnx_infer.policies.<name>.target_limit_margin`（可选）：目标位置限位的内缩余量（rad），默认 `0`；最终范围为 `[lower + margin, upper - margin]`，必须为有限非空区间
+- `rl_policy.onnx_infer.policies.<name>.target_position_lower / target_position_upper`（可选）：按机器人关节顺序给出目标位置上下限（rad），须同时配置且长度与 `rl_default_pos` 一致；同时省略时禁用
+- `rl_policy.onnx_infer.policies.<name>.target_limit_margin`（可选）：目标位置限位的内缩余量（rad），默认 `0`；`[lower + margin, upper - margin]` 必须为有效区间
 - `rl_policy.onnx_infer.policies.<name>.prerequisite.policy / .duration`（可选）：进入目标策略前运行的策略及持续时间
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter`（可选）：参考动作、特殊模型输入或 RL 内关节轨迹接管；支持 `mjlab`、`protomotions`、`sonic`、`joint_trajectory`
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.start_mode`（MJLab 可选）：`auto`（默认）或 `manual`；手动模式进入 RL 后保持参考首帧，按 `G` 开始
@@ -153,7 +153,7 @@ HMI 的 `x` 才能清除锁存。重复收到同一条已确认的恢复状态�
 
 - **策略准备与异步推理：** 默认策略在 BehaviorManager 初始化时创建 ONNX runtime；退出 RL 后或在 POWER_OFF/DAMP 选择策略时，后台准备全新的策略状态，准备完成前不进入 HOME。进入 RL 后只重置时序状态并启动独立推理线程，不在控制循环内加载模型
 - **策略入场过渡：** 可按策略配置目标位置过渡；RL 增益立即生效，推理与 recurrent state 正常更新，仅在新推理结果到达时平滑目标位置
-- **目标位置限位：** `StateRL` 在关节映射和入场插值后执行可选非对称裁剪，覆盖零缩放及未被策略控制的关节；配置错误会阻止策略加载。该裁剪只限制最终下发目标，不回写 RL 的 `last_action` 或平滑动作历史；`clip_actions` 仍是独立的模型输出裁剪
+- **目标位置限位：** `StateRL` 在关节映射和入场插值后按可选的逐关节上下限裁剪最终目标，配置错误会阻止策略加载。此限位不修改模型的 `last_action` 或动作平滑历史；`clip_actions` 另用于模型输出裁剪
 - **通用模型 I/O：** `PolicyExecutorConfig` 整体透传给 RL 组件；多输入输出、feedback、external 等拓扑由策略 YAML `model_io` 声明，common 无需复制底层字段
 - **策略协议适配：** `policy_adapter` 是 behavior_manager 的私有子模块；机器人自由度、关节映射和自定义观测维度由机型 YAML 透传，common 不固定具体机型维度
 - **交互动作接管：** `joint_trajectory` adapter 在 RL 状态内部合并选择性关节轨迹，最终 applied action 回写策略观测；不会创建与 RL 并列的 FSM 状态

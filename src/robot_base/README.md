@@ -43,7 +43,7 @@
 | :--- | :--- |
 | `name` | 线程名（最长 15 字符，用于 `ps`/`htop` 中识别） |
 | `cpu_id` | CPU 亲和性，`-1` 不绑定 |
-| `cpu_affinity` | 可迁移的 Linux CPU 编号列表；非空时不能再配 `cpu_id` |
+| `cpu_affinity` | 当前线程可运行的 CPU 编号列表；非空时不能再配 `cpu_id`，不表示每核各启一个线程 |
 | `sched` | 调度策略：`"other"`（CFS 默认）\| `"fifo"` \| `"rr"` |
 | `priority` | 优先级（`fifo`/`rr`: 1~99；`other` 忽略） |
 | `FromYaml(yaml, name)` | 静态工厂：从 `robot_base.threads.{name}` 加载配置，返回未启动的 ThreadLoop |
@@ -53,21 +53,22 @@
 | `IsRunning()` | 查询线程是否运行中 |
 | 拷贝构造/赋值 | 仅复制配置字段，新对象处于未启动状态 |
 
-YAML 配置位于 `robot_base.threads`，按线程名独立配置，各模块按名读取对应条目：
+YAML 配置位于 `robot_base.threads`，按线程名独立配置，各模块按名读取对应条目。
+以下 CPU 编号仅作示例，应按目标设备的可用核心调整：
 
 ```yaml
 robot_base:
   threads:
     rl_infer:       # RL 推理线程
-      cpu_affinity: [4, 5, 6, 7]
+      cpu_affinity: [2, 3]
       sched: fifo   # other（默认）| fifo | rr（需 root）
       priority: 80
     control_main:   # control_demo 主控制循环
-      cpu_id: 3
+      cpu_id: 4
       sched: fifo
       priority: 90
     driver_main:    # driver_demo / hardware 主线程
-      cpu_id: 4
+      cpu_id: 5
       sched: fifo
       priority: 85
 ```

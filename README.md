@@ -179,6 +179,11 @@ driver、传输、安全监控和策略故障，阻止重新上电并通过 v2 �
 故障再次发生时会生成新的故障事件并重新进入 SAFETY。
 电机、IMU、whole_body 或 transport 反馈失效时 SAFETY 立即保持失能，不使用冻结状态
 继续渐退；只有反馈仍有效的策略故障和姿态/角速度超限才执行配置的受控卸力。
+control 启动时先确认 driver 状态的设备时间在允许的包间隔内递增；在此之前保持
+POWER_OFF，不转发 HMI 上电命令，也不启动运行期 `driver_state_timeout_s` 看门狗。
+从首个无故障状态包起，确认过程最多等待 `behavior_manager.safety.driver_startup_timeout_s`
+（默认 1.5 s，且不小于运行期阈值）；永久停流或时间戳冻结会报超时并保留锁存。
+启动中的真实 driver 故障仍会传到 HMI；状态流就绪后按原运行期阈值保护。
 
 ### Runtime 日志
 

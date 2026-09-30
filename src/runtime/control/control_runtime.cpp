@@ -129,6 +129,7 @@ enum class StateTimeoutKind : int32_t {
     kNone = 0,
     kPacket = 1,
     kDeviceTime = 2,
+    kStartup = 3,
 };
 
 robot_base::FaultStatus StateTimeoutFault(StateTimeoutKind kind, double age_s) {
@@ -141,10 +142,14 @@ robot_base::FaultStatus StateTimeoutFault(StateTimeoutKind kind, double age_s) {
     fault.timestamp_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
     std::ostringstream detail;
-    detail << (kind == StateTimeoutKind::kDeviceTime
+    if (kind == StateTimeoutKind::kStartup) {
+        detail << "driver state stream did not become ready after ";
+    } else {
+        detail << (kind == StateTimeoutKind::kDeviceTime
             ? "driver device timestamp has not advanced for "
-            : "driver state packet has not arrived for ")
-        << std::fixed << std::setprecision(3) << age_s << " s";
+            : "driver state packet has not arrived for ");
+    }
+    detail << std::fixed << std::setprecision(3) << age_s << " s";
     fault.detail = detail.str();
     return fault;
 }
@@ -213,12 +218,16 @@ int main(int argc, char *argv[]) {
 
     const double configured_driver_state_timeout_s = yaml_file.Read<double>(
         "behavior_manager.safety.driver_state_timeout_s").value_or(0.05);
+    const double configured_driver_startup_timeout_s = yaml_file.Read<double>(
+        "behavior_manager.safety.driver_startup_timeout_s").value_or(1.5);
     const double configured_hmi_command_timeout =
         yaml_file.Read<double>("hmi.command_timeout").value_or(0.5);
     const double configured_status_hz =
         yaml_file.Read<double>("hmi.status_hz").value_or(20.0);
     if (!std::isfinite(configured_driver_state_timeout_s) ||
         configured_driver_state_timeout_s <= 0.0 ||
+        !std::isfinite(configured_driver_startup_timeout_s) ||
+        configured_driver_startup_timeout_s <= 0.0 ||
         !std::isfinite(configured_hmi_command_timeout) ||
         configured_hmi_command_timeout <= 0.0 ||
         !std::isfinite(configured_status_hz) || configured_status_hz <= 0.0) {
@@ -228,6 +237,8 @@ int main(int argc, char *argv[]) {
     const double driver_state_timeout_s = std::max(
         static_cast<double>(control_dt) * 2.0,
         configured_driver_state_timeout_s);
+    const double driver_startup_timeout_s = std::max(
+        driver_state_timeout_s, configured_driver_startup_timeout_s);
 
     // HMI 心跳边界；速度范围由应用层每个策略的 command.limits 提供。
     const double hmi_command_timeout = std::max(0.1, configured_hmi_command_timeout);
@@ -250,6 +261,7 @@ int main(int argc, char *argv[]) {
     uint64_t fault_ack_sequence = 0;
     robot_base::RobotData latest_state;
     robot_base::FaultStatus latest_state_fault;
+    robot_base::FaultStatus startup_fault;
     robot_base::ControlCmd latest_control;
     bool has_state = false;
     bool has_control = false;
@@ -286,6 +298,8 @@ int main(int argc, char *argv[]) {
     double latest_state_progress_age_s = 0.0;
     StateTimeoutKind previous_state_timeout = StateTimeoutKind::kNone;
     runtime_timing::ProgressWatchdog state_progress_watchdog;
+    runtime_timing::StateStartupGate state_startup_gate;
+    bool state_ready = false;
     runtime_timing::Window timing_window(next_control_time);
     runtime_timing::Summary latest_timing;
 
@@ -305,6 +319,10 @@ int main(int argc, char *argv[]) {
                 has_hmi = true;
                 last_hmi_time = std::chrono::steady_clock::now();
             }
+            if (!state_ready) {
+                cmd = {};
+                fault_ack_sequence = 0;
+            }
         }
 
         // 2) drain Driver 状态（读空 buffer，取最新）
@@ -312,6 +330,7 @@ int main(int argc, char *argv[]) {
             robot_base::RobotData state;
             robot_base::FaultStatus state_fault;
             bool received_state = false;
+            bool became_ready = false;
             bool reset_state_progress =
                 previous_state_timeout == StateTimeoutKind::kPacket;
             auto received_at = std::chrono::steady_clock::now();
@@ -319,11 +338,30 @@ int main(int argc, char *argv[]) {
                 received_at = std::chrono::steady_clock::now();
                 const bool source_fault_recovered = has_state &&
                     latest_state_fault.active && !state_fault.active;
-                if (reset_state_progress || source_fault_recovered) {
-                    state_progress_watchdog.Reset();
-                    reset_state_progress = false;
+                if (!state_ready) {
+                    if (state_fault.latched) {
+                        startup_fault = state_fault;
+                    } else if (startup_fault.latched && !state_fault.active) {
+                        startup_fault.active = false;
+                    }
+                    if (state_fault.active) {
+                        state_startup_gate.Reset();
+                    } else if (state_startup_gate.Observe(
+                            state.time, received_at, driver_state_timeout_s)) {
+                        state_ready = true;
+                        became_ready = true;
+                        state_progress_watchdog.Reset();
+                        runtime_logging::Log(runtime_logging::Level::kInfo,
+                            "driver state stream ready", false);
+                    }
                 }
-                state_progress_watchdog.Observe(state.time, received_at);
+                if (state_ready) {
+                    if (reset_state_progress || source_fault_recovered) {
+                        state_progress_watchdog.Reset();
+                        reset_state_progress = false;
+                    }
+                    state_progress_watchdog.Observe(state.time, received_at);
+                }
                 latest_state = state;
                 latest_state_fault = state_fault;
                 received_state = true;
@@ -334,7 +372,7 @@ int main(int argc, char *argv[]) {
                 }
             }
             if (received_state) {
-                if (!has_state) {
+                if (became_ready) {
                     next_control_time = received_at;
                     last_control_time = received_at - control_period;
                 }
@@ -394,10 +432,15 @@ int main(int argc, char *argv[]) {
         latest_state_progress_age_s = state_progress_watchdog.AgeSeconds(now);
         StateTimeoutKind state_timeout = StateTimeoutKind::kNone;
         double state_timeout_age_s = 0.0;
-        if (has_state && latest_state_age_s > driver_state_timeout_s) {
+        if (!state_ready && !latest_state_fault.active &&
+            state_startup_gate.Expired(now, driver_startup_timeout_s)) {
+            state_timeout = StateTimeoutKind::kStartup;
+            state_timeout_age_s = state_startup_gate.AgeSeconds(now);
+        } else if (state_ready && has_state &&
+            latest_state_age_s > driver_state_timeout_s) {
             state_timeout = StateTimeoutKind::kPacket;
             state_timeout_age_s = latest_state_age_s;
-        } else if (!latest_state_fault.active &&
+        } else if (state_ready && !latest_state_fault.active &&
             state_progress_watchdog.Expired(now, driver_state_timeout_s)) {
             state_timeout = StateTimeoutKind::kDeviceTime;
             state_timeout_age_s = latest_state_progress_age_s;
@@ -414,7 +457,13 @@ int main(int argc, char *argv[]) {
             previous_state_timeout = state_timeout;
         }
 
-        if (now >= next_control_time && has_state) {
+        if (now >= next_control_time && has_state &&
+            (state_ready || has_control || startup_fault.latched ||
+                state_timeout != StateTimeoutKind::kNone)) {
+            if (!has_control) {
+                next_control_time = now;
+                last_control_time = now - control_period;
+            }
             timing_window.Observe(now, next_control_time);
             const double elapsed = std::chrono::duration<double>(
                 now - last_control_time).count();
@@ -428,14 +477,16 @@ int main(int argc, char *argv[]) {
             // runtime log, but must not replace the actionable fault identity.
             const robot_base::FaultStatus control_fault = latest_state_fault.active
                 ? latest_state_fault
-                : (state_timeout != StateTimeoutKind::kNone
-                    ? StateTimeoutFault(state_timeout, state_timeout_age_s)
-                    : latest_state_fault);
+                : (startup_fault.latched ? startup_fault
+                    : (state_timeout != StateTimeoutKind::kNone
+                        ? StateTimeoutFault(state_timeout, state_timeout_age_s)
+                        : latest_state_fault));
             bm.SetSensorData(latest_state);
             bm.SetSensorFault(control_fault);
             bm.SetCommand(cmd);
             bm.AcknowledgeFault(fault_ack_sequence);
             bm.Step(actual_control_dt, rl_dt);
+            startup_fault = {};
             const auto &out = bm.GetOutput();
             robot_base::ControlCmd ctrl;
             ctrl.enable = out.enable;
@@ -474,12 +525,13 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        const auto reported_fault = has_control ? bm.CurrentFault() : startup_fault;
         if (logging_config.telemetry_enabled && has_state && has_control &&
             now - last_telemetry_time >= telemetry_period) {
             RecordControlTelemetry(latest_state, latest_control, bm.CurrentState(),
                 bm.CurrentPolicyName(), hmi_connected, cmd, latest_control_hz,
                 bm.GetRlFreq(), latest_state_age_s, latest_state_progress_age_s,
-                bm.CurrentFault(), joint_names);
+                reported_fault, joint_names);
             last_telemetry_time = now;
         }
 
@@ -503,7 +555,7 @@ int main(int argc, char *argv[]) {
             status.rl_frequency_hz = static_cast<float>(bm.GetRlFreq());
             status.active_policy = bm.CurrentPolicyName();
             status.interaction = bm.CurrentInteractionStatus();
-            const bool sent = transport->SendStatusV2(status, bm.CurrentFault());
+            const bool sent = transport->SendStatusV2(status, reported_fault);
             if (!sent && !status_send_failed) {
                 runtime_logging::Log(runtime_logging::Level::kWarning,
                     "control status validation or transport send failed", false);
@@ -529,7 +581,7 @@ int main(int argc, char *argv[]) {
                 << " hmi=" << (hmi_connected ? "online" : "timeout")
                 << std::fixed << std::setprecision(2)
                 << " cmd=(" << cmd.vx << "," << cmd.vy << "," << cmd.wz << ")";
-            const auto fault = bm.CurrentFault();
+            const auto &fault = reported_fault;
             if (fault.latched) {
                 line0 << " fault=" << robot_base::FaultSourceName(fault.source)
                     << "/" << robot_base::FaultCodeName(fault.code)

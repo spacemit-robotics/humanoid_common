@@ -170,6 +170,53 @@ private:
     bool has_value_ = false;
 };
 
+class StateStartupGate {
+public:
+    void Reset() {
+        ready_ = false;
+        has_candidate_ = false;
+    }
+
+    bool Observe(double device_time, Clock::time_point received_at, double max_gap_s) {
+        if (ready_) return true;
+        if (!std::isfinite(device_time)) {
+            Reset();
+            return false;
+        }
+        if (!has_candidate_) startup_received_ = received_at;
+        const bool expired = has_candidate_ &&
+            std::chrono::duration<double>(received_at - candidate_received_).count() > max_gap_s;
+        if (!has_candidate_ || expired || device_time < candidate_time_) {
+            candidate_time_ = device_time;
+            candidate_received_ = received_at;
+            has_candidate_ = true;
+            return false;
+        }
+        if (device_time > candidate_time_) {
+            ready_ = true;
+        }
+        return ready_;
+    }
+
+    bool Ready() const { return ready_; }
+
+    double AgeSeconds(Clock::time_point now) const {
+        return has_candidate_ ? std::max(0.0,
+            std::chrono::duration<double>(now - startup_received_).count()) : 0.0;
+    }
+
+    bool Expired(Clock::time_point now, double timeout_s) const {
+        return !ready_ && has_candidate_ && AgeSeconds(now) > timeout_s;
+    }
+
+private:
+    Clock::time_point startup_received_{};
+    Clock::time_point candidate_received_{};
+    double candidate_time_ = 0.0;
+    bool has_candidate_ = false;
+    bool ready_ = false;
+};
+
 }  // namespace runtime_timing
 
 #endif  // RUNTIME_TIMING_H

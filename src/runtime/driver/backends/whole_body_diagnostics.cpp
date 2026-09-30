@@ -238,7 +238,8 @@ void RenderWholeBodyDiagnostics(
 
     std::vector<std::string> alerts;
     if (diagnostics.health.state != WHOLE_BODY_HEALTH_READY &&
-        diagnostics.health.state != WHOLE_BODY_HEALTH_READ_ONLY) {
+        diagnostics.health.state != WHOLE_BODY_HEALTH_READ_ONLY &&
+        diagnostics.health.state != WHOLE_BODY_HEALTH_CREATED) {
         std::ostringstream alert;
         alert << "整机 " << HealthName(diagnostics.health.state)
             << "，错误码 " << diagnostics.health.last_error;
@@ -254,13 +255,14 @@ void RenderWholeBodyDiagnostics(
     }
     for (uint32_t i = 0; i < diagnostics.motor_count; ++i) {
         const auto &motor = diagnostics.motors[i];
-        if (motor.fatal_error == 0) continue;
+        if (!motor.feedback_received || motor.fatal_error == 0) continue;
         alerts.push_back(MotorAlertTarget(motor) + " 致命故障 " +
             HexCode(motor.fatal_error));
     }
     for (uint32_t i = 0; i < diagnostics.coupling_count; ++i) {
         const auto &coupling = diagnostics.couplings[i];
-        if (coupling.valid) continue;
+        if (coupling.valid || diagnostics.health.state == WHOLE_BODY_HEALTH_CREATED)
+            continue;
         alerts.push_back("并联关节 " + CompactLabel(coupling.joint_names, 28) +
             " 解算无效");
     }
@@ -277,7 +279,7 @@ void RenderWholeBodyDiagnostics(
     }
     for (uint32_t i = 0; i < diagnostics.motor_count; ++i) {
         const auto &motor = diagnostics.motors[i];
-        if (motor.warning_error == 0) continue;
+        if (!motor.feedback_fresh || motor.warning_error == 0) continue;
         alerts.push_back(MotorAlertTarget(motor) + " 警告 " +
             HexCode(motor.warning_error));
     }
@@ -346,12 +348,15 @@ void RenderWholeBodyDiagnostics(
     }
     if (diagnostics.coupling_count > 0) {
         output << "  并联关节  "
-            << (valid_coupling_count == diagnostics.coupling_count ? "正常" : "异常")
+            << (diagnostics.health.state == WHOLE_BODY_HEALTH_CREATED ? "等待反馈" :
+                (valid_coupling_count == diagnostics.coupling_count ? "正常" : "异常"))
             << "    " << valid_coupling_count << "/"
             << diagnostics.coupling_count << "\n";
     }
 
-    output << "---------------- 当前异常 ----------------\n";
+    output << (diagnostics.health.state == WHOLE_BODY_HEALTH_CREATED
+        ? "---------------- 启动检查 ----------------\n"
+        : "---------------- 当前异常 ----------------\n");
     if (alerts.empty()) {
         output << "  无\n";
     } else {

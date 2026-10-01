@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#151914">
+  <title>SpacemiT · 机器人控制台</title>
+  <link rel="icon" href="/assets/spacemit-logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/vendor/lucide.min.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body data-view="control">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="SpacemiT 机器人控制台"><img src="/assets/spacemit-logo.svg" alt="SpacemiT 进迭时空"></a>
+    <span class="product-name">机器人控制台</span>
+    <div class="header-actions">
+      <span id="connection" class="connection">连接中</span>
+      <button id="pair" class="icon" title="手机扫码接入" aria-label="手机扫码接入"><i data-lucide="qr-code"></i></button>
+      <button id="disconnect" class="icon" title="断开连接" aria-label="断开连接"><i data-lucide="unplug"></i></button>
+      <button id="reconnect" class="icon" title="重新连接" aria-label="重新连接" hidden><i data-lucide="plug"></i></button>
+    </div>
+  </header>
+  <main>
+    <div class="page-heading"><div><p class="eyebrow">SPACEMIT / HUMANOID</p><h1 id="robot">机器人</h1></div>
+      <a id="download-app" class="button" href="/downloads/SpacemiT-Operator.apk"
+        download="SpacemiT-Operator.apk" hidden><i data-lucide="download"></i>下载 Android App</a></div>
+    <form id="login" hidden>
+      <i data-lucide="scan-line"></i>
+      <div class="login-copy"><strong>需要设备配对</strong><span id="login-message">扫描操作二维码连接</span></div>
+      <label class="sr-only" for="pairing-link">设备连接链接</label>
+      <input id="pairing-link" type="url" placeholder="粘贴设备连接链接" autocomplete="off" required>
+      <button type="submit" class="primary"><i data-lucide="link"></i>连接</button>
+    </form>
+    <section class="status-band" aria-label="实时状态">
+      <div class="state-reading"><span>当前状态</span><strong id="state">—</strong><span id="state-label">等待状态</span></div>
+      <div><span>准备姿态</span><strong id="ready">—</strong><span>ZERO</span></div>
+      <div><span>策略推理</span><strong id="frequency">—</strong><span>实时频率</span></div>
+      <div><span>反馈延迟</span><strong id="age">—</strong><span>控制链路</span></div>
+    </section>
+    <section class="authority" aria-label="控制权">
+      <div class="owner-info"><i data-lucide="radio-tower"></i><div><span>控制权</span><strong id="owner">无人持有</strong></div></div>
+      <div class="authority-actions"><button id="acquire" class="primary"><i data-lucide="hand"></i>接管控制</button>
+        <button id="release" class="icon" title="释放控制权" aria-label="释放控制权"><i data-lucide="log-out"></i></button></div>
+    </section>
+    <section id="fault" class="fault" hidden><i data-lucide="triangle-alert"></i>
+      <div><strong id="fault-title"></strong><p id="fault-detail"></p></div><button id="ack">确认故障</button></section>
+    <nav class="mobile-views" aria-label="操作视图">
+      <button data-view="control" class="active"><i data-lucide="sliders-horizontal"></i>状态与动作</button>
+      <button data-view="motion"><i data-lucide="move"></i>移动控制</button>
+    </nav>
+    <div class="workspace">
+      <div class="operations">
+        <section class="state-section">
+          <div class="section-heading"><h2><i data-lucide="workflow"></i>运行状态</h2><span id="fsm-note">等待连接</span></div>
+          <div class="states" aria-label="状态切换">
+            <button data-state="POWER_OFF"><i data-lucide="power"></i><strong>掉电</strong><span>POWER OFF</span></button>
+            <button data-state="DAMP"><i data-lucide="waves"></i><strong>阻尼</strong><span>DAMP</span></button>
+            <button data-state="HOME"><i data-lucide="house"></i><strong>复位</strong><span>HOME</span></button>
+            <button data-state="ZERO"><i data-lucide="crosshair"></i><strong>准备</strong><span>ZERO</span></button>
+            <button data-state="RL"><i data-lucide="activity"></i><strong>策略控制</strong><span>RL</span></button>
+          </div>
+        </section>
+        <section class="policy-section">
+          <div class="section-heading"><h2><i data-lucide="cpu"></i>控制策略</h2></div>
+          <div class="select-row"><label class="sr-only" for="policy">控制策略</label><select id="policy"></select>
+            <button id="select-policy" title="应用策略"><i data-lucide="check"></i>应用</button></div>
+          <div class="current"><span class="live-dot"></span>当前采用 <strong id="active-policy">—</strong></div>
+        </section>
+        <section class="action-section">
+          <div class="section-heading"><h2><i data-lucide="hand"></i>交互动作</h2><span id="action-state">就绪</span></div>
+          <div class="select-row"><label class="sr-only" for="action">交互动作</label><select id="action"></select>
+            <button id="start-action" class="primary"><i data-lucide="play"></i>播放</button>
+            <button id="cancel-action" class="icon" title="平滑取消动作" aria-label="取消动作"><i data-lucide="square"></i></button></div>
+          <button id="start-reference" class="reference-button primary" hidden><i data-lucide="play"></i>开始参考动作</button>
+          <div class="progress-row"><progress id="progress" max="1" value="0"></progress><span id="progress-label">0%</span></div>
+          <div class="request"><span>最近请求</span><strong id="request">暂无操作</strong></div>
+        </section>
+      </div>
+      <section class="motion" aria-label="移动控制">
+        <div class="section-heading"><h2><i data-lucide="move"></i>移动控制</h2><span id="motion-state">等待接管</span></div>
+        <div class="speed-settings">
+          <label>前后 <span>m/s</span><input id="speed-vx" type="number" min="0" max="0" step="0.05" value="0.1"></label>
+          <label>左右 <span>m/s</span><input id="speed-vy" type="number" min="0" max="0" step="0.05" value="0.1"></label>
+          <label>转向 <span>rad/s</span><input id="speed-wz" type="number" min="0" max="0" step="0.1" value="0.2"></label>
+        </div>
+        <div class="direction-pad">
+          <button data-motion="j" title="左转" aria-label="左转"><i data-lucide="rotate-ccw"></i></button>
+          <button data-motion="w" title="前进" aria-label="前进"><i data-lucide="arrow-up"></i></button>
+          <button data-motion="l" title="右转" aria-label="右转"><i data-lucide="rotate-cw"></i></button>
+          <button data-motion="a" title="左移" aria-label="左移"><i data-lucide="arrow-left"></i></button>
+          <div class="pad-center"><i data-lucide="move"></i></div>
+          <button data-motion="d" title="右移" aria-label="右移"><i data-lucide="arrow-right"></i></button>
+          <span></span><button data-motion="s" title="后退" aria-label="后退"><i data-lucide="arrow-down"></i></button><span></span>
+        </div>
+        <div class="adopted"><span>实际采用 · 前 / 左 / 转</span><output id="velocity">0.00 / 0.00 / 0.00</output></div>
+      </section>
+    </div>
+    <footer class="command-bar"><p id="message" role="status">正在连接设备</p>
+      <div class="stop-bar"><button id="stop" class="stop"><i data-lucide="octagon-pause"></i>停止移动</button></div></footer>
+  </main>
+  <dialog id="pair-dialog">
+    <div class="dialog-head"><h2>手机扫码接入</h2><button id="close-pair" class="icon" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></div>
+    <img id="qr" alt="机器人操作二维码">
+    <p id="pair-address"></p>
+    <a id="download-qr" class="button primary" download="spacemit-operator-qr.svg"><i data-lucide="download"></i>保存二维码</a>
+  </dialog>
+</body>
+</html>

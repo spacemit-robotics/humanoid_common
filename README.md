@@ -2,11 +2,12 @@
 
 ## 项目简介
 
-人形机器人通用控制层，提供三进程（driver / control / hmi）的可执行程序以及它们共用的三个基础库：
+人形机器人通用控制层，提供三进程（driver / control / hmi）及以下共享模块：
 
 - `robot_base` — 统一数据结构与 YAML 配置解析
 - `behavior_manager` — FSM 行为管理（POWER_OFF / DAMP / HOME / ZERO / RL / SAFETY）
 - `transport` — 跨进程通信（UDP / SHM 可切换）
+- `operator_service` — 终端、App、网页的操作请求、控制权和结果确认
 
 所有机型（g1、asimov、tinker、tiangong、qinglong、go1）共用本模块的二进制，机型差异由各机型仓库的 `config/<robot>.yaml` 描述。
 
@@ -17,6 +18,7 @@
 - sim2sim 模式（跳过 FSM，直接 RL 推理，用于算法验证）
 - SHM / UDP 两种通信后端（同机 / 跨机均可）
 - `driver_runtime` 通过 YAML 选择 MuJoCo 或 `whole_body` backend
+- HMI 常驻服务与独立终端客户端；实机另支持 Android App 和手机扫码网页接入
 - x86_64 与 riscv64（K3 板卡）双平台编译
 
 不支持：
@@ -27,7 +29,7 @@
 ### 环境准备
 
 ```bash
-sudo apt install -y libeigen3-dev libyaml-cpp-dev
+sudo apt install -y libeigen3-dev libyaml-cpp-dev libboost-dev nlohmann-json3-dev
 ```
 
 本模块还依赖 SDK 内部组件 `model_zoo/rl`。`simulation/mujoco` 和
@@ -39,13 +41,17 @@ sudo apt install -y libeigen3-dev libyaml-cpp-dev
 **SDK 内编译（mm）**：
 
 ```bash
+cd ~/spacemit_robot
 source build/envsetup.sh
+cd application/native/humanoid_common
 mm
 ```
 
 编译产物安装到 `output/staging/`：
-- `lib/`：`librobot_base.so`、`libbehavior_manager.so`、`libtransport_executor.so`
-- `bin/`：`driver_runtime`、`control_runtime`、`hmi_runtime`、`control_sim2sim_runtime`
+- `lib/`：`librobot_base.so`、`libbehavior_manager.so`、`libtransport_executor.so`、`liboperator_client.so`
+- `bin/`：`driver_runtime`、`control_runtime`、`hmi_runtime`、`hmi_tui`、`control_sim2sim_runtime`
+- `include/`：`operator_client.h`、`operator_types.h` 等公共接口
+- `share/humanoid_common/operator_web/`：桌面和手机网页；已构建的 Android APK 随 `mm` 安装到 `downloads/`
 - benchmark：`benchmark_humanoid_policy`、`run_benchmark_humanoid_policy.sh`
 
 单配置生成器未指定 `CMAKE_BUILD_TYPE` 时默认使用 `Release`。StateRL runtime
@@ -65,12 +71,13 @@ make
 
 启动脚本位于对应机型仓库（如 `humanoid_unitree_g1/scripts/`），编译安装后进入 PATH，以 g1 为例：
 
-**FSM 完整仿真（3 个终端）：**
+**FSM 完整仿真：**
 
 ```bash
 run_driver_g1.sh    # 终端1（PC，x86_64）
 run_control_g1.sh   # 终端2（K3 板卡）
-run_hmi_g1.sh       # 终端3（K3 板卡）
+hmi_runtime /absolute/path/g1.yaml --sim # 终端3，仅接受本机 TUI
+hmi_tui --connection FILE          # 可选终端客户端，FILE 使用服务启动时显示的路径
 ```
 
 **sim2sim（2 个终端）：**
@@ -145,6 +152,10 @@ PR 档含 `humanoid-common-functional`（前三个公共模块跑通离线流程
 
 ### 三进程架构
 
+终端、Android App 和网页是外部客户端，不占用内部 HMI 写端；它们统一调用
+`hmi_runtime` 提供的操作服务。核心 driver/control/hmi 仍为三进程，sim2sim 仍为双进程。
+接口、控制权和扫码说明见 [操作服务](src/operator_service/README.md)。
+
 ```
  ┌───────────┐   HMI cmd    ┌───────────────┐   control cmd   ┌──────────────┐
  │  hmi      │ ───────────▶ │  control      │ ──────────────▶ │  driver      │
@@ -179,6 +190,10 @@ driver、传输、安全监控和策略故障，阻止重新上电并通过 v2 �
 故障再次发生时会生成新的故障事件并重新进入 SAFETY。
 电机、IMU、whole_body 或 transport 反馈失效时 SAFETY 立即保持失能，不使用冻结状态
 继续渐退；只有反馈仍有效的策略故障和姿态/角速度超限才执行配置的受控卸力。
+实机硬件断连或电机断电不会主动退出 driver：后端保持状态/故障通道，降低硬件重试
+频率，并丢弃断连期间收到的运动指令。反馈与失能发送都恢复后，仍需经过 POWER_OFF
+和 HMI 故障确认才能重新上电。硬件初始化失败会重建连接后重试，配置错误与内部
+传输失败仍退出。硬件 YAML 应禁止驱动初始化自动使能；恢复通信不等于恢复运动。
 control 启动时先确认 driver 状态的设备时间在允许的包间隔内递增；在此之前保持
 POWER_OFF，不转发 HMI 上电命令，也不启动运行期 `driver_state_timeout_s` 看门狗。
 从首个无故障状态包起，确认过程最多等待 `behavior_manager.safety.driver_startup_timeout_s`
@@ -424,14 +439,16 @@ interaction_actions:
 
 设计原则：跨层接口字段必须用通用语义，禁止携带某一具体后端（mujoco 悬挂等）的私有概念。
 
-### hmi_runtime 键盘操作
+### hmi_tui 键盘操作
 
-hmi_runtime 使用带颜色的 ANSI 全屏 TUI。FSM、当前策略、Control 实际采用速度和
+hmi_tui 复用原 HMI 的彩色 ANSI 全屏界面，经公开客户端接口连接 hmi_runtime。
+FSM、当前策略、Control 实际采用速度和
 RL 频率均来自 control 端回传，不在 HMI 本地预判。主界面用左右键切换相邻 FSM，
 策略和速度分别使用独立子页面。
 
 | 按键 | 动作 |
 | --- | --- |
+| `L/U` | 申请/释放控制权 |
 | `←/→` | 按真实 FSM 后退/前进；RL 按左键直接退到 DAMP |
 | `f` | 全局请求 POWER_OFF（完全失力） |
 | `p` | 打开策略选择页；`↑/↓` 或 `j/k` 移动，Enter 确认，Esc 返回 |
@@ -441,6 +458,8 @@ RL 频率均来自 control 端回传，不在 HMI 本地预判。主界面用左
 | `q/e` | 速度页内增减 wz |
 | `空格` | 速度清零 |
 | `Esc` / `v` | 退出速度页并清零 |
+| `A` / `G` / `C` | 主页面进入动作列表 / 开始手动参考动作 / 平滑取消动作 |
+| `Ctrl+C` | 退出客户端并释放控制权，不自动掉电 |
 
 `o/h/z/r` 保留为兼容快捷键，但合法性仍由 control 端 FSM 校验。HMI 以配置频率发送
 心跳；退出速度页、离开 RL、HMI 退出或心跳超时都会清零速度。按键步长和通信超时在

@@ -27,9 +27,10 @@ volatile std::sig_atomic_t g_running = 1;
 void OnSignal(int) { g_running = 0; }
 
 void PrintUsage(const char *program, std::ostream &output) {
-    output << "Usage: " << program << " <config.yaml>\n";
+    output << "Usage: " << program << " <config.yaml> [--backend mujoco|whole_body]\n";
     output << "Options:\n";
     output << "  <config.yaml>  Robot configuration file\n";
+    output << "  --backend     Override driver.backend for this process\n";
     output << "  -h, --help     Show this help\n";
 }
 
@@ -44,12 +45,20 @@ int main(int argc, char *argv[]) {
     const std::string yaml_path = argv[1];
     std::unique_ptr<runtime_logging::Session> logging_session;
     try {
+        std::optional<std::string> backend_override;
+        for (int i = 2; i < argc; ++i) {
+            if (std::string(argv[i]) != "--backend" || i + 1 >= argc)
+                throw std::runtime_error("expected --backend mujoco|whole_body");
+            if (backend_override) throw std::runtime_error("backend specified more than once");
+            backend_override = argv[++i];
+        }
         const auto yaml_file = robot_base::YamlFile::Load(yaml_path);
         logging_session = std::make_unique<runtime_logging::Session>(
             yaml_file, yaml_path, "driver");
         robot_base::ThreadLoop::FromYaml(yaml_file, "driver_main").Apply();
 
-        const auto backend_kind = driver_runtime::ParseBackendKind(yaml_file);
+        const auto backend_setting = backend_override ? backend_override : yaml_file.Read<std::string>("driver.backend");
+        const auto backend_kind = driver_runtime::ParseBackendKind(backend_setting);
         if (!driver_runtime::BackendIsCompiled(backend_kind)) {
             throw std::runtime_error("selected driver backend is unavailable in this build");
         }

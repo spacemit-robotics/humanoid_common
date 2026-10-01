@@ -36,6 +36,8 @@ endif()
 find_package(Threads REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(yaml-cpp REQUIRED)
+find_package(Boost 1.70 REQUIRED)
+find_package(nlohmann_json 3.7 REQUIRED)
 
 set(HUMANOID_COMMON_GIT_COMMIT "unknown")
 set(HUMANOID_COMMON_GIT_DIRTY 0)
@@ -249,18 +251,42 @@ if(BUILD_RL)
     install(TARGETS control_sim2sim_runtime RUNTIME DESTINATION bin)
 endif()
 
-# hmi_runtime（HMI 进程：仅 transport）
-add_executable(hmi_runtime
-    src/runtime/hmi/hmi_runtime.cpp
-    src/runtime/hmi/interaction.cpp
-)
-target_include_directories(hmi_runtime PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/common
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/hmi
-)
-target_link_libraries(hmi_runtime PRIVATE transport_executor robot_base)
-install(TARGETS hmi_runtime RUNTIME DESTINATION bin)
+# Operator protocol and client SDK have no robot, RL or hardware dependencies.
+add_library(operator_protocol STATIC src/operator_service/protocol/protocol.cpp)
+target_include_directories(operator_protocol PUBLIC include src/operator_service/protocol)
+target_link_libraries(operator_protocol PUBLIC nlohmann_json::nlohmann_json)
+
+add_library(operator_client SHARED src/operator_service/client_sdk/client.cpp)
+target_link_libraries(operator_client PRIVATE operator_protocol Boost::headers Threads::Threads)
+target_include_directories(operator_client PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+target_compile_definitions(operator_client PRIVATE BOOST_ERROR_CODE_HEADER_ONLY)
+
+add_library(operator_qr STATIC thirdparty/qrcodegen/qrcodegen.cpp)
+target_include_directories(operator_qr PUBLIC thirdparty/qrcodegen)
+
+add_library(operator_service STATIC
+    src/operator_service/service/service.cpp
+    src/operator_service/service/server.cpp)
+target_include_directories(operator_service PUBLIC src/operator_service/service)
+target_include_directories(operator_service PRIVATE src/runtime/common)
+target_link_libraries(operator_service PUBLIC operator_protocol robot_base
+    PRIVATE operator_qr Boost::headers transport_executor)
+target_compile_definitions(operator_service PRIVATE BOOST_ERROR_CODE_HEADER_ONLY
+    OPERATOR_WEB_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/clients/web")
+
+add_executable(hmi_runtime src/runtime/hmi/hmi_runtime.cpp)
+target_link_libraries(hmi_runtime PRIVATE operator_service)
+add_executable(hmi_tui clients/terminal/hmi_tui.cpp clients/terminal/terminal_ui.cpp)
+target_link_libraries(hmi_tui PRIVATE operator_client)
+install(TARGETS hmi_runtime hmi_tui RUNTIME DESTINATION bin)
+install(TARGETS operator_client LIBRARY DESTINATION lib)
+install(FILES include/operator_client.h include/operator_types.h DESTINATION include)
+install(DIRECTORY clients/web/ DESTINATION share/humanoid_common/operator_web)
+install(FILES clients/android/app/build/outputs/apk/debug/app-debug.apk
+    DESTINATION share/humanoid_common/operator_web/downloads
+    RENAME SpacemiT-Operator.apk OPTIONAL)
 
 # driver_runtime（按 YAML 选择已编译的 MuJoCo / whole_body backend）
 if(BUILD_MUJOCO_BACKEND OR BUILD_WHOLE_BODY_BACKEND)
@@ -371,8 +397,35 @@ install(TARGETS test_driver_runtime RUNTIME DESTINATION bin)
 option(BUILD_TESTS "Build humanoid_common offline tests" ON)
 if(BUILD_TESTS)
     enable_testing()
+    add_executable(test_operator_service example/operator_service/test_operator_service.cpp)
+    target_link_libraries(test_operator_service PRIVATE operator_service)
+    add_executable(test_operator_network example/operator_service/test_operator_network.cpp)
+    target_link_libraries(test_operator_network PRIVATE operator_service operator_client transport_executor)
+    target_compile_options(test_operator_service PRIVATE -UNDEBUG)
+    target_compile_options(test_operator_network PRIVATE -UNDEBUG)
+    add_test(NAME operator_service COMMAND test_operator_service)
+    add_test(NAME operator_network COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml)
+    add_test(NAME operator_terminal_only COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --sim)
+    set_tests_properties(operator_network operator_terminal_only PROPERTIES RUN_SERIAL TRUE TIMEOUT 20)
     add_test(NAME driver_runtime_backend_selection
         COMMAND test_driver_runtime ${DRIVER_RUNTIME_EXAMPLE_CONFIG})
+    if(BUILD_WHOLE_BODY_BACKEND)
+        add_executable(test_hardware_recovery
+            example/driver_runtime/test_hardware_recovery.cpp
+            src/runtime/driver/backends/whole_body_backend.cpp
+            src/runtime/driver/backends/whole_body_adapter.cpp)
+        target_include_directories(test_hardware_recovery PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/driver
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/common
+            ${WHOLE_BODY_INCLUDE_DIR})
+        target_link_libraries(test_hardware_recovery PRIVATE robot_base)
+        target_compile_options(test_hardware_recovery PRIVATE -UNDEBUG)
+        add_test(NAME hardware_recovery COMMAND test_hardware_recovery
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/behavior_manager/config_example.yaml)
+        set_tests_properties(hardware_recovery PROPERTIES TIMEOUT 15)
+    endif()
 endif()
 
 if(BUILD_RL)

@@ -26,6 +26,8 @@ whole_body_mode ToWholeBodyMode(robot_base::ControlMode mode) {
             return WHOLE_BODY_MODE_ZERO;
         case robot_base::ControlMode::RL:
             return WHOLE_BODY_MODE_RL;
+        case robot_base::ControlMode::TRAJECTORY:
+            return WHOLE_BODY_MODE_TRAJECTORY;
         case robot_base::ControlMode::SAFETY:
             return WHOLE_BODY_MODE_SAFETY;
     }
@@ -61,7 +63,7 @@ bool HasValidCommandShape(const robot_base::ControlCmd &command, uint32_t num_do
 }  // namespace
 
 bool ConvertWholeBodyState(
-    const whole_body_state &source, robot_base::RobotData *destination) {
+    const whole_body_state &source, robot_base::RobotData *destination, bool imu_configured) {
     if (!destination || source.num_dof == 0 || source.num_dof > WHOLE_BODY_MAX_DOF)
         return false;
 
@@ -73,14 +75,17 @@ bool ConvertWholeBodyState(
         result.joint_temperature[i] = source.temperature[i];
         result.joint_error[i] = source.motor_error[i];
     }
-    for (size_t i = 0; i < result.base_quat.size(); ++i)
-        result.base_quat[i] = source.base_quat[i];
-    for (size_t i = 0; i < result.gyro.size(); ++i) {
-        result.gyro[i] = source.gyro[i];
-        result.acceleration[i] = source.acceleration[i];
-        result.base_vel[i + 3] = source.gyro[i];
+    // Without an IMU, retain mathematical defaults, not measured base motion.
+    if (imu_configured) {
+        for (size_t i = 0; i < result.base_quat.size(); ++i)
+            result.base_quat[i] = source.base_quat[i];
+        for (size_t i = 0; i < result.gyro.size(); ++i) {
+            result.gyro[i] = source.gyro[i];
+            result.acceleration[i] = source.acceleration[i];
+            result.base_vel[i + 3] = source.gyro[i];
+        }
+        robot_base::QuatToRpy(result.base_quat, result.rpy);
     }
-    robot_base::QuatToRpy(result.base_quat, result.rpy);
     result.time = source.timestamp_s;
     *destination = std::move(result);
     return true;

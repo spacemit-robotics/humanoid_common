@@ -129,6 +129,9 @@ dialog::backdrop { background: #10150ecc; }
 #download-qr { width: 100%; margin-top: 8px; }
 .sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 [hidden] { display: none !important; }
+body[data-trajectory="true"] .workspace { grid-template-columns: minmax(0, 1fr); }
+body[data-trajectory="true"] .operations { grid-template-columns: minmax(0, 1fr); }
+body[data-trajectory="true"] .status-band { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 @media (max-width: 850px) {
   .product-name { display: none; }
   .workspace { gap: 24px; grid-template-columns: minmax(0, 1.3fr) minmax(280px, 1fr); }
@@ -187,4 +190,5 @@ dialog::backdrop { background: #10150ecc; }
   .login-copy { flex: 1; }
   #pairing-link { flex-basis: 65%; width: 0; }
   .fault { flex-wrap: wrap; }
+  body[data-trajectory="true"] .status-band > div:last-child { display: flex; }
 }

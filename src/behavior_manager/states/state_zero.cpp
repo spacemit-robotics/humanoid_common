@@ -96,10 +96,10 @@ public:
     }
 
     StateName CheckTransition() override {
-        // key=3 且已到位 → RL 控制
+        // key=3 且已到位，进入配置的控制状态。
         if (command_ && command_->key == 3 && finished_) {
             command_->key = 0;
-            return StateName::RL;
+            return transition_config_.next_state;
         }
         if (command_ && command_->key == 3 && !finished_) {
             ReportBlockedTransition();
@@ -223,9 +223,10 @@ private:
 
         MeasurePose();
         const std::string pose_status = FormatPoseStatus();
+        const std::string target = StateNameStr(transition_config_.next_state);
         const std::string message =
-            "ZERO -> RL blocked by pose readiness: " + pose_status;
-        std::cout << "[StateZero] 未通过到位校验，不能进入 RL："
+            "ZERO -> " + target + " blocked by pose readiness: " + pose_status;
+        std::cout << "[StateZero] 未通过到位校验，不能进入 " << target << "："
             << pose_status << std::endl;
         runtime_logging::Log(
             runtime_logging::Level::kWarning, message, false);

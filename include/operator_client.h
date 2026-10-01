@@ -24,6 +24,7 @@ public:
     std::string LastError() const;
     Status LatestStatus() const;
     std::vector<Policy> Policies() const;
+    std::vector<Action> Actions() const;
     std::string RobotName() const;
     Velocity VelocityStep() const;
     // Requests are serialized, bounded and never automatically retried.

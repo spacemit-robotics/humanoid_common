@@ -48,6 +48,8 @@ const char *StateNameStr(StateName s) {
         return "SAFETY";
     case StateName::HOME:
         return "HOME";
+    case StateName::TRAJECTORY:
+        return "TRAJECTORY";
     default:
         return "UNKNOWN";
     }
@@ -191,6 +193,7 @@ public:
     std::string pending_policy;               // 待生效的策略名
     std::string active_policy;                // 当前已加载的策略名
     bool has_rl = false;                      // 是否配置了 RL 状态
+    bool fixed_base = false;
     std::atomic<double> rl_freq_hz{0.0};      // RL 实时推理频率（Hz）
     robot_base::ThreadLoop infer_thread_cfg;  // 推理线程配置（robot_base.threads.rl_infer）
     SafetyMonitorConfig safety_monitor;
@@ -381,7 +384,7 @@ public:
         }
 
         const StateName state = fsm.CurrentState();
-        if (state != StateName::POWER_OFF) {
+        if (state != StateName::POWER_OFF && !fixed_base) {
             if ((safety_monitor.max_roll > 0.0 &&
                     std::abs(sensor.rpy[0]) > safety_monitor.max_roll) ||
                 (safety_monitor.max_pitch > 0.0 &&
@@ -520,6 +523,16 @@ public:
         int num_dof = sensor.num_dof;
 
         robot_base::YamlFile yaml_file = robot_base::YamlFile::Load(path);
+        fixed_base = yaml_file.Read<bool>("robot_base.fixed_base").value_or(false);
+        const bool trajectory_enabled = yaml_file.Read<bool>(
+            "behavior_manager.trajectory.enabled").value_or(false);
+        if (trajectory_enabled && (!fixed_base || yaml_file.Read<std::string>("rl_policy.type"))) {
+            throw std::runtime_error(
+                "trajectory behavior requires fixed_base=true and no rl_policy");
+        }
+        if (fixed_base && yaml_file.Read<std::string>("rl_policy.type")) {
+            throw std::runtime_error("fixed_base profile cannot enable locomotion RL");
+        }
 
         // 解析 robot_dir（绝对路径）
         robot_dir =
@@ -686,6 +699,19 @@ public:
             // 无 RL 策略时，ZERO 使用独立安全增益和可选 zero_pos。
             const auto &effective_zero_kp = zero_kp.empty() ? home_kp : zero_kp;
             const auto &effective_zero_kd = zero_kd.empty() ? home_kd : zero_kd;
+            if (trajectory_enabled) {
+                zero_transition_config.next_state = StateName::TRAJECTORY;
+                const auto config = joint_trajectory::LoadConfig(
+                    yaml_file, "behavior_manager.trajectory", robot_dir);
+                const auto kp = yaml_file.Read<std::vector<double>>(
+                    "behavior_manager.trajectory.kp").value_or(effective_zero_kp);
+                const auto kd = yaml_file.Read<std::vector<double>>(
+                    "behavior_manager.trajectory.kd").value_or(effective_zero_kd);
+                ValidateGainVector(kp, num_dof, "behavior_manager.trajectory.kp");
+                ValidateGainVector(kd, num_dof, "behavior_manager.trajectory.kd");
+                fsm.AddState(StateName::TRAJECTORY,
+                    CreateStateTrajectory(config, zero_pos, kp, kd));
+            }
             fsm.AddState(StateName::ZERO,
                 CreateStateZero(
                     zero_pos, zero_transition_config,

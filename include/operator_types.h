@@ -57,6 +57,7 @@ struct Status {
     std::string interaction_action;
     double interaction_progress = 0;
     RequestResult request;
+    bool trajectory_enabled = false;
 };
 struct Reply {
     bool ok = false;

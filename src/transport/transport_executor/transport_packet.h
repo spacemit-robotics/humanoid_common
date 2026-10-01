@@ -125,7 +125,7 @@ struct ControlCmdPacket {
     PacketHeader header{};
     int32_t num_dof = 0;
     uint8_t enable = 0;
-    // robot_base::ControlMode: POWER_OFF/DAMP/HOME/ZERO/RL/SAFETY.
+    // robot_base::ControlMode: POWER_OFF/DAMP/HOME/ZERO/RL/SAFETY/TRAJECTORY.
     int8_t control_mode = 0;
     // robot_base::ActuationMode: HYBRID/POSITION/VELOCITY/TORQUE.
     int8_t actuation_mode = 0;
@@ -217,6 +217,7 @@ inline bool ValidControlModeValue(int8_t value) {
     case robot_base::ControlMode::ZERO:
     case robot_base::ControlMode::RL:
     case robot_base::ControlMode::SAFETY:
+    case robot_base::ControlMode::TRAJECTORY:
         return true;
     }
     return false;

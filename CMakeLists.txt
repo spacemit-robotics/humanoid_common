@@ -176,6 +176,7 @@ if(BUILD_RL)
         src/behavior_manager/behavior_fsm.cpp
         src/behavior_manager/behavior_manager.cpp
         src/behavior_manager/rl_state_config.cpp
+        src/behavior_manager/joint_trajectory.cpp
         src/behavior_manager/policy_adapter/policy_adapter.cpp
         src/behavior_manager/policy_adapter/joint_trajectory_policy_adapter.cpp
         src/behavior_manager/states/state_power_off.cpp
@@ -183,6 +184,7 @@ if(BUILD_RL)
         src/behavior_manager/states/state_home.cpp
         src/behavior_manager/states/state_zero.cpp
         src/behavior_manager/states/state_rl.cpp
+        src/behavior_manager/states/state_trajectory.cpp
         src/behavior_manager/states/state_safety.cpp
     )
 
@@ -408,7 +410,12 @@ if(BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml)
     add_test(NAME operator_terminal_only COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --sim)
-    set_tests_properties(operator_network operator_terminal_only PROPERTIES RUN_SERIAL TRUE TIMEOUT 20)
+    add_test(NAME operator_trajectory COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --trajectory)
+    add_test(NAME operator_trajectory_terminal COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --trajectory --sim)
+    set_tests_properties(operator_network operator_terminal_only operator_trajectory
+        operator_trajectory_terminal PROPERTIES RUN_SERIAL TRUE TIMEOUT 20)
     add_test(NAME driver_runtime_backend_selection
         COMMAND test_driver_runtime ${DRIVER_RUNTIME_EXAMPLE_CONFIG})
     if(BUILD_WHOLE_BODY_BACKEND)
@@ -417,6 +424,7 @@ if(BUILD_TESTS)
             src/runtime/driver/backends/whole_body_backend.cpp
             src/runtime/driver/backends/whole_body_adapter.cpp)
         target_include_directories(test_hardware_recovery PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/driver
             ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/common
             ${WHOLE_BODY_INCLUDE_DIR})
@@ -449,6 +457,14 @@ if(BUILD_RL)
     install(TARGETS test_policy_adapter RUNTIME DESTINATION bin)
 
     if(BUILD_TESTS)
+        add_test(NAME policy_adapter COMMAND test_policy_adapter)
+        add_executable(test_trajectory example/behavior_manager/test_trajectory.cpp)
+        target_include_directories(test_trajectory PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager)
+        target_link_libraries(test_trajectory PRIVATE behavior_manager cnpy)
+        add_test(NAME trajectory COMMAND test_trajectory)
+        install(TARGETS test_trajectory RUNTIME DESTINATION bin)
+
         add_executable(test_rl_target_limits
             example/behavior_manager/test_rl_target_limits.cpp)
         target_include_directories(test_rl_target_limits PRIVATE

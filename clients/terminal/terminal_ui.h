@@ -16,6 +16,7 @@ struct View {
     Page page = Page::MAIN;
     operator_service::Status status;
     std::vector<operator_service::Policy> policies;
+    std::vector<operator_service::Action> actions;
     operator_service::Velocity target_command;
     int active_policy_idx = 0;
     int policy_cursor_idx = 0;

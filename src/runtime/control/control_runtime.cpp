@@ -10,7 +10,7 @@
  * 执行状态转换和控制逻辑，最后将控制命令发送给 driver。
  *
  * 调用的模块：
- * - behavior_manager: 行为状态机管理（POWER_OFF → DAMP → HOME → ZERO → RL）
+ * - behavior_manager: 行为状态机管理（POWER_OFF → DAMP → HOME → ZERO → RL/TRAJECTORY）
  * - transport_executor: 统一传输接口
  * - robot_base: 机器人状态数据结构
  */
@@ -166,6 +166,8 @@ robot_base::ControlMode ToControlMode(behavior_manager::StateName state) {
         return robot_base::ControlMode::ZERO;
     case behavior_manager::StateName::RL:
         return robot_base::ControlMode::RL;
+    case behavior_manager::StateName::TRAJECTORY:
+        return robot_base::ControlMode::TRAJECTORY;
     case behavior_manager::StateName::SAFETY:
         return robot_base::ControlMode::SAFETY;
     }
@@ -188,11 +190,13 @@ int main(int argc, char *argv[]) {
 
     // 从配置读取控制频率参数
     robot_base::YamlFile yaml_file;
+    bool trajectory_enabled = false;
     runtime_config::PolicyCommandLimitMap policy_command_limits;
     std::unique_ptr<runtime_logging::Session> logging_session;
     try {
         yaml_file = robot_base::YamlFile::Load(yaml_path);
-        policy_command_limits = runtime_config::LoadPolicyCommandLimits(yaml_file);
+        trajectory_enabled = yaml_file.Read<bool>("behavior_manager.trajectory.enabled").value_or(false);
+        if (!trajectory_enabled) policy_command_limits = runtime_config::LoadPolicyCommandLimits(yaml_file);
         logging_session = std::make_unique<runtime_logging::Session>(
             yaml_file, yaml_path, "control", false);
     } catch (const std::exception &e) {
@@ -209,7 +213,8 @@ int main(int argc, char *argv[]) {
         static_cast<float>(yaml_file.Read<double>("behavior_manager.control_dt").value_or(0.02));
 
     // rl_policy.rl_dt: RL 推理周期（对应训练时的推理频率）
-    float rl_dt = static_cast<float>(yaml_file.Read<double>("rl_policy.rl_dt").value_or(0.02));
+    float rl_dt = trajectory_enabled ? control_dt
+        : static_cast<float>(yaml_file.Read<double>("rl_policy.rl_dt").value_or(0.02));
     if (!std::isfinite(control_dt) || control_dt <= 0.0f ||
         !std::isfinite(rl_dt) || rl_dt <= 0.0f) {
         std::cerr << "[control_runtime] invalid control_dt or rl_dt\n";
@@ -577,10 +582,11 @@ int main(int argc, char *argv[]) {
 
             std::ostringstream line0, line1, line2;
             line0 << "[control] state=" << StateNameStr(bm.CurrentState())
-                << " policy=" << policy
-                << " hmi=" << (hmi_connected ? "online" : "timeout")
-                << std::fixed << std::setprecision(2)
-                << " cmd=(" << cmd.vx << "," << cmd.vy << "," << cmd.wz << ")";
+                << " hmi=" << (hmi_connected ? "online" : "timeout");
+            if (!trajectory_enabled) {
+                line0 << " policy=" << policy << std::fixed << std::setprecision(2)
+                    << " cmd=(" << cmd.vx << "," << cmd.vy << "," << cmd.wz << ")";
+            }
             const auto &fault = reported_fault;
             if (fault.latched) {
                 line0 << " fault=" << robot_base::FaultSourceName(fault.source)
@@ -592,9 +598,13 @@ int main(int argc, char *argv[]) {
                 << "Hz actual=" << std::setprecision(2) << control_freq << "Hz"
                 << " p99=" << latest_timing.period_p99_ms << "ms"
                 << " skip=" << latest_timing.skipped_cycles;
-            line2 << std::fixed << std::setprecision(4) << "rl_dt=" << rl_dt
-                << "s target=" << std::setprecision(1) << target_rl_hz
-                << "Hz actual=" << std::setprecision(2) << rl_freq << "Hz";
+            if (trajectory_enabled) {
+                line2 << "trajectory action=" << bm.CurrentInteractionStatus().action;
+            } else {
+                line2 << std::fixed << std::setprecision(4) << "rl_dt=" << rl_dt
+                    << "s target=" << std::setprecision(1) << target_rl_hz
+                    << "Hz actual=" << std::setprecision(2) << rl_freq << "Hz";
+            }
 
             std::cout << "\033[3A"
                     << "\r\033[2K" << line0.str() << "\n"

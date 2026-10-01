@@ -36,6 +36,8 @@ const char *StateName(robot_base::ControlMode mode) {
         return "ZERO";
     case M::RL:
         return "RL";
+    case M::TRAJECTORY:
+        return "TRAJECTORY";
     case M::SAFETY:
         return "SAFETY";
     }
@@ -64,6 +66,17 @@ const char *PhaseName(robot_base::InteractionStatus::Phase phase) {
 bool Busy(robot_base::InteractionStatus::Phase p) {
     using P = robot_base::InteractionStatus::Phase;
     return p == P::BLEND_IN || p == P::PLAYING || p == P::HOLDING || p == P::BLEND_OUT;
+}
+bool SupportsInteraction(robot_base::ControlMode mode) {
+    return mode == robot_base::ControlMode::RL || mode == robot_base::ControlMode::TRAJECTORY;
+}
+std::vector<Action> LoadActions(const robot_base::YamlFile &yaml, const std::string &catalog) {
+    std::vector<Action> actions;
+    for (const auto &key :
+        yaml.Read<std::vector<std::string>>(catalog + ".action_names").value_or(std::vector<std::string>{})) {
+        actions.push_back({key, yaml.Read<std::string>(catalog + ".actions." + key + ".display_name").value_or(key)});
+    }
+    return actions;
 }
 bool TokenEqual(const std::string &a, const std::string &b) {
     if (a.size() != b.size() || a.empty()) return false;
@@ -143,6 +156,14 @@ Config LoadConfig(const std::string &path) {
         !std::isfinite(c.status_timeout) || c.status_timeout < 0.1 || !std::isfinite(c.request_timeout) ||
         c.request_timeout < 0.5 || c.lease_ms < 300 || c.lease_ms > 5000)
         throw std::runtime_error("invalid operator timing");
+    c.trajectory_enabled = yaml.Read<bool>("behavior_manager.trajectory.enabled").value_or(false);
+    if (c.trajectory_enabled) {
+        const auto file = yaml.Read<std::string>("behavior_manager.trajectory.catalog_file");
+        const auto catalog = yaml.Read<std::string>("behavior_manager.trajectory.catalog")
+            .value_or("behavior_manager.trajectory");
+        c.actions = LoadActions(file ? robot_base::YamlFile::Load(yaml.ToAbsPath(*file)) : yaml, catalog);
+        return c;
+    }
     const auto names =
         yaml.Read<std::vector<std::string>>("rl_policy.onnx_infer.policy_names").value_or(std::vector<std::string>{});
     for (const auto &name : names) {
@@ -160,11 +181,7 @@ Config LoadConfig(const std::string &path) {
         const auto configured = yaml.Read<std::string>(adapter + ".catalog");
         if (type == "joint_trajectory" || (type == "sonic" && configured && !configured->empty())) {
             const std::string catalog = configured.value_or(adapter);
-            for (const auto &key :
-                yaml.Read<std::vector<std::string>>(catalog + ".action_names").value_or(std::vector<std::string>{})) {
-                p.actions.push_back(
-                    {key, yaml.Read<std::string>(catalog + ".actions." + key + ".display_name").value_or(key)});
-            }
+            p.actions = LoadActions(yaml, catalog);
         }
         c.policies.push_back(p);
     }
@@ -234,7 +251,7 @@ void Service::Tick() {
     }
     if (result_.phase == "accepted" && now >= request_until_) Finish("expired", "control did not confirm request");
     if (command_.interaction.operation != robot_base::InteractionRequest::Operation::NONE &&
-        (status_.mode != robot_base::ControlMode::RL ||
+        (!SupportsInteraction(status_.mode) ||
             status_.interaction.sequence == command_.interaction.sequence)) {
         command_.interaction.operation = robot_base::InteractionRequest::Operation::NONE;
         command_.interaction.action.clear();
@@ -275,6 +292,7 @@ Status Service::Snapshot(uint64_t session) const {
     s.online = Online();
     s.hmi_connected = status_.hmi_connected;
     s.zero_ready = status_.zero_ready;
+    s.trajectory_enabled = config_.trajectory_enabled;
     s.state = StateName(status_.mode);
     s.policy = status_.active_policy;
     s.age_ms = status_at_ < 0 ? 0 : std::max(0.0, (Now() - status_at_) * 1000);
@@ -295,8 +313,11 @@ Status Service::Snapshot(uint64_t session) const {
 Json Service::Catalog() const {
     Json policies = Json::array();
     for (const auto &p : config_.policies) policies.push_back(Encode(p));
+    Json actions = Json::array();
+    for (const auto &a : config_.actions) actions.push_back({{"key", a.key}, {"display_name", a.display_name}});
     return {{"robot", config_.robot}, {"policies", policies}, {"lease_ms", config_.lease_ms},
-        {"velocity_step", Encode(config_.velocity_step)}};
+        {"velocity_step", Encode(config_.velocity_step)}, {"trajectory_enabled", config_.trajectory_enabled},
+        {"actions", actions}};
 }
 Json Service::ReplyTo(
     uint64_t id, bool ok, const std::string &code, const std::string &message, const Json &data) const {
@@ -375,7 +396,7 @@ Json Service::Handle(uint64_t session, const Json &request) {
             }
         }
         if (op == "velocity") {
-            if (status_.mode != robot_base::ControlMode::RL || fault_.latched)
+            if (config_.trajectory_enabled || status_.mode != robot_base::ControlMode::RL || fault_.latched)
                 return fail("not_ready", "velocity is only available in healthy RL");
             const auto *policy = ActivePolicy();
             if (!policy) return fail("not_ready", "active policy has no catalog");
@@ -400,13 +421,15 @@ Json Service::Handle(uint64_t session, const Json &request) {
             if (target == "DAMP" && mode != M::SAFETY) key = 1;
             if (target == "HOME" && mode == M::DAMP) key = 4;
             if (target == "ZERO" && mode == M::HOME) key = 2;
-            if (target == "RL" && mode == M::ZERO && status_.zero_ready) key = 3;
+            const auto active_mode = config_.trajectory_enabled ? "TRAJECTORY" : "RL";
+            if (target == active_mode && mode == M::ZERO && status_.zero_ready) key = 3;
             if (target == StateName(mode)) return ReplyTo(id, true, "ok", "already in requested state");
             if (!key) return fail("not_ready", "state prerequisite is not satisfied");
             command_.key = key;
             source_mode_ = mode;
             pending_target_ = target;
         } else if (op == "policy") {
+            if (config_.trajectory_enabled) return fail("not_ready", "trajectory mode has no RL policy");
             if (status_.mode != M::POWER_OFF && status_.mode != M::DAMP)
                 return fail("not_ready", "select policy in POWER_OFF or DAMP");
             const auto name = args.at("policy").get<std::string>();
@@ -416,12 +439,14 @@ Json Service::Handle(uint64_t session, const Json &request) {
             command_.switch_policy = name;
             pending_target_ = name;
         } else if (op == "interaction" || op == "cancel") {
-            if (status_.mode != M::RL) return fail("not_ready", "action requires RL");
+            const auto active_mode = config_.trajectory_enabled ? M::TRAJECTORY : M::RL;
+            if (status_.mode != active_mode) return fail("not_ready", "action requires the configured active mode");
             const auto *policy = ActivePolicy();
+            const auto *actions = config_.trajectory_enabled ? &config_.actions : (policy ? &policy->actions : nullptr);
             const auto action = args.value("action", "");
             if (op == "interaction" &&
-                (!policy || Busy(status_.interaction.phase) ||
-                    std::none_of(policy->actions.begin(), policy->actions.end(),
+                (!actions || Busy(status_.interaction.phase) ||
+                    std::none_of(actions->begin(), actions->end(),
                         [&](const Action &a) { return a.key == action; })))
                 return fail("not_ready", "action is unavailable or another action is busy");
             command_.interaction.sequence = std::max(command_.interaction.sequence, status_.interaction.sequence) + 1;
@@ -431,7 +456,7 @@ Json Service::Handle(uint64_t session, const Json &request) {
             command_.interaction.action = op == "interaction" ? action : "";
         } else if (op == "reference_start") {
             const auto *policy = ActivePolicy();
-            if (status_.mode != M::RL || !policy || !policy->manual_reference)
+            if (config_.trajectory_enabled || status_.mode != M::RL || !policy || !policy->manual_reference)
                 return fail("not_ready", "active policy is not a manual reference policy");
             command_.key = robot_base::kCommandStartReference;
             reference_until_ = Now() + 0.25;

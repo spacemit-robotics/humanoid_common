@@ -31,6 +31,8 @@ struct Config {
     int lease_ms = 1000;
     Velocity velocity_step{0.1, 0.1, 0.1};
     std::vector<Policy> policies;
+    bool trajectory_enabled = false;
+    std::vector<Action> actions;
 };
 Config LoadConfig(const std::string &path);
 std::string DefaultConnectionFile(const std::string &robot);

@@ -1,0 +1,29 @@
+robot_base:
+  name: operator_test
+driver:
+  backend: whole_body
+operator_service:
+  port: 18765
+  public_url: http://127.0.0.1:18765
+transport:
+  type: udp
+  udp:
+    driver_ip: 127.0.0.1
+    control_ip: 127.0.0.1
+    hmi_ip: 127.0.0.1
+    state_port: 18860
+    control_port: 18861
+    hmi_port: 18862
+    status_port: 18863
+rl_policy:
+  onnx_infer:
+    policy_names: [test_policy]
+    policies:
+      test_policy:
+        command:
+          limits: {max_vx: 0.1, max_vy: 0.1, max_wz: 0.2}
+        policy_adapter:
+          type: joint_trajectory
+          action_names: [wave]
+          actions:
+            wave: {display_name: Wave}

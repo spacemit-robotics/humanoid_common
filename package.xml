@@ -8,6 +8,8 @@
   <depend>mujoco</depend>
   <system_depend check="pkg-config --exists eigen3">libeigen3-dev</system_depend>
   <system_depend check="pkg-config --exists yaml-cpp">libyaml-cpp-dev</system_depend>
+  <system_depend check="test -f /usr/include/boost/beast.hpp">libboost-dev</system_depend>
+  <system_depend check="test -f /usr/include/nlohmann/json.hpp">nlohmann-json3-dev</system_depend>
 
   <export>
     <build_type>cmake</build_type>

@@ -66,6 +66,7 @@ class WholeBodyBackend final : public DriverBackend {
 public:
     explicit WholeBodyBackend(const std::string &yaml_path) : yaml_path_(yaml_path) {
         const auto yaml_file = robot_base::YamlFile::Load(yaml_path);
+        fixed_base_ = yaml_file.Read<bool>("robot_base.fixed_base").value_or(false);
         state_template_ = robot_base::RobotData::FromYaml(yaml_path);
         const auto hardware_config = yaml_file.Read<std::string>("whole_body.config_file");
         if (hardware_config) {
@@ -74,6 +75,18 @@ public:
         }
         if (whole_body_create(yaml_path.c_str(), &device_) != WHOLE_BODY_OK)
             throw std::runtime_error("failed to create whole_body from YAML");
+        const int has_imu = whole_body_has_imu(device_);
+        if (has_imu < 0) {
+            whole_body_destroy(device_);
+            device_ = nullptr;
+            throw std::runtime_error("failed to query whole_body IMU configuration");
+        }
+        imu_configured_ = has_imu != 0;
+        ValidateImuConfiguration();
+        if (!imu_configured_) {
+            runtime_logging::Log(runtime_logging::Level::kInfo,
+                "IMU not configured; base pose and motion are mathematical defaults, not measurements");
+        }
         if (whole_body_get_cycle_s(device_, &cycle_s_) != WHOLE_BODY_OK ||
             !std::isfinite(cycle_s_) || cycle_s_ <= 0.0) {
             whole_body_destroy(device_);
@@ -111,6 +124,14 @@ public:
             }
             if (!should_continue()) return 0;
             if (whole_body_create(yaml_path_.c_str(), &device_) != WHOLE_BODY_OK) return 1;
+            const int has_imu = whole_body_has_imu(device_);
+            if (has_imu < 0) {
+                (void)PublishFault(publish_state,
+                    UpdateFault(has_imu, FaultContext::kInitialization, nullptr, true));
+                return 1;
+            }
+            imu_configured_ = has_imu != 0;
+            ValidateImuConfiguration();
             init_result = whole_body_init(device_);
         }
         if (recovery_active_) (void)whole_body_set_mode(device_, WHOLE_BODY_MODE_SAFETY);
@@ -178,7 +199,7 @@ public:
                         runtime_logging::Level::kInfo, "whole_body feedback recovered");
                 }
                 robot_base::RobotData state;
-                if (!ConvertWholeBodyState(hardware_state, &state)) {
+                if (!ConvertWholeBodyState(hardware_state, &state, imu_configured_)) {
                     hardware_cycle_failed = true;
                     runtime_logging::Log(runtime_logging::Level::kError,
                         "rejected whole_body state dimensions");
@@ -274,14 +295,14 @@ public:
                 whole_body_diagnostics_v2 diagnostics{};
                 if (whole_body_get_diagnostics_v2(device_, &diagnostics) == WHOLE_BODY_OK) {
                     if (render_due) {
-                        RenderWholeBodyDiagnostics(diagnostics, cycle_s_);
+                        RenderWholeBodyDiagnostics(diagnostics, cycle_s_, imu_configured_);
                         last_monitor = sample_time;
                     }
                     if (telemetry_due) {
                         whole_body_motor_command_diagnostics_v2 command_diagnostics{};
                         if (whole_body_get_motor_command_diagnostics_v2(
                                 device_, &command_diagnostics) == WHOLE_BODY_OK) {
-                            RecordWholeBodyDiagnostics(diagnostics, command_diagnostics);
+                            RecordWholeBodyDiagnostics(diagnostics, command_diagnostics, imu_configured_);
                         }
                         last_telemetry = sample_time;
                     }
@@ -349,6 +370,14 @@ public:
     }
 
 private:
+    void ValidateImuConfiguration() {
+        if (imu_configured_ || fixed_base_) return;
+        whole_body_destroy(device_);
+        device_ = nullptr;
+        throw std::runtime_error(
+            "whole_body without IMU requires explicit robot_base.fixed_base: true");
+    }
+
     robot_base::FaultSource ClassifyFaultSource(
         FaultContext context, const whole_body_diagnostics_v2 *diagnostics) const {
         if (context == FaultContext::kStateAdapter ||
@@ -368,8 +397,8 @@ private:
                 break;
             }
         }
-        const bool imu_problem = !diagnostics->imu.feedback_received ||
-            !diagnostics->imu.feedback_fresh;
+        const bool imu_problem = imu_configured_ &&
+            (!diagnostics->imu.feedback_received || !diagnostics->imu.feedback_fresh);
         if (imu_problem && !motor_problem) return robot_base::FaultSource::IMU;
         if (motor_problem && !imu_problem) return robot_base::FaultSource::MOTOR;
         return robot_base::FaultSource::WHOLE_BODY;
@@ -452,6 +481,8 @@ private:
     std::string yaml_path_;
     bool recovery_active_ = false;
     bool await_power_off_ = false;
+    bool imu_configured_ = true;
+    bool fixed_base_ = false;
     double cycle_s_ = 0.0;
     robot_base::RobotData state_template_;
     std::optional<robot_base::RobotData> last_valid_state_;

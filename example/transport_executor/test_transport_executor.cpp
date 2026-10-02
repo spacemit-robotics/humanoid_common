@@ -123,6 +123,13 @@ bool TestStaleShmDataDiscard() {
 }
 
 bool TestPacketValidation() {
+    static_assert(static_cast<int>(robot_base::ControlMode::POWER_OFF) == 0);
+    static_assert(static_cast<int>(robot_base::ControlMode::DAMP) == 1);
+    static_assert(static_cast<int>(robot_base::ControlMode::ZERO) == 2);
+    static_assert(static_cast<int>(robot_base::ControlMode::RL) == 3);
+    static_assert(static_cast<int>(robot_base::ControlMode::SAFETY) == 4);
+    static_assert(static_cast<int>(robot_base::ControlMode::HOME) == 5);
+    static_assert(static_cast<int>(robot_base::ControlMode::TRAJECTORY) == 6);
     transport::HmiCmdPacket hmi{};
     hmi.header.type = static_cast<uint16_t>(transport::MsgType::HMI_CMD);
     if (!transport::ValidHmiCmdPacket(hmi)) return false;
@@ -158,6 +165,15 @@ bool TestPacketValidation() {
 
     transport::ControlStatusPacket status{};
     status.header.type = static_cast<uint16_t>(transport::MsgType::CONTROL_STATUS);
+    for (int8_t mode = 0; mode <= 6; ++mode) {
+        control.control_mode = status.control_mode = mode;
+        if (!transport::ValidControlCmdPacket(control) || !transport::ValidControlStatusPacket(status)) return false;
+    }
+    for (int8_t mode : {-1, 7, 127}) {
+        control.control_mode = status.control_mode = mode;
+        if (transport::ValidControlCmdPacket(control) || transport::ValidControlStatusPacket(status)) return false;
+    }
+    status.control_mode = 0;
     if (!transport::ValidControlStatusPacket(status)) return false;
     status.hmi_connected = 2;
     if (transport::ValidControlStatusPacket(status)) return false;
@@ -361,6 +377,12 @@ int main(int argc, char *argv[]) {
         all_ok = false;
     }
 
+    cmd.mode = robot_base::ControlMode::TRAJECTORY;
+    if (!control->SendControlV2(cmd)) return 1;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!driver->RecvControl(recv_cmd) || recv_cmd.mode != robot_base::ControlMode::TRAJECTORY ||
+        recv_cmd.target_pos != cmd.target_pos || recv_cmd.actuation_mode != cmd.actuation_mode) return 1;
+
     robot_base::ControlCmd invalid_cmd = cmd;
     invalid_cmd.target_vel.pop_back();
     bool invalid_control_rejected = !control->SendControlV2(invalid_cmd);
@@ -528,6 +550,16 @@ int main(int argc, char *argv[]) {
     std::cout << "[test] 状态回传验证: "
         << (status_ok ? "通过" : "失败") << "\n";
     all_ok = all_ok && status_ok;
+
+    robot_base::ControlStatus trajectory_status;
+    trajectory_status.mode = robot_base::ControlMode::TRAJECTORY;
+    trajectory_status.interaction = status.interaction;
+    if (!control->SendStatusV2(trajectory_status, {})) return 1;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!hmi->RecvStatusV2(recv_status, recv_status_fault) ||
+        recv_status.mode != robot_base::ControlMode::TRAJECTORY || !recv_status.active_policy.empty() ||
+        recv_status.rl_frequency_hz != 0 || recv_status.interaction.action != "wave" || recv_status_fault.latched)
+        return 1;
 
     robot_base::ControlStatus invalid_status = status;
     invalid_status.rl_frequency_hz = std::numeric_limits<float>::infinity();

@@ -28,7 +28,8 @@ enum class StateName {
     ZERO,       ///< 回零位：平滑到 RL 训练初始位置
     RL,         ///< RL 控制：异步推理输出动作
     SAFETY,     ///< 安全保护：IMU 倾角/关节限位触发
-    HOME        ///< 机型复位：平滑到 robot_base.default_joint_pos
+    HOME,       ///< 机型复位：平滑到 robot_base.default_joint_pos
+    TRAJECTORY  ///< 固定底座关节轨迹播放，不运行 RL
 };
 
 /**

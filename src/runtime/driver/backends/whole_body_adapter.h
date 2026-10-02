@@ -17,7 +17,7 @@
 namespace driver_runtime {
 
 bool ConvertWholeBodyState(
-    const whole_body_state &source, robot_base::RobotData *destination);
+    const whole_body_state &source, robot_base::RobotData *destination, bool imu_configured = true);
 
 bool ConvertControlCommand(const robot_base::ControlCmd &source, uint32_t num_dof,
     whole_body_joint_command *destination);

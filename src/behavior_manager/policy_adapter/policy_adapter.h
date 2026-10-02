@@ -15,6 +15,7 @@
 
 #include "rl_service.h"
 #include "robot_base.h"
+#include "../joint_trajectory.h"
 
 namespace behavior_manager {
 namespace policy_adapter {
@@ -33,25 +34,13 @@ struct ReferenceActionConfig {
 /**
  * @brief 一条外部关节轨迹及其控制权范围
  */
-struct JointTrajectoryActionConfig {
-    std::string name;
-    std::string file;
-    std::vector<int> joint_indices;
-    double motion_fps = 50.0;
-    double playback_speed = 1.0;
-    bool hold_last_frame = false;
-};
+using JointTrajectoryActionConfig = joint_trajectory::ActionConfig;
 
 /**
  * @brief RL 内部关节轨迹接管配置
  */
-struct JointTrajectoryConfig {
+struct JointTrajectoryConfig : joint_trajectory::Config {
     std::string applied_action_term;
-    double blend_in_duration = 0.25;
-    double blend_out_duration = 0.25;
-    std::vector<JointTrajectoryActionConfig> actions;
-
-    bool Enabled() const { return !actions.empty(); }
 };
 
 /**

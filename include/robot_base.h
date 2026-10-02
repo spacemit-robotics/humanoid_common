@@ -229,7 +229,7 @@ void RpyToQuat(const std::array<double, 3> &rpy, std::array<double, 4> &quat);
 void NormalizeQuat(std::array<double, 4> &quat);
 
 /**
- * @brief RL 状态内部交互动作请求
+ * @brief RL 或 TRAJECTORY 状态的交互动作请求
  */
 struct InteractionRequest {
     enum class Operation : uint8_t {
@@ -260,7 +260,7 @@ struct Command {
 };
 
 /**
- * @brief RL 状态内部交互动作的执行状态
+ * @brief RL 或 TRAJECTORY 状态的交互动作执行状态
  */
 struct InteractionStatus {
     enum class Phase : uint8_t {
@@ -292,7 +292,8 @@ enum class ControlMode : int8_t {
     ZERO = 2,       ///< PD 锁位（回零或保持训练初始位）
     RL = 3,         ///< RL 策略动态控制
     SAFETY = 4,     ///< 安全保护
-    HOME = 5        ///< 机型默认姿态复位
+    HOME = 5,       ///< 机型默认姿态复位
+    TRAJECTORY = 6  ///< 独立关节轨迹动作控制，不依赖 RL 策略
 };
 
 /**
@@ -303,20 +304,20 @@ enum class ControlMode : int8_t {
  */
 struct ControlStatus {
     ControlMode mode = ControlMode::POWER_OFF;  ///< 当前真实 FSM 状态
-    bool zero_ready = false;                    ///< ZERO 已完成，可请求进入 RL
+    bool zero_ready = false;                    ///< ZERO 已完成，可请求进入 RL 或 TRAJECTORY
     bool hmi_connected = false;                 ///< Control 在超时内收到过 HMI 心跳
     float vx = 0.0f;                            ///< Control 实际采用的前进速度 (m/s)
     float vy = 0.0f;                            ///< Control 实际采用的横向速度 (m/s)
     float wz = 0.0f;                            ///< Control 实际采用的转向角速度 (rad/s)
     float rl_frequency_hz = 0.0f;               ///< RL 当前推理频率 (Hz)
-    std::string active_policy;                  ///< 当前实际生效策略
-    InteractionStatus interaction;              ///< RL 内部交互动作状态
+    std::string active_policy;                  ///< 当前实际生效策略；独立轨迹模式为空
+    InteractionStatus interaction;              ///< RL 或 TRAJECTORY 交互动作状态
 };
 
 /**
  * @brief 关节命令的执行器控制语义，独立于上层 FSM 状态
  *
- * ControlMode 描述机器人当前处于 POWER_OFF、DAMP、HOME、ZERO、RL 或 SAFETY 状态；
+ * ControlMode 描述 POWER_OFF、DAMP、HOME、ZERO、RL、SAFETY 或 TRAJECTORY 状态；
  * ActuationMode 描述 position/velocity/target_torque/kp/kd 应如何被执行器解释。
  */
 enum class ActuationMode : int8_t {

@@ -47,6 +47,7 @@ struct Client::Impl {
     uint64_t waiting_id = 0;
     Status status;
     std::vector<Policy> policies;
+    std::vector<Action> actions;
     std::string robot;
     Velocity velocity_step{0.1, 0.1, 0.1};
     std::chrono::steady_clock::time_point last_status{};
@@ -196,6 +197,8 @@ bool Client::Connect(const Connection &c, std::string *error) {
         }
         for (const auto &p : catalog.at("policies"))
             impl_->policies.push_back(DecodePolicy(p));
+        for (const auto &a : catalog.value("actions", Json::array()))
+            impl_->actions.push_back({a.at("key"), a.at("display_name")});
         return true;
     } catch (const std::exception &e) {
         if (error)
@@ -240,6 +243,10 @@ Status Client::LatestStatus() const {
 std::vector<Policy> Client::Policies() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->policies;
+}
+std::vector<Action> Client::Actions() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->actions;
 }
 std::string Client::RobotName() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);

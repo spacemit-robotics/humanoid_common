@@ -35,7 +35,7 @@
     <section class="status-band" aria-label="实时状态">
       <div class="state-reading"><span>当前状态</span><strong id="state">—</strong><span id="state-label">等待状态</span></div>
       <div><span>准备姿态</span><strong id="ready">—</strong><span>ZERO</span></div>
-      <div><span>策略推理</span><strong id="frequency">—</strong><span>实时频率</span></div>
+      <div id="inference-status"><span>策略推理</span><strong id="frequency">—</strong><span>实时频率</span></div>
       <div><span>反馈延迟</span><strong id="age">—</strong><span>控制链路</span></div>
     </section>
     <section class="authority" aria-label="控制权">
@@ -58,7 +58,7 @@
             <button data-state="DAMP"><i data-lucide="waves"></i><strong>阻尼</strong><span>DAMP</span></button>
             <button data-state="HOME"><i data-lucide="house"></i><strong>复位</strong><span>HOME</span></button>
             <button data-state="ZERO"><i data-lucide="crosshair"></i><strong>准备</strong><span>ZERO</span></button>
-            <button data-state="RL"><i data-lucide="activity"></i><strong>策略控制</strong><span>RL</span></button>
+            <button id="active-mode" data-state="RL"><i data-lucide="activity"></i><strong>策略控制</strong><span>RL</span></button>
           </div>
         </section>
         <section class="policy-section">
@@ -97,7 +97,7 @@
       </section>
     </div>
     <footer class="command-bar"><p id="message" role="status">正在连接设备</p>
-      <div class="stop-bar"><button id="stop" class="stop"><i data-lucide="octagon-pause"></i>停止移动</button></div></footer>
+      <div class="stop-bar"><button id="stop" class="stop"><i data-lucide="octagon-pause"></i><span id="stop-label">停止移动</span></button></div></footer>
   </main>
   <dialog id="pair-dialog">
     <div class="dialog-head"><h2>手机扫码接入</h2><button id="close-pair" class="icon" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></div>

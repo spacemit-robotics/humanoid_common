@@ -129,6 +129,7 @@ bool IsManualReferencePolicy(const UiState &state) {
     return policy && policy->manual_reference;
 }
 const std::vector<operator_service::Action> *ActiveInteractionActions(const UiState &state) {
+    if (state.status.trajectory_enabled) return &state.actions;
     const auto *policy = ActivePolicy(state);
     return policy ? &policy->actions : nullptr;
 }
@@ -153,9 +154,10 @@ std::string InteractionDisplayName(const UiState &state, const std::string &key)
     }
     return key;
 }
-bool ActiveRlHasInteractions(const UiState &state) {
+bool ActiveModeHasInteractions(const UiState &state) {
     const auto *actions = ActiveInteractionActions(state);
-    return state.status.online && state.status.hmi_connected && state.status.state == "RL" && actions &&
+    return state.status.online && state.status.hmi_connected &&
+        state.status.state == (state.status.trajectory_enabled ? "TRAJECTORY" : "RL") && actions &&
         !actions->empty();
 }
 Color InteractionColor(const std::string &phase) {
@@ -186,13 +188,13 @@ void PrintInteractionProgress(const UiState &state, int width) {
     ResetAttr();
 }
 
-const char *ModeName(const std::string &mode) { return mode.c_str(); }
+const char *ModeName(const std::string &mode) { return mode == "TRAJECTORY" ? "动作" : mode.c_str(); }
 Color ModeColor(const std::string &mode) {
     if (mode == "POWER_OFF") return Color::BRIGHT_RED;
     if (mode == "DAMP") return Color::BRIGHT_YELLOW;
     if (mode == "HOME") return Color::BLUE;
     if (mode == "ZERO") return Color::BRIGHT_CYAN;
-    if (mode == "RL") return Color::BRIGHT_GREEN;
+    if (mode == "RL" || mode == "TRAJECTORY") return Color::BRIGHT_GREEN;
     if (mode == "SAFETY") return Color::MAGENTA;
     return Color::WHITE;
 }
@@ -226,19 +228,26 @@ void PrintHeader(const Layout &layout, const UiState &state, const char *title) 
 }
 
 void PrintModeToken(const std::string &token, const UiState &state) {
+    const char *label = ModeName(token);
+    if (state.status.trajectory_enabled) {
+        if (token == "POWER_OFF") label = "掉电";
+        if (token == "DAMP") label = "阻尼";
+        if (token == "HOME") label = "复位";
+        if (token == "ZERO") label = "准备";
+    }
     const bool active = state.status.online && state.status.state == token;
     const bool pending = !state.transition_target.empty() && state.transition_target == token;
     if (active) {
         SetFg(ModeColor(token));
         SetBold();
-        printf("▶[%s]", ModeName(token));
+        printf("▶[%s]", label);
     } else if (pending) {
         SetFg(Color::MAGENTA);
         SetBold();
-        printf("…[%s]", ModeName(token));
+        printf("…[%s]", label);
     } else {
         SetDim();
-        printf(" [%s]", ModeName(token));
+        printf(" [%s]", label);
     }
     ResetAttr();
 }
@@ -278,7 +287,7 @@ void RenderMainPage(const UiState &state) {
     printf(" → ");
     PrintModeToken("ZERO", state);
     printf(" → ");
-    PrintModeToken("RL", state);
+    PrintModeToken(state.status.trajectory_enabled ? "TRAJECTORY" : "RL", state);
     MoveTo(7, layout.content_left);
     if (state.status.online && state.status.fault.latched) {
         SetFg(state.status.fault.active ? Color::BRIGHT_RED : Color::BRIGHT_YELLOW);
@@ -297,13 +306,14 @@ void RenderMainPage(const UiState &state) {
             : "当前仅查看；控制权由其他客户端持有");
     } else if (state.status.online && state.status.state == "ZERO") {
         SetFg(state.status.zero_ready ? Color::BRIGHT_GREEN : Color::BRIGHT_YELLOW);
-        printf("回零: %s", state.status.zero_ready ? "READY，可按 → 进入 RL" : "进行中，等待到位");
+        printf("回零: %s", !state.status.zero_ready ? "进行中，等待到位"
+            : (state.status.trajectory_enabled ? "READY，可按 → 进入动作" : "READY，可按 → 进入 RL"));
     } else if (state.status.online && state.status.state == "RL" && IsManualReferencePolicy(state)) {
         SetFg(state.reference_start_requested ? Color::BRIGHT_GREEN : Color::BRIGHT_YELLOW);
         printf("%s",
             state.reference_start_requested ? "开始命令已发送；未动作可再次按 [G]"
                                             : "RL 已接管，等待人工确认    [G] 开始动作");
-    } else if (ActiveRlHasInteractions(state)) {
+    } else if (ActiveModeHasInteractions(state)) {
         SetFg(Color::BRIGHT_CYAN);
         SetBold();
         if (InteractionIsBusy(state.status.interaction_phase)) {
@@ -311,38 +321,51 @@ void RenderMainPage(const UiState &state) {
         } else if (state.status.interaction_phase == "FINISHED") {
             printf("交互动作已完成    [A] 选择下一个动作");
         } else {
-            printf("RL 策略已接管    [A] 选择交互动作");
+            printf("%s    [A] 选择交互动作", state.status.trajectory_enabled ? "动作模式已就绪" : "RL 策略已接管");
         }
     } else {
         SetDim();
-        printf("← 后退；→ 前进；从 RL 按 ← 直接退回 DAMP");
+        printf("← 后退；→ 前进；从%s按 ← 退回 DAMP", state.status.trajectory_enabled ? "动作" : " RL ");
     }
     ResetAttr();
 
-    DrawBox(9, layout.left, layout.width, 4);
-    MoveTo(10, layout.content_left);
-    SetDim();
-    printf("策略");
-    ResetAttr();
-    MoveTo(11, layout.content_left);
-    const std::string policy = state.status.policy.empty() ? "(未加载)" : state.status.policy;
-    SetFg(Color::MAGENTA);
-    SetBold();
-    printf("当前: %s", Fit(policy, layout.width - 28).c_str());
-    ResetAttr();
-    printf("    ");
-    SetFg(Color::CYAN);
-    printf("[P] 选择策略");
-    ResetAttr();
+    if (state.status.trajectory_enabled) {
+        DrawBox(9, layout.left, layout.width, 8);
+        MoveTo(10, layout.content_left);
+        printf("动作 · TRAJECTORY    [A] 动作列表");
+        MoveTo(12, layout.content_left);
+        const auto action = InteractionDisplayName(state, state.status.interaction_action);
+        printf("当前: %s", Fit(action.empty() ? "尚未播放" : action, layout.width - 10).c_str());
+        MoveTo(13, layout.content_left);
+        printf("状态: %s", InteractionPhaseName(state.status.interaction_phase));
+        MoveTo(15, layout.content_left);
+        PrintInteractionProgress(state, layout.width - 14);
+    } else {
+        DrawBox(9, layout.left, layout.width, 4);
+        MoveTo(10, layout.content_left);
+        SetDim();
+        printf("策略");
+        ResetAttr();
+        MoveTo(11, layout.content_left);
+        const std::string policy = state.status.policy.empty() ? "(未加载)" : state.status.policy;
+        SetFg(Color::MAGENTA);
+        SetBold();
+        printf("当前: %s", Fit(policy, layout.width - 28).c_str());
+        ResetAttr();
+        printf("    ");
+        SetFg(Color::CYAN);
+        printf("[P] 选择策略");
+        ResetAttr();
 
-    DrawBox(13, layout.left, layout.width, 4);
-    MoveTo(14, layout.content_left);
-    SetDim();
-    printf("Control 实际采用速度");
-    ResetAttr();
-    MoveTo(15, layout.content_left);
-    printf("vx=%+.2f m/s   vy=%+.2f m/s   wz=%+.2f rad/s", state.status.velocity.vx, state.status.velocity.vy,
-        state.status.velocity.wz);
+        DrawBox(13, layout.left, layout.width, 4);
+        MoveTo(14, layout.content_left);
+        SetDim();
+        printf("Control 实际采用速度");
+        ResetAttr();
+        MoveTo(15, layout.content_left);
+        printf("vx=%+.2f m/s   vy=%+.2f m/s   wz=%+.2f rad/s", state.status.velocity.vx, state.status.velocity.vy,
+            state.status.velocity.wz);
+    }
 
     DrawBox(17, layout.left, layout.width, 5);
     MoveTo(18, layout.content_left);
@@ -351,13 +374,13 @@ void RenderMainPage(const UiState &state) {
     ResetAttr();
     printf(" FSM  ");
     SetFg(Color::CYAN);
-    printf("[P]");
+    printf("%s", state.status.trajectory_enabled ? "[A]" : "[P]");
     ResetAttr();
-    printf(" 策略  ");
+    printf("%s", state.status.trajectory_enabled ? " 动作  " : " 策略  ");
     SetFg(Color::CYAN);
-    printf("[V]");
+    printf("%s", state.status.trajectory_enabled ? "[C]" : "[V]");
     ResetAttr();
-    printf(" 速度  [Space] 清零");
+    printf("%s", state.status.trajectory_enabled ? " 取消动作" : " 速度  [Space] 清零");
     MoveTo(19, layout.content_left);
     SetFg(Color::BRIGHT_YELLOW);
     SetBold();
@@ -370,7 +393,8 @@ void RenderMainPage(const UiState &state) {
     printf(" 掉电");
     MoveTo(20, layout.content_left);
     SetDim();
-    printf("[A]动作 [G]开始 [C]取消 [X]确认 [Ctrl+C]退出");
+    printf("%s", state.status.trajectory_enabled ? "[A]动作 [C]取消 [X]确认 [Ctrl+C]退出"
+        : "[A]动作 [G]开始 [C]取消 [X]确认 [Ctrl+C]退出");
     ResetAttr();
 
     PrintLastAction(layout, 22, state.last_action);
@@ -449,12 +473,14 @@ void RenderInteractionSelectPage(const UiState &state) {
     DrawBox(4, layout.left, layout.width, shown + 3);
     MoveTo(5, layout.content_left);
     SetDim();
-    printf("策略: %s    动作 %d/%d", Fit(state.status.policy, layout.width - 28).c_str(),
+    if (!state.status.trajectory_enabled)
+        printf("策略: %s    ", Fit(state.status.policy, layout.width - 28).c_str());
+    printf("动作 %d/%d",
         count == 0 ? 0 : cursor + 1, count);
     ResetAttr();
     if (count == 0) {
         MoveTo(6, layout.content_left);
-        printf("(当前策略没有注册交互动作)");
+        printf("%s", state.status.trajectory_enabled ? "(没有配置动作)" : "(当前策略没有注册交互动作)");
     } else {
         for (int row = 0; row < shown; ++row) {
             const int index = first + row;
@@ -500,7 +526,7 @@ void RenderInteractionSelectPage(const UiState &state) {
     } else if (state.status.interaction_phase == "FINISHED") {
         printf("动作已完成，可以直接选择并播放下一项");
     } else {
-        printf("动作由当前 RL 策略及其适配器执行");
+        printf("%s", state.status.trajectory_enabled ? "动作" : "动作由当前 RL 策略及其适配器执行");
     }
     ResetAttr();
     PrintLastAction(layout, operation_row + 7, state.last_action);

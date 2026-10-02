@@ -189,7 +189,7 @@ std::string ColumnPrefix(const char *name) {
 }  // namespace
 
 void RenderWholeBodyDiagnostics(
-    const whole_body_diagnostics_v2 &diagnostics, double cycle_s) {
+    const whole_body_diagnostics_v2 &diagnostics, double cycle_s, bool imu_configured) {
     const auto rpy = ImuRpy(diagnostics.imu);
     uint32_t fresh_motor_count = 0;
     uint32_t valid_joint_count = 0;
@@ -245,9 +245,9 @@ void RenderWholeBodyDiagnostics(
             << "，错误码 " << diagnostics.health.last_error;
         alerts.push_back(alert.str());
     }
-    if (!diagnostics.imu.feedback_received) {
+    if (imu_configured && !diagnostics.imu.feedback_received) {
         alerts.emplace_back("IMU 未收到反馈");
-    } else if (!diagnostics.imu.feedback_fresh) {
+    } else if (imu_configured && !diagnostics.imu.feedback_fresh) {
         std::ostringstream alert;
         alert << "IMU 反馈过期 " << std::fixed << std::setprecision(1)
             << diagnostics.imu.feedback_age_s * 1000.0 << " ms";
@@ -292,7 +292,7 @@ void RenderWholeBodyDiagnostics(
         << (cycle_s > 0.0 ? 1.0 / cycle_s : 0.0) << " Hz\n"
         << "反馈：电机 " << fresh_motor_count << "/" << diagnostics.motor_count
         << "    关节 " << valid_joint_count << "/" << diagnostics.joint_count
-        << "    IMU " << ImuState(diagnostics.imu) << "\n"
+        << "    IMU " << (imu_configured ? ImuState(diagnostics.imu) : "未配置") << "\n"
         << "通信：最慢电机 ";
     if (has_motor_age) {
         output << max_motor_age_s * 1000.0 << " ms";
@@ -301,7 +301,10 @@ void RenderWholeBodyDiagnostics(
     }
     output << "    反馈时间差 " << diagnostics.feedback_window_s * 1000.0
         << " ms    看门狗 " << diagnostics.health.watchdog_events << "\n";
-    if (diagnostics.imu.feedback_received) {
+    if (!imu_configured) {
+        output << "姿态：IMU 未配置，基座姿态为数学默认值，非测量值\n"
+            << "动态：IMU 未配置，基座速度与加速度非测量值\n";
+    } else if (diagnostics.imu.feedback_received) {
         output << "姿态：左右倾 "
             << SignedValue(rpy[0] * kRadiansToDegrees, 2) << "°"
             << "    前后倾 " << SignedValue(rpy[1] * kRadiansToDegrees, 2) << "°"
@@ -374,7 +377,7 @@ void RenderWholeBodyDiagnostics(
 }
 
 void RecordWholeBodyDiagnostics(const whole_body_diagnostics_v2 &diagnostics,
-    const whole_body_motor_command_diagnostics_v2 &command_diagnostics) {
+    const whole_body_motor_command_diagnostics_v2 &command_diagnostics, bool imu_configured) {
     const double wall_time = WallTimeSeconds();
 
     static bool inventory_recorded = false;
@@ -484,12 +487,24 @@ void RecordWholeBodyDiagnostics(const whole_body_diagnostics_v2 &diagnostics,
         << diagnostics.imu.decode_errors << "," << diagnostics.imu.superseded_frames << ","
         << diagnostics.imu.resync_discarded_bytes << ","
         << diagnostics.imu.overflow_discarded_bytes;
+    if (!imu_configured) {
+        imu.str("");
+        imu << wall_time << "," << diagnostics.timestamp_s << ","
+            << diagnostics.feedback_window_s << ",0,0";
+        // Missing sensor values must not be mistaken for measured defaults.
+        for (int i = 0; i < 16; ++i) imu << ",nan";
+        for (int i = 0; i < 6; ++i) imu << ",0";
+    }
+    imu << "," << imu_configured << "," << (imu_configured && diagnostics.imu.feedback_received)
+        << "," << (!imu_configured ? "not_configured"
+            : (!diagnostics.imu.feedback_received ? "missing"
+                : (diagnostics.imu.feedback_fresh ? "fresh" : "stale")));
     runtime_logging::RecordCsv(
         "driver_imu",
         "wall_time_s,device_time_s,feedback_window_s,received,fresh,age_s,"
         "sample_timestamp_s,receive_timestamp_s,qw,qx,qy,qz,roll,pitch,yaw,"
         "gx,gy,gz,ax,ay,az,valid_frames,crc_errors,decode_errors,"
-        "superseded_frames,resync_discarded_bytes,overflow_discarded_bytes",
+        "superseded_frames,resync_discarded_bytes,overflow_discarded_bytes,configured,measured,state",
         imu.str());
 
     static std::string coupling_header;

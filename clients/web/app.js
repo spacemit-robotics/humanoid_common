@@ -91,6 +91,18 @@ function connect() {
 }
 function activePolicy() { return catalog?.policies.find(p => p.name === status?.policy); }
 function render() {
+  const trajectory = status?.trajectory_enabled ?? catalog?.trajectory_enabled ?? false;
+  document.body.dataset.trajectory = String(trajectory);
+  $("inference-status").hidden = trajectory;
+  document.querySelector('.policy-section').hidden = trajectory;
+  document.querySelector('.motion').hidden = trajectory;
+  document.querySelector('.mobile-views').hidden = trajectory;
+  if (trajectory) document.body.dataset.view = 'control';
+  const activeMode = $("active-mode");
+  activeMode.dataset.state = trajectory ? 'TRAJECTORY' : 'RL';
+  activeMode.querySelector('strong').textContent = trajectory ? '动作' : '策略控制';
+  activeMode.querySelector('span').textContent = trajectory ? 'TRAJECTORY' : 'RL';
+  $("stop-label").textContent = trajectory ? '停止动作' : '停止移动';
   const online = authenticated && status?.online && performance.now() - lastStatusAt < 1000;
   const owns = online && status.owns_control;
   const fault = status?.fault;
@@ -98,8 +110,8 @@ function render() {
   $("connection").textContent = online ? "控制链路在线" : authenticated ? "等待控制程序" : "未连接";
   $("connection").classList.toggle("online", !!online);
   $("owner").textContent = owns ? "本客户端" : (status?.owner || "无人持有");
-  $("state").textContent = status?.state || "—";
-  const stateLabels = {POWER_OFF:'电机未上电',DAMP:'阻尼保护',HOME:'复位姿态',ZERO:'准备姿态',RL:'策略运行中',SAFETY:'安全保护'};
+  $("state").textContent = status?.state === 'TRAJECTORY' ? '动作' : status?.state || "—";
+  const stateLabels = {POWER_OFF:'电机未上电',DAMP:'阻尼保护',HOME:'复位姿态',ZERO:'准备姿态',RL:'策略运行中',TRAJECTORY:'TRAJECTORY',SAFETY:'安全保护'};
   $("state-label").textContent = stateLabels[status?.state] || '等待状态';
   $("fsm-note").textContent = status?.state === 'ZERO' ? (status.zero_ready ? '准备就绪' : '姿态调整中') : '';
   $("ready").textContent = status?.state === "ZERO" ? (status.zero_ready ? "已到位" : "调整中") : "—";
@@ -117,13 +129,13 @@ function render() {
   $("fault-title").textContent = fault ? `${fault.source}/${fault.code}${fault.active ? " · 活动" : " · 锁存"}` : "";
   $("fault-detail").textContent = fault?.detail || "";
   $("ack").disabled = !owns || status?.state !== "POWER_OFF" || fault?.active;
-  const before = {HOME:"DAMP",ZERO:"HOME",RL:"ZERO"};
+  const before = {HOME:"DAMP",ZERO:"HOME",RL:"ZERO",TRAJECTORY:"ZERO"};
   document.querySelectorAll("[data-state]").forEach(b => {
     const target = b.dataset.state;
     b.classList.toggle("active", status?.state === target);
     b.disabled = !online || status.state === target ||
       (!['POWER_OFF','DAMP'].includes(target) && (!owns || busy || fault?.latched ||
-        before[target] !== status.state || (target === 'RL' && !status.zero_ready))) ||
+        before[target] !== status.state || (['RL','TRAJECTORY'].includes(target) && !status.zero_ready))) ||
       (target === 'DAMP' && status.state === 'SAFETY');
   });
   if (catalog) {
@@ -133,27 +145,29 @@ function render() {
       $("policy").value = status.policy; lastPolicyCatalog = signature;
     }
   }
-  $("select-policy").disabled = !owns || busy || fault?.latched || !['POWER_OFF','DAMP'].includes(status?.state);
+  $("select-policy").disabled = trajectory || !owns || busy || fault?.latched || !['POWER_OFF','DAMP'].includes(status?.state);
   const p = activePolicy();
-  const signature = status?.policy || "";
+  const actions = trajectory ? (catalog?.actions || []) : (p?.actions || []);
+  const signature = JSON.stringify([trajectory, status?.policy || '', actions]);
   if (signature !== lastActionCatalog) {
-    $("policy").value = status.policy;
-    $("action").replaceChildren(...(p?.actions || []).map(a => new Option(a.display_name, a.key)));
+    $("policy").value = status?.policy || '';
+    $("action").replaceChildren(...actions.map(a => new Option(a.display_name, a.key)));
     lastActionCatalog = signature;
     for (const axis of ['vx','vy','wz']) {
       const input = $("speed-" + axis);
       const max = Math.max(Math.abs(p?.minimum[axis] || 0), p?.maximum[axis] || 0);
-      input.step = catalog.velocity_step?.[axis] || 0.1;
+      input.step = catalog?.velocity_step?.[axis] || 0.1;
       input.max = max; input.value = Math.min(Number(input.value), max); input.disabled = !max;
     }
   }
-  const rl = owns && status.state === 'RL' && !fault?.latched;
+  const rl = !trajectory && owns && status.state === 'RL' && !fault?.latched;
+  const actionReady = owns && status.state === (trajectory ? 'TRAJECTORY' : 'RL') && !fault?.latched;
   const movable = p && ['vx','vy','wz'].some(axis => p.minimum[axis] < 0 || p.maximum[axis] > 0);
   $("motion-state").textContent = rl ? (movable ? '可操作' : '定点站立') : owns ? '等待 RL' : '等待接管';
   const actionBusy = ['BLEND_IN','PLAYING','HOLDING','BLEND_OUT'].includes(status?.interaction.phase);
-  $("start-action").disabled = !rl || busy || actionBusy || !p?.actions.length;
-  $("cancel-action").disabled = !rl || busy || !actionBusy;
-  $("start-reference").hidden = !p?.manual_reference;
+  $("start-action").disabled = !actionReady || busy || actionBusy || !actions.length;
+  $("cancel-action").disabled = !actionReady || busy || !actionBusy;
+  $("start-reference").hidden = trajectory || !p?.manual_reference;
   $("start-reference").disabled = !rl || busy;
   const actionPhase = status?.interaction.phase || "IDLE";
   $("action-state").textContent = actionPhases[actionPhase] || actionPhase;

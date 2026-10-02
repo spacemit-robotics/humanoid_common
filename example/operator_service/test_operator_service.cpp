@@ -7,11 +7,109 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem> // NOLINT(build/c++17): isolated configuration fixtures.
+#include <fstream>
+#include <stdexcept>
 #include <thread>
 
 #include "service.h"
 
+namespace {
+void TestTrajectory() {
+    using namespace operator_service;  // NOLINT(build/namespaces)
+    char directory[] = "/tmp/operator-trajectory-XXXXXX";
+    assert(mkdtemp(directory));
+    const std::filesystem::path root(directory);
+    const auto path = root / "runtime.yaml";
+    std::ofstream(path) << "robot_base: {name: test}\n"
+        "behavior_manager:\n  trajectory:\n    enabled: true\n"
+        "    catalog_file: linglong.yaml\n    catalog: upper_body_actions\n";
+    std::ofstream(root / "linglong.yaml") << "upper_body_actions:\n"
+        "  action_names: [wave, bow]\n  actions:\n    wave: {display_name: Wave}\n";
+    auto config = LoadConfig(path.string());
+    assert(config.trajectory_enabled && config.policies.empty());
+    assert(config.actions.size() == 2 && config.actions[0].key == "wave");
+    assert(config.actions[0].display_name == "Wave" && config.actions[1].display_name == "bow");
+    config.token = "trajectory-test";
+    Service service(config);
+    const auto session = service.Open();
+    uint64_t id = 0;
+    const auto call = [&](const std::string &op, const Json &args = Json::object()) {
+        return service.Handle(session, {{"v", 1}, {"id", ++id}, {"op", op}, {"args", args}}).at("ok").get<bool>();
+    };
+    assert(call("hello", {{"token", config.token}}));
+    assert(service.Catalog().at("trajectory_enabled").get<bool>());
+    assert(service.Catalog().at("policies").empty());
+    assert(service.Catalog().at("actions").size() == 2);
+    robot_base::ControlStatus status;
+    status.hmi_connected = true;
+    service.UpdateStatus(status, {});
+    service.UpdateStatus(status, {});
+    assert(call("acquire"));
+    assert(!call("policy", {{"policy", "wave"}}));
+    assert(!call("interaction", {{"action", "wave"}}));
+    assert(!call("state", {{"state", "TRAJECTORY"}}));
+    status.mode = robot_base::ControlMode::ZERO;
+    service.UpdateStatus(status, {});
+    assert(!call("state", {{"state", "TRAJECTORY"}}));
+    status.zero_ready = true;
+    service.UpdateStatus(status, {});
+    assert(!call("state", {{"state", "RL"}}));
+    assert(call("state", {{"state", "TRAJECTORY"}}));
+    assert(service.Command().key == 3);
+    service.Tick();
+    assert(service.Command().key == 3);
+    status.mode = robot_base::ControlMode::TRAJECTORY;
+    service.UpdateStatus(status, {});
+    assert(service.Command().key == 0 && service.Snapshot().request.phase == "completed");
+    const auto decoded = DecodeStatus(Encode(service.Snapshot()));
+    assert(decoded.state == "TRAJECTORY" && decoded.trajectory_enabled && decoded.policy.empty());
+    assert(decoded.rl_hz == 0 && decoded.velocity.vx == 0);
+    auto legacy = Encode(Status{});
+    legacy.erase("trajectory_enabled");
+    assert(!DecodeStatus(legacy).trajectory_enabled);
+    assert(!call("velocity", {{"vx", 1}, {"vy", 0}, {"wz", 0}}));
+    assert(!call("reference_start"));
+    assert(!call("interaction", {{"action", "unknown"}}));
+    assert(call("interaction", {{"action", "wave"}}));
+    service.Tick();
+    assert(service.Command().interaction.operation == robot_base::InteractionRequest::Operation::START);
+    status.interaction = {service.Command().interaction.sequence, true,
+        robot_base::InteractionStatus::Phase::PLAYING, 0.3F, "wave"};
+    service.UpdateStatus(status, {});
+    assert(service.Snapshot().request.phase == "completed");
+    assert(!call("interaction", {{"action", "bow"}}));
+    assert(call("cancel"));
+    service.Tick();
+    assert(service.Command().interaction.operation == robot_base::InteractionRequest::Operation::CANCEL);
+    status.interaction.sequence = service.Command().interaction.sequence;
+    status.interaction.phase = robot_base::InteractionStatus::Phase::IDLE;
+    service.UpdateStatus(status, {});
+    assert(service.Command().interaction.operation == robot_base::InteractionRequest::Operation::NONE);
+    assert(call("interaction", {{"action", "bow"}}));
+    service.Disconnect(session);
+    service.Tick();
+    assert(service.Snapshot().request.phase == "cancelled");
+    assert(service.Command().interaction.operation == robot_base::InteractionRequest::Operation::CANCEL);
+
+    std::filesystem::remove(root / "linglong.yaml");
+    bool rejected = false;
+    try { (void)LoadConfig(path.string()); } catch (const std::exception &) { rejected = true; }
+    assert(rejected);
+    std::ofstream(path) << "behavior_manager:\n  trajectory:\n    enabled: true\n"
+        "    action_names: [wave]\n    actions:\n      wave: {display_name: Wave}\n";
+    const auto inline_config = LoadConfig(path.string());
+    assert(inline_config.trajectory_enabled && inline_config.actions.size() == 1);
+    assert(inline_config.actions[0].key == "wave" && inline_config.actions[0].display_name == "Wave");
+    std::ofstream(path) << "behavior_manager: {trajectory: {enabled: false}}\n";
+    assert(!LoadConfig(path.string()).trajectory_enabled);
+    std::filesystem::remove_all(root);
+}
+} // namespace
+
 int main() {
+    TestTrajectory();
     using operator_service::Config;
     using operator_service::DecodeStatus;
     using operator_service::Encode;
@@ -66,6 +164,7 @@ int main() {
     assert(!call(alice, &alice_id, "state", {{"state", "RL"}})["ok"].get<bool>());
     status.zero_ready = true;
     update();
+    assert(!call(alice, &alice_id, "state", {{"state", "TRAJECTORY"}})["ok"].get<bool>());
     assert(call(alice, &alice_id, "state", {{"state", "RL"}})["ok"].get<bool>());
     status.mode = robot_base::ControlMode::RL;
     update();

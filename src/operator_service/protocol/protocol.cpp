@@ -26,6 +26,7 @@ Json Encode(const RequestResult &r) {
 Json Encode(const Status &s) {
     const auto &f = s.fault;
     return {{"online", s.online}, {"hmi_connected", s.hmi_connected}, {"zero_ready", s.zero_ready}, {"state", s.state},
+        {"trajectory_enabled", s.trajectory_enabled},
         {"policy", s.policy}, {"age_ms", s.age_ms}, {"rl_hz", s.rl_hz}, {"velocity", Encode(s.velocity)},
         {"owner", s.owner}, {"owns_control", s.owns_control}, {"lease_remaining_ms", s.lease_remaining_ms},
         {"interaction",
@@ -40,6 +41,7 @@ Status DecodeStatus(const Json &v) {
     s.online = v.at("online");
     s.hmi_connected = v.at("hmi_connected");
     s.zero_ready = v.at("zero_ready");
+    s.trajectory_enabled = v.value("trajectory_enabled", false);
     s.state = v.at("state");
     s.policy = v.at("policy");
     s.age_ms = v.at("age_ms");

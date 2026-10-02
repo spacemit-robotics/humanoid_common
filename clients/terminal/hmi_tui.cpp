@@ -76,11 +76,11 @@ private:
     termios original_{};
 };
 
-std::string Next(const std::string &s) {
+std::string Next(const std::string &s, bool trajectory_enabled) {
     if (s == "POWER_OFF") return "DAMP";
     if (s == "DAMP") return "HOME";
     if (s == "HOME") return "ZERO";
-    if (s == "ZERO") return "RL";
+    if (s == "ZERO") return trajectory_enabled ? "TRAJECTORY" : "RL";
     return s;
 }
 std::string ReplyMessage(const operator_service::Reply &reply) {
@@ -104,6 +104,7 @@ void Run(operator_service::Client *client) {
     Terminal terminal;
     operator_terminal::View view;
     view.policies = client->Policies();
+    view.actions = client->Actions();
     const auto step = client->VelocityStep();
     auto last_renew = Clock::now(), last_velocity = last_renew, highlight_until = last_renew;
     uint64_t pending = 0;
@@ -160,7 +161,7 @@ void Run(operator_service::Client *client) {
             view.last_action = "速度已清零";
         } else if (key == 'x') reply(client->AcknowledgeFault(), "确认故障");
         else if (key == 'c') reply(client->CancelInteraction(), "取消动作");
-        else if (key == 'g') {
+        else if (key == 'g' && !s.trajectory_enabled) {
             const auto r = client->StartReference();
             reply(r, "开始参考动作");
             view.reference_start_requested = r.ok;
@@ -186,20 +187,21 @@ void Run(operator_service::Client *client) {
             }
         } else if (view.page == Page::POLICY_SELECT || view.page == Page::INTERACTION_SELECT) {
             const bool policies = view.page == Page::POLICY_SELECT;
+            const auto *actions = s.trajectory_enabled ? &view.actions
+                : (policy == view.policies.end() ? nullptr : &policy->actions);
             const int count = policies          ? view.policies.size()
-                : policy == view.policies.end() ? 0
-                                                : policy->actions.size();
+                : actions ? actions->size() : 0;
             int &cursor = policies ? view.policy_cursor_idx : view.interaction_cursor_idx;
             cursor = std::clamp(cursor, 0, std::max(0, count - 1));
             if (key == kUp || key == 'k') cursor = std::max(0, cursor - 1);
             if (key == kDown || key == 'j') cursor = std::min(std::max(0, count - 1), cursor + 1);
             if ((key == '\r' || key == '\n') && count) {
                 if (policies) reply(client->SelectPolicy(view.policies[cursor].name), "选择策略");
-                else reply(client->StartInteraction(policy->actions[cursor].key), "播放动作");
+                else reply(client->StartInteraction((*actions)[cursor].key), "播放动作");
             }
             if ((policies && key == 'p') || (!policies && key == 'a')) view.page = Page::MAIN;
         } else {
-            if (key == 'p') {
+            if (key == 'p' && !s.trajectory_enabled) {
                 view.page = Page::POLICY_SELECT;
                 view.policy_cursor_idx = view.active_policy_idx;
             }
@@ -207,12 +209,13 @@ void Run(operator_service::Client *client) {
                 view.page = Page::INTERACTION_SELECT;
                 view.interaction_cursor_idx = 0;
             }
-            if (key == 'v' || key == '\r' || key == '\n') view.page = Page::VELOCITY;
-            if (key == kRight) transition(Next(s.state));
+            if (key == 'v' || key == '\r' || key == '\n')
+                view.page = s.trajectory_enabled ? Page::INTERACTION_SELECT : Page::VELOCITY;
+            if (key == kRight) transition(Next(s.state, s.trajectory_enabled));
             if (key == kLeft) transition(s.state == "DAMP" ? "POWER_OFF" : "DAMP");
             if (key == 'h') transition("HOME");
             if (key == 'z') transition("ZERO");
-            if (key == 'r') transition("RL");
+            if (key == 'r') transition(s.trajectory_enabled ? "TRAJECTORY" : "RL");
         }
         if (s.owns_control && s.state == "RL" && now - last_velocity >= std::chrono::milliseconds(100)) {
             const auto r = client->SetVelocity(view.target_command);
@@ -253,8 +256,10 @@ int main(int argc, char *argv[]) {
             throw std::runtime_error(error);
         if (once) {
             const auto s = client.LatestStatus();
-            std::printf("robot=%s state=%s policy=%s online=%d zero_ready=%d owner=%s\n", client.RobotName().c_str(),
-                s.state.c_str(), s.policy.c_str(), s.online, s.zero_ready, s.owner.c_str());
+            std::printf("robot=%s state=%s online=%d zero_ready=%d owner=%s", client.RobotName().c_str(),
+                s.state.c_str(), s.online, s.zero_ready, s.owner.c_str());
+            if (!s.trajectory_enabled) std::printf(" policy=%s", s.policy.c_str());
+            std::puts("");
             return 0;
         }
         std::signal(SIGINT, Signal);

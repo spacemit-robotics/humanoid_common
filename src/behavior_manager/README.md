@@ -1,6 +1,6 @@
 # behavior_manager — FSM 行为管理
 
-有限状态机（FSM）的人形机器人行为控制模块。支持 6 种状态（POWER_OFF、DAMP、HOME、ZERO、RL、SAFETY），完全由 YAML 配置驱动，与机器人型号解耦。StateRL 集成 ONNX 推理，在独立线程中执行策略。
+有限状态机（FSM）的人形机器人行为控制模块。支持 POWER_OFF、DAMP、HOME、ZERO、RL、SAFETY 和可选的 TRAJECTORY 状态，由 YAML 配置驱动，与机器人型号解耦。StateRL 在独立线程执行 ONNX 推理；固定底座轨迹控制不运行推理。
 
 ## 接口说明
 
@@ -13,8 +13,9 @@
 | `POWER_OFF` | 完全失力（关节零力矩）|
 | `DAMP` | 阻尼保持（kp=0, kd=配置值）|
 | `HOME` | 平滑恢复 `robot_base.default_joint_pos` |
-| `ZERO` | 平滑到当前 RL 策略的准备姿态 |
+| `ZERO` | 平滑到当前控制方式的准备姿态 |
 | `RL` | RL 控制（异步 ONNX 推理）|
+| `TRAJECTORY` | 固定底座关节轨迹播放 |
 | `SAFETY` | 安全保护（传感器、策略、传输或执行故障触发）|
 
 #### `robot_base::RobotData` — 传感器输入
@@ -163,3 +164,25 @@ HMI 的 `x` 才能清除锁存。重复收到同一条已确认的恢复状态�
 - **安全保护：** driver 故障、状态超时、无效数据、姿态超限和 RL 推理/action 超时统一触发安全状态并跨进程锁存
 - **状态回传：** `CurrentState()`、`IsZeroReady()`、当前策略和 RL 频率由 control_runtime 组装为 `ControlStatus` 发给 HMI
 - **参数隔离：** damp_kd ≈ policy kd / 5（不同阶段刚度需求不同）
+## Fixed-Base Trajectory Behavior
+
+`behavior_manager.trajectory.enabled: true` registers `TRAJECTORY` after ZERO.
+It requires `robot_base.fixed_base: true` and no `rl_policy`. HOME and ZERO keep
+their existing feedback gates and configured gains. TRAJECTORY holds
+`behavior_manager.zero_pos` until an interaction request, plays joint-space NPZ
+clips, and returns to that pose on completion or cancellation. It runs on the
+control loop without policy inference. The RL joint-trajectory adapter shares
+the same player and retains its applied-action observation feedback.
+
+`trajectory.catalog` selects the action catalog. Optional `catalog_file` is
+relative to the runtime YAML and reuses another configuration's catalog;
+source `joint_indices` are mapped through that file's `robot_base.joint_names`
+to the active profile's joint names. Missing joints are errors, not skipped.
+Motion files resolve against the catalog configuration's `robot_base.robot_dir`.
+`trajectory.kp/kd` are optional and otherwise use the ZERO gains.
+
+Fixed-base mode disables body-attitude safety checks, not joint or transport
+faults. Configure optional sensors explicitly in the hardware backend; a
+mathematical default base pose is not an IMU measurement. Operator clients use
+the same interaction/cancel requests in RL and TRAJECTORY; locomotion velocity
+and policy selection are unavailable in the standalone trajectory profile.

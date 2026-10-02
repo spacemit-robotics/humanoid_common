@@ -113,6 +113,15 @@ void VerifyWholeBodyStateConversion() {
     }
     assert(Near(destination.base_quat[0], quaternion[0]));
 
+    assert(driver_runtime::ConvertWholeBodyState(source, &destination, false));
+    assert(destination.IsValid());
+    assert(destination.base_quat == (std::array<double, 4>{1, 0, 0, 0}));
+    assert(destination.rpy == (std::array<double, 3>{0, 0, 0}));
+    assert(destination.gyro == (std::array<double, 3>{0, 0, 0}));
+    assert(destination.acceleration == (std::array<double, 3>{0, 0, 0}));
+    assert(destination.base_vel == (std::array<double, 6>{0, 0, 0, 0, 0, 0}));
+    assert(destination.joint_error[1] == 7 && Near(destination.joint_pos[1], source.position[1]));
+
     source.num_dof = 0;
     assert(!driver_runtime::ConvertWholeBodyState(source, &destination));
     source.num_dof = WHOLE_BODY_MAX_DOF + 1;
@@ -121,21 +130,23 @@ void VerifyWholeBodyStateConversion() {
 }
 
 void VerifyWholeBodyCommandConversion() {
-    const std::array<robot_base::ControlMode, 6> source_modes = {
+    const std::array<robot_base::ControlMode, 7> source_modes = {
         robot_base::ControlMode::POWER_OFF,
         robot_base::ControlMode::DAMP,
         robot_base::ControlMode::HOME,
         robot_base::ControlMode::ZERO,
         robot_base::ControlMode::RL,
         robot_base::ControlMode::SAFETY,
+        robot_base::ControlMode::TRAJECTORY,
     };
-    const std::array<whole_body_mode, 6> expected_modes = {
+    const std::array<whole_body_mode, 7> expected_modes = {
         WHOLE_BODY_MODE_POWER_OFF,
         WHOLE_BODY_MODE_DAMP,
         WHOLE_BODY_MODE_HOME,
         WHOLE_BODY_MODE_ZERO,
         WHOLE_BODY_MODE_RL,
         WHOLE_BODY_MODE_SAFETY,
+        WHOLE_BODY_MODE_TRAJECTORY,
     };
     const std::array<robot_base::ActuationMode, 4> source_actuation_modes = {
         robot_base::ActuationMode::HYBRID,

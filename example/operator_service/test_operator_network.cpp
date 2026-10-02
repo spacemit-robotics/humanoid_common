@@ -59,7 +59,13 @@ boost::beast::http::response<boost::beast::http::string_body> Get(
 
 int main(int argc, char *argv[]) {
     assert(argc >= 3);
-    const bool terminal_only = argc > 3 && std::string(argv[3]) == "--sim";
+    bool terminal_only = false;
+    bool trajectory = false;
+    for (int i = 3; i < argc; ++i) {
+        terminal_only = terminal_only || std::string(argv[i]) == "--sim";
+        trajectory = trajectory || std::string(argv[i]) == "--trajectory";
+    }
+    const auto active_state = trajectory ? "TRAJECTORY" : "RL";
     assert(setenv("XDG_RUNTIME_DIR", "/tmp", 1) == 0);
     assert(setenv("XDG_STATE_HOME", "/tmp/operator-network-state", 1) == 0);
     char directory[] = "/tmp/operator-download-XXXXXX";
@@ -70,6 +76,15 @@ int main(int argc, char *argv[]) {
     const std::string apk_data = "PK" + std::string(65536, 'x');
     std::ofstream(apk_path, std::ios::binary) << apk_data;
     auto yaml = YAML::LoadFile(argv[2]);
+    if (trajectory) {
+        yaml.remove("rl_policy");
+        auto config = yaml["behavior_manager"]["trajectory"];
+        config["enabled"] = true;
+        config["catalog_file"] = "actions.yaml";
+        config["catalog"] = "standalone_actions";
+        std::ofstream(root / "actions.yaml") << "standalone_actions:\n"
+            "  action_names: [wave]\n  actions:\n    wave: {display_name: Wave}\n";
+    }
     yaml["operator_service"]["web_root"] = root.string();
     const auto config_path = (root / "config.yaml").string();
     std::ofstream(config_path) << yaml;
@@ -78,9 +93,9 @@ int main(int argc, char *argv[]) {
     std::atomic<bool> running{true};
     std::thread producer([&] {
         robot_base::ControlStatus status;
-        status.active_policy = "test_policy";
+        status.active_policy = trajectory ? "" : "test_policy";
         status.zero_ready = true;
-        status.rl_frequency_hz = 50;
+        status.rl_frequency_hz = trajectory ? 0 : 50;
         status.hmi_connected = true;
         while (running) {
             robot_base::Command command;
@@ -90,7 +105,8 @@ int main(int argc, char *argv[]) {
                 if (command.key == 1) status.mode = robot_base::ControlMode::DAMP;
                 if (command.key == 4) status.mode = robot_base::ControlMode::HOME;
                 if (command.key == 2) status.mode = robot_base::ControlMode::ZERO;
-                if (command.key == 3) status.mode = robot_base::ControlMode::RL;
+                if (command.key == 3) status.mode = trajectory
+                    ? robot_base::ControlMode::TRAJECTORY : robot_base::ControlMode::RL;
                 status.vx = command.vx;
                 status.vy = command.vy;
                 status.wz = command.wz;
@@ -139,17 +155,28 @@ int main(int argc, char *argv[]) {
         connection.name = "observer";
         assert(bob.Connect(connection, &error));
         assert(Wait([&] { return alice.LatestStatus().online; }));
-        assert(alice.Policies().size() == 1 && alice.Policies()[0].actions.size() == 1);
+        assert(alice.LatestStatus().trajectory_enabled == trajectory);
+        if (trajectory) {
+            assert(alice.Policies().empty() && alice.LatestStatus().policy.empty());
+            assert(alice.Actions().size() == 1 && alice.Actions()[0].display_name == "Wave");
+        } else {
+            assert(alice.Policies().size() == 1 && alice.Policies()[0].actions.size() == 1);
+            assert(alice.Actions().empty());
+        }
         assert(alice.AcquireControl().ok);
         assert(!bob.AcquireControl().ok);
-        for (const auto *target : {"DAMP", "HOME", "ZERO", "RL"}) {
+        for (const auto *target : {"DAMP", "HOME", "ZERO", active_state}) {
             assert(alice.RenewControl().ok);
             assert(alice.RequestState(target).ok);
             assert(Wait([&] { return alice.LatestStatus().state == target; }));
         }
-        assert(alice.SetVelocity({1, 0, 0}, 300).ok);
-        assert(Wait([&] { return alice.LatestStatus().velocity.vx > 0.09; }));
-        assert(Wait([&] { return alice.LatestStatus().velocity.vx == 0; }));
+        if (trajectory) {
+            assert(!alice.SetVelocity({1, 0, 0}, 300).ok);
+        } else {
+            assert(alice.SetVelocity({1, 0, 0}, 300).ok);
+            assert(Wait([&] { return alice.LatestStatus().velocity.vx > 0.09; }));
+            assert(Wait([&] { return alice.LatestStatus().velocity.vx == 0; }));
+        }
         auto pairing = operator_service::LoadConfig(config_path);
         const auto host = "127.0.0.1:" + std::to_string(pairing.port);
         const std::string apk_url = "/downloads/SpacemiT-Operator.apk";
@@ -188,7 +215,7 @@ int main(int argc, char *argv[]) {
         }
         alice.Disconnect();
         assert(Wait([&] { return bob.LatestStatus().owner.empty(); }));
-        assert(bob.LatestStatus().state == "RL" && bob.LatestStatus().velocity.vx == 0);
+        assert(bob.LatestStatus().state == active_state && bob.LatestStatus().velocity.vx == 0);
         assert(bob.AcquireControl().ok);
         assert(bob.StartInteraction("wave").ok);
         const bool playing = Wait([&] { return bob.LatestStatus().interaction_phase == "PLAYING"; });

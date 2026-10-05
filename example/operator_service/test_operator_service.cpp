@@ -104,6 +104,15 @@ void TestTrajectory() {
     assert(inline_config.actions[0].key == "wave" && inline_config.actions[0].display_name == "Wave");
     std::ofstream(path) << "behavior_manager: {trajectory: {enabled: false}}\n";
     assert(!LoadConfig(path.string()).trajectory_enabled);
+    assert(LoadConfig(path.string()).voice_chat_port == 0);
+    std::ofstream(path) << "operator_service: {voice_chat_port: 8442}\n";
+    const auto voice_config = LoadConfig(path.string());
+    assert(voice_config.voice_chat_port == 8442);
+    assert(Service(voice_config).Catalog().at("voice_chat_port").get<int>() == 8442);
+    std::ofstream(path) << "operator_service: {voice_chat_port: 70000}\n";
+    rejected = false;
+    try { (void)LoadConfig(path.string()); } catch (const std::exception &) { rejected = true; }
+    assert(rejected);
     std::filesystem::remove_all(root);
 }
 } // namespace

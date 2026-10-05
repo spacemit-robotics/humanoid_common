@@ -125,6 +125,8 @@ Config LoadConfig(const std::string &path) {
     if (port < 1 || port > 65535) throw std::runtime_error("invalid operator port");
     c.port = static_cast<uint16_t>(port);
     c.public_url = yaml.Read<std::string>("operator_service.public_url").value_or("");
+    c.voice_chat_port = yaml.Read<int>("operator_service.voice_chat_port").value_or(0);
+    if (c.voice_chat_port < 0 || c.voice_chat_port > 65535) throw std::runtime_error("invalid voice chat port");
     c.connection_file =
         yaml.Read<std::string>("operator_service.connection_file").value_or(DefaultConnectionFile(c.robot));
     const auto pairing_dir = StateRoot() + "/humanoid-operator/" + c.robot;
@@ -317,7 +319,7 @@ Json Service::Catalog() const {
     for (const auto &a : config_.actions) actions.push_back({{"key", a.key}, {"display_name", a.display_name}});
     return {{"robot", config_.robot}, {"policies", policies}, {"lease_ms", config_.lease_ms},
         {"velocity_step", Encode(config_.velocity_step)}, {"trajectory_enabled", config_.trajectory_enabled},
-        {"actions", actions}};
+        {"actions", actions}, {"voice_chat_port", config_.voice_chat_port}};
 }
 Json Service::ReplyTo(
     uint64_t id, bool ok, const std::string &code, const std::string &message, const Json &data) const {

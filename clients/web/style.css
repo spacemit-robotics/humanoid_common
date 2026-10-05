@@ -43,7 +43,8 @@ main { max-width: 1200px; margin: 0 auto; padding: 20px 32px 100px; }
 h1 { font-size: 30px; line-height: 1.2; margin: 0; font-weight: 650; overflow-wrap: anywhere; }
 h2 { display: flex; align-items: center; gap: 9px; font-size: 15px; margin: 0; line-height: 1.5; font-weight: 650; }
 h2 svg { width: 18px; height: 18px; color: #66735c; }
-#download-app { flex-shrink: 0; font-size: 12px; }
+.heading-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+#download-app, #voice-chat { flex-shrink: 0; font-size: 12px; }
 .status-band { display: grid; grid-template-columns: 1.25fr 1fr 1fr 1fr; padding: 16px 0; border-top: 1px solid #cbd4c2; border-bottom: 1px solid #cbd4c2; }
 .status-band > div { display: flex; flex-direction: column; gap: 9px; border-left: 1px solid var(--line); padding-left: 30px; min-width: 0; }
 .status-band > div:first-child { border-left: none; padding-left: 0; }
@@ -152,7 +153,7 @@ body[data-trajectory="true"] .status-band { grid-template-columns: repeat(3, min
   h1 { font-size: 26px; }
   .eyebrow { font-size: 9px; margin-bottom: 7px; }
   .page-heading { flex-wrap: wrap; }
-  #download-app { font-size: 11px; padding: 8px 10px; }
+  #download-app, #voice-chat { font-size: 11px; padding: 8px 10px; }
   .status-band { grid-template-columns: 1.2fr 1fr 1fr; padding: 17px 0; }
   .status-band > div { padding-left: 15px; gap: 6px; }
   .status-band > div:last-child { display: none; }

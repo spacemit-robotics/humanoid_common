@@ -59,6 +59,7 @@ function connect() {
       authenticated = true; catalog = r.data.catalog; status = r.data.status;
       lastStatusAt = performance.now();
       $("robot").textContent = catalog.robot === 'linglong' ? 'LingLong 灵龙' : catalog.robot;
+      showVoiceChat(catalog.voice_chat_port);
       document.title = `${catalog.robot} · 操作台`;
       $("login").hidden = true;
       tell("已连接，尚未申请控制权"); render();
@@ -273,6 +274,13 @@ setInterval(() => {
   }
 }, 100);
 if (window.lucide) lucide.createIcons();
+// 机器人装了语音服务时（YAML operator_service.voice_chat_port）链到同一主机该端口，那边再跳到它的 HTTPS 页面；
+// 录音要求页面本身是 HTTPS，不能嵌进本页。App 内的 WebView 不处理录音权限，不显示。
+function showVoiceChat(port) {
+  const shown = Number.isInteger(port) && port > 0 && !navigator.userAgent.includes('SpaceMITOperatorApp');
+  $("voice-chat").hidden = !shown;
+  if (shown) $("voice-chat").href = `http://${location.hostname}:${port}/`;
+}
 async function initialize() {
   if (!navigator.userAgent.includes('SpaceMITOperatorApp')) {
     fetch('/downloads/SpacemiT-Operator.apk', {method:'HEAD', cache:'no-store'})

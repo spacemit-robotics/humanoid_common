@@ -14,6 +14,10 @@
   <header class="topbar">
     <a class="brand" href="/" aria-label="SpacemiT 机器人控制台"><img src="/assets/spacemit-logo.svg" alt="SpacemiT 进迭时空"></a>
     <span class="product-name">机器人控制台</span>
+    <nav id="mode-switch" class="mode-switch" aria-label="模式" hidden>
+      <a class="active" aria-current="page"><i data-lucide="sliders-horizontal"></i><span>控制<span class="long">模式</span></span></a>
+      <a id="voice-chat"><i data-lucide="mic"></i><span>语音<span class="long">模式</span></span></a>
+    </nav>
     <div class="header-actions">
       <span id="connection" class="connection">连接中</span>
       <button id="pair" class="icon" title="手机扫码接入" aria-label="手机扫码接入"><i data-lucide="qr-code"></i></button>
@@ -23,10 +27,8 @@
   </header>
   <main>
     <div class="page-heading"><div><p class="eyebrow">SPACEMIT / HUMANOID</p><h1 id="robot">机器人</h1></div>
-      <div class="heading-actions">
-        <a id="voice-chat" class="button" target="_blank" rel="noopener" hidden><i data-lucide="mic"></i>语音对话</a>
-        <a id="download-app" class="button" href="/downloads/SpacemiT-Operator.apk"
-          download="SpacemiT-Operator.apk" hidden><i data-lucide="download"></i>下载 Android App</a></div></div>
+      <a id="download-app" class="button" href="/downloads/SpacemiT-Operator.apk"
+        download="SpacemiT-Operator.apk" hidden><i data-lucide="download"></i>下载 Android App</a></div>
     <form id="login" hidden>
       <i data-lucide="scan-line"></i>
       <div class="login-copy"><strong>需要设备配对</strong><span id="login-message">扫描操作二维码连接</span></div>

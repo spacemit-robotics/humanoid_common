@@ -274,12 +274,17 @@ setInterval(() => {
   }
 }, 100);
 if (window.lucide) lucide.createIcons();
-// 机器人装了语音服务时（YAML operator_service.voice_chat_port）链到同一主机该端口，那边再跳到它的 HTTPS 页面；
-// 录音要求页面本身是 HTTPS，不能嵌进本页。App 内的 WebView 不处理录音权限，不显示。
+// 机器人装了语音服务时（YAML operator_service.voice_chat_port）顶栏显示「控制模式 | 语音模式」。语音模式链到同一主机
+// 该端口，那边再跳到它的 HTTPS 页面（录音要求页面本身是 HTTPS，不能嵌进本页），back 参数让它能切回来。
+// 在本标签页打开：配对凭据在本页的 sessionStorage 里，切回来不用重新配对；离开时连接断开，控制权随之释放。
+// App 内的 WebView 不处理录音权限，不显示。
 function showVoiceChat(port) {
   const shown = Number.isInteger(port) && port > 0 && !navigator.userAgent.includes('SpaceMITOperatorApp');
-  $("voice-chat").hidden = !shown;
-  if (shown) $("voice-chat").href = `http://${location.hostname}:${port}/`;
+  $("mode-switch").hidden = !shown;
+  if (shown) {
+    const back = encodeURIComponent(location.origin + location.pathname);
+    $("voice-chat").href = `http://${location.hostname}:${port}/?back=${back}`;
+  }
 }
 async function initialize() {
   if (!navigator.userAgent.includes('SpaceMITOperatorApp')) {

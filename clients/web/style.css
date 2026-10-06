@@ -43,8 +43,13 @@ main { max-width: 1200px; margin: 0 auto; padding: 20px 32px 100px; }
 h1 { font-size: 30px; line-height: 1.2; margin: 0; font-weight: 650; overflow-wrap: anywhere; }
 h2 { display: flex; align-items: center; gap: 9px; font-size: 15px; margin: 0; line-height: 1.5; font-weight: 650; }
 h2 svg { width: 18px; height: 18px; color: #66735c; }
-.heading-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
-#download-app, #voice-chat { flex-shrink: 0; font-size: 12px; }
+#download-app { flex-shrink: 0; font-size: 12px; }
+.mode-switch { display: flex; gap: 2px; padding: 3px; border: 1px solid #41483b; border-radius: 7px; }
+.mode-switch a { display: inline-flex; align-items: center; gap: 7px; padding: 7px 14px; border-radius: 5px;
+  color: #c9d1c2; font-size: 13px; text-decoration: none; white-space: nowrap; }
+.mode-switch a svg { width: 16px; height: 16px; }
+.mode-switch a:not(.active):hover { background: #2a3125; }
+.mode-switch a.active { background: var(--accent); color: #1b2907; font-weight: 600; }
 .status-band { display: grid; grid-template-columns: 1.25fr 1fr 1fr 1fr; padding: 16px 0; border-top: 1px solid #cbd4c2; border-bottom: 1px solid #cbd4c2; }
 .status-band > div { display: flex; flex-direction: column; gap: 9px; border-left: 1px solid var(--line); padding-left: 30px; min-width: 0; }
 .status-band > div:first-child { border-left: none; padding-left: 0; }
@@ -142,6 +147,8 @@ body[data-trajectory="true"] .status-band { grid-template-columns: repeat(3, min
   .states button span { font-size: 8px; }
 }
 @media (max-width: 640px) {
+  .mode-switch a { padding: 6px 10px; font-size: 12px; gap: 5px; }
+  .mode-switch a svg, .mode-switch .long { display: none; }
   .topbar { min-height: 64px; padding: 14px 18px; gap: 12px; }
   .brand img { width: 116px; height: 29px; }
   .header-actions { gap: 6px; }
@@ -153,7 +160,7 @@ body[data-trajectory="true"] .status-band { grid-template-columns: repeat(3, min
   h1 { font-size: 26px; }
   .eyebrow { font-size: 9px; margin-bottom: 7px; }
   .page-heading { flex-wrap: wrap; }
-  #download-app, #voice-chat { font-size: 11px; padding: 8px 10px; }
+  #download-app { font-size: 11px; padding: 8px 10px; }
   .status-band { grid-template-columns: 1.2fr 1fr 1fr; padding: 17px 0; }
   .status-band > div { padding-left: 15px; gap: 6px; }
   .status-band > div:last-child { display: none; }

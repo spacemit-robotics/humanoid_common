@@ -45,11 +45,13 @@ h2 { display: flex; align-items: center; gap: 9px; font-size: 15px; margin: 0; l
 h2 svg { width: 18px; height: 18px; color: #66735c; }
 #download-app { flex-shrink: 0; font-size: 12px; }
 .mode-switch { display: flex; gap: 2px; padding: 3px; border: 1px solid #41483b; border-radius: 7px; }
-.mode-switch a { display: inline-flex; align-items: center; gap: 7px; padding: 7px 14px; border-radius: 5px;
-  color: #c9d1c2; font-size: 13px; text-decoration: none; white-space: nowrap; }
-.mode-switch a svg { width: 16px; height: 16px; }
-.mode-switch a:not(.active):hover { background: #2a3125; }
-.mode-switch a.active { background: var(--accent); color: #1b2907; font-weight: 600; }
+.mode-switch button { min-height: 0; gap: 7px; padding: 7px 14px; border: 0; border-radius: 5px; background: transparent;
+  color: #c9d1c2; font-size: 13px; white-space: nowrap; }
+.mode-switch button svg { width: 16px; height: 16px; }
+.mode-switch button:not(.active):hover:not(:disabled) { background: #2a3125; }
+.mode-switch button.active, .mode-switch button.active:hover { background: var(--accent); color: #1b2907; font-weight: 600; }
+/* 语音模式：只留语音面板（样式由语音服务的 panel.css 提供）、配对和故障提示、底部停止栏 */
+body[data-mode="voice"] :is(.page-heading, .status-band, .authority, .mobile-views, .workspace) { display: none; }
 .status-band { display: grid; grid-template-columns: 1.25fr 1fr 1fr 1fr; padding: 16px 0; border-top: 1px solid #cbd4c2; border-bottom: 1px solid #cbd4c2; }
 .status-band > div { display: flex; flex-direction: column; gap: 9px; border-left: 1px solid var(--line); padding-left: 30px; min-width: 0; }
 .status-band > div:first-child { border-left: none; padding-left: 0; }
@@ -147,8 +149,8 @@ body[data-trajectory="true"] .status-band { grid-template-columns: repeat(3, min
   .states button span { font-size: 8px; }
 }
 @media (max-width: 640px) {
-  .mode-switch a { padding: 6px 10px; font-size: 12px; gap: 5px; }
-  .mode-switch a svg, .mode-switch .long { display: none; }
+  .mode-switch button { padding: 6px 10px; font-size: 12px; gap: 5px; }
+  .mode-switch button svg, .mode-switch .long { display: none; }
   .topbar { min-height: 64px; padding: 14px 18px; gap: 12px; }
   .brand img { width: 116px; height: 29px; }
   .header-actions { gap: 6px; }

@@ -15,8 +15,8 @@
     <a class="brand" href="/" aria-label="SpacemiT 机器人控制台"><img src="/assets/spacemit-logo.svg" alt="SpacemiT 进迭时空"></a>
     <span class="product-name">机器人控制台</span>
     <nav id="mode-switch" class="mode-switch" aria-label="模式" hidden>
-      <a class="active" aria-current="page"><i data-lucide="sliders-horizontal"></i><span>控制<span class="long">模式</span></span></a>
-      <a id="voice-chat"><i data-lucide="mic"></i><span>语音<span class="long">模式</span></span></a>
+      <button id="mode-control" class="active" aria-pressed="true"><i data-lucide="sliders-horizontal"></i><span>控制<span class="long">模式</span></span></button>
+      <button id="mode-voice" aria-pressed="false"><i data-lucide="mic"></i><span>语音<span class="long">模式</span></span></button>
     </nav>
     <div class="header-actions">
       <span id="connection" class="connection">连接中</span>
@@ -49,6 +49,7 @@
     </section>
     <section id="fault" class="fault" hidden><i data-lucide="triangle-alert"></i>
       <div><strong id="fault-title"></strong><p id="fault-detail"></p></div><button id="ack">确认故障</button></section>
+    <section id="voice-panel" class="voice-panel" aria-label="语音对话" hidden></section>
     <nav class="mobile-views" aria-label="操作视图">
       <button data-view="control" class="active"><i data-lucide="sliders-horizontal"></i>状态与动作</button>
       <button data-view="motion"><i data-lucide="move"></i>移动控制</button>

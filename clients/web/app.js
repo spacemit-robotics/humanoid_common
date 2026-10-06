@@ -14,6 +14,10 @@ const operationNames = {state:"状态切换",policy:"策略切换",interaction:"
 const phaseNames = {accepted:"待确认",completed:"已确认",rejected:"已拒绝",expired:"确认超时",cancelled:"已撤销",sent:"已发送"};
 const actionPhases = {IDLE:"就绪",BLEND_IN:"进入",PLAYING:"播放",HOLDING:"保持",BLEND_OUT:"收回",FINISHED:"完成",REJECTED:"拒绝"};
 const descriptions = {"control acquired":"已取得控制权","released":"控制权已释放","control renewed":"控制权已续期","velocity accepted":"速度请求已受理","velocity cleared; pending requests cancelled":"速度已清零，控制权及待处理请求已撤销","control entered requested state":"机器人已切换状态","control selected requested policy":"机器人已采用所选策略","control handled action request":"机器人已处理动作请求","control acknowledged fault":"故障已确认","already in requested state":"已经在请求状态"};
+// #mode=voice：在 HTTP 页面点「语音」跳到 HTTPS 版时和令牌一起放在片段里（不发给服务器；服务器只认 "/"，带查询会 404），
+// 进来直接是语音模式。下一行会清掉地址里的片段。
+const startInVoice = new URLSearchParams(location.hash.slice(1)).get("mode") === "voice";
+const inApp = navigator.userAgent.includes("SpaceMITOperatorApp");
 history.replaceState(null, "", location.pathname);
 window.addEventListener('hashchange', () => {
   const paired = new URLSearchParams(location.hash.slice(1)).get('token');
@@ -59,7 +63,8 @@ function connect() {
       authenticated = true; catalog = r.data.catalog; status = r.data.status;
       lastStatusAt = performance.now();
       $("robot").textContent = catalog.robot === 'linglong' ? 'LingLong 灵龙' : catalog.robot;
-      showVoiceChat(catalog.voice_chat_port);
+      voicePort = Number.isInteger(catalog.voice_chat_port) ? catalog.voice_chat_port : 0;
+      showModeSwitch();
       document.title = `${catalog.robot} · 操作台`;
       $("login").hidden = true;
       tell("已连接，尚未申请控制权"); render();
@@ -110,7 +115,7 @@ function render() {
   const busy = status?.request.phase === "accepted";
   $("connection").textContent = online ? "控制链路在线" : authenticated ? "等待控制程序" : "未连接";
   $("connection").classList.toggle("online", !!online);
-  $("owner").textContent = owns ? "本客户端" : (status?.owner || "无人持有");
+  $("owner").textContent = owns ? "本客户端" : ownerLabel(status?.owner);
   $("state").textContent = status?.state === 'TRAJECTORY' ? '动作' : status?.state || "—";
   const stateLabels = {POWER_OFF:'电机未上电',DAMP:'阻尼保护',HOME:'复位姿态',ZERO:'准备姿态',RL:'策略运行中',TRAJECTORY:'TRAJECTORY',SAFETY:'安全保护'};
   $("state-label").textContent = stateLabels[status?.state] || '等待状态';
@@ -188,7 +193,17 @@ function render() {
     b.disabled = !rl || !Math.max(Math.abs(p?.minimum[axis] || 0), p?.maximum[axis] || 0);
     b.classList.toggle('active', held === b.dataset.motion);
   });
+  // 语音面板据此显示现在能不能让机器人做动作（谁握着控制权、什么状态、在做什么动作）
+  window.dispatchEvent(new CustomEvent("operator-status", {detail: {status, catalog, online: !!online, authenticated}}));
 }
+// 先把本地的持有标记清掉再发 release：否则服务端推来新状态前，每 300 ms 的续租可能紧跟着发出去，报「请先接管控制」
+function releaseControl() {
+  endMotion();
+  if (status) status.owns_control = false;
+  return request("release");
+}
+// 语音服务做动作时以 voice#<会话号> 持有控制权
+function ownerLabel(owner) { return !owner ? "无人持有" : owner.startsWith("voice#") ? "语音（正在做动作）" : owner; }
 function velocity() {
   const v = {vx:0,vy:0,wz:0,valid_for_ms:300};
   const key = held;
@@ -212,7 +227,7 @@ document.querySelectorAll('[data-motion]').forEach(b => {
   b.onpointerup = b.onpointercancel = b.onlostpointercapture = () => endMotion();
 });
 $("acquire").onclick = () => request('acquire');
-$("release").onclick = () => { endMotion(); request('release'); };
+$("release").onclick = () => releaseControl();
 $("stop").onclick = () => { endMotion(false); request('stop'); };
 $("select-policy").onclick = () => request('policy', {policy:$("policy").value});
 $("start-action").onclick = () => request('interaction', {action:$("action").value});
@@ -274,17 +289,41 @@ setInterval(() => {
   }
 }, 100);
 if (window.lucide) lucide.createIcons();
-// 机器人装了语音服务时（YAML operator_service.voice_chat_port）顶栏显示「控制模式 | 语音模式」。语音模式链到同一主机
-// 该端口，那边再跳到它的 HTTPS 页面（录音要求页面本身是 HTTPS，不能嵌进本页），back 参数让它能切回来。
-// 在本标签页打开：配对凭据在本页的 sessionStorage 里，切回来不用重新配对；离开时连接断开，控制权随之释放。
+// 语音模式：机器人装了语音服务时（YAML operator_service.voice_chat_port）顶栏显示「控制 | 语音」，同一页里切换。
+// 手机浏览器只在安全上下文（HTTPS 或本机）里允许录音，语音服务给本控制台套了一层 HTTPS（其余请求原样转发到这里），
+// 并提供语音面板 /voice/panel.js：在安全上下文里加载面板；局域网 HTTP 下点「语音」带着会话令牌经该端口跳到
+// HTTPS 版，只跳一次（#token= 片段不发给服务器）。语音动作由语音服务自己申请控制权，所以切到语音时把本页的控制权放掉。
 // App 内的 WebView 不处理录音权限，不显示。
-function showVoiceChat(port) {
-  const shown = Number.isInteger(port) && port > 0 && !navigator.userAgent.includes('SpaceMITOperatorApp');
-  $("mode-switch").hidden = !shown;
-  if (shown) {
-    const back = encodeURIComponent(location.origin + location.pathname);
-    $("voice-chat").href = `http://${location.hostname}:${port}/?back=${back}`;
+let voicePort = 0;
+function voiceAvailable() {
+  if (inApp) return false;
+  return window.isSecureContext ? !!window.voicePanel : voicePort > 0;
+}
+function showModeSwitch() { $("mode-switch").hidden = !voiceAvailable(); }
+function setMode(mode) {
+  if (mode === "voice" && !window.voicePanel) {
+    if (voicePort > 0 && token) {
+      location.assign(`http://${location.hostname}:${voicePort}/#mode=voice&token=${encodeURIComponent(token)}`);
+    }
+    return;
   }
+  if (mode === "voice" && status?.owns_control) releaseControl();
+  const voice = mode === "voice";
+  document.body.dataset.mode = voice ? "voice" : "control";
+  $("mode-control").classList.toggle("active", !voice);
+  $("mode-voice").classList.toggle("active", voice);
+  $("mode-control").setAttribute("aria-pressed", String(!voice));
+  $("mode-voice").setAttribute("aria-pressed", String(voice));
+  $("voice-panel").hidden = !voice;
+  window.voicePanel?.setActive(voice);
+}
+$("mode-control").onclick = () => setMode("control");
+$("mode-voice").onclick = () => setMode("voice");
+if (window.isSecureContext && !inApp) {
+  const script = document.createElement("script");
+  script.src = "/voice/panel.js";
+  script.onload = () => { showModeSwitch(); if (startInVoice) setMode("voice"); };
+  document.head.append(script);
 }
 async function initialize() {
   if (!navigator.userAgent.includes('SpaceMITOperatorApp')) {

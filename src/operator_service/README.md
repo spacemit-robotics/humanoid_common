@@ -66,10 +66,12 @@ hmi_runtime /absolute/path/robot.yaml --real --export-pairing --public-url http:
 实机网页可从同一服务下载 `/downloads/SpacemiT-Operator.apk`，支持 GET/HEAD，文件位于
 `operator_web/downloads/`。这是不含凭据的安装包，不要求操作权限；下载不授予控制权。
 APK 缺失时返回 404，网页隐藏下载按钮；仿真仍禁用网页、App 和 APK 下载入口。
-YAML `operator_service.voice_chat_port` 大于 0 时，登录后的网页顶栏显示「控制模式 | 语音模式」：
-语音模式在本标签页打开同一主机该端口的 http 入口（带 `back=` 本页地址，语音页据此显示切回的「控制模式」），
-由机器人上的语音服务跳转到它自己的 HTTPS 页面（手机录音要求 HTTPS，不能嵌入本页）。离开本页时连接断开、
-控制权释放，切回来凭本页会话自动重连，不用重新配对。默认 0 不显示，App 内也不显示。
+YAML `operator_service.voice_chat_port` 大于 0 时，登录后的网页顶栏显示「控制 | 语音」，在同一页里切换。
+手机浏览器只在 HTTPS 页面里允许录音，所以语音由机器人上的语音服务提供：它给本控制台套一层 HTTPS
+（除 `/voice/` 外的请求原样转发到本服务，含 WebSocket），并提供语音面板 `/voice/panel.js`。网页在 HTTPS
+下加载面板；在 HTTP 下点「语音」时带着会话令牌经该端口跳到 HTTPS 版（令牌在 `#` 片段里，不发给服务器），
+不用重新配对。切到语音时网页释放本页的控制权，语音动作由语音服务自己申请；状态里的控制者
+`voice#<会话号>` 显示为「语音」。默认 0 不显示，App 内也不显示。
 本版本 HTTP/WS 没有链路加密，只用于受信任局域网，不应暴露公网。网页按钮显示的是
 control 实际回报的状态，不把“已受理”当作“已完成”。
 

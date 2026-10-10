@@ -126,6 +126,11 @@ function render() {
   $("active-policy").textContent = status?.policy || "—";
   $("acquire").disabled = !online || !!status?.owner;
   $("release").disabled = !owns;
+  // 本页握着控制权时「语音」变灰：切过去得先放掉控制权，正在做的动作会被取消，所以不替用户放，点了只提示（只看本页，其他人不受影响）
+  const voiceLocked = !!status?.owns_control;
+  $("mode-voice").classList.toggle("locked", voiceLocked);
+  $("mode-voice").setAttribute("aria-disabled", String(voiceLocked));
+  $("mode-voice").title = voiceLocked ? "正在控制机器人，先释放控制权再切到语音" : "";
   $("pair").disabled = !authenticated;
   $("disconnect").disabled = !authenticated;
   $("disconnect").hidden = !authenticated;
@@ -292,7 +297,7 @@ if (window.lucide) lucide.createIcons();
 // 语音模式：机器人装了语音服务时（YAML operator_service.voice_chat_port）顶栏显示「控制 | 语音」，同一页里切换。
 // 手机浏览器只在安全上下文（HTTPS 或本机）里允许录音，语音服务给本控制台套了一层 HTTPS（其余请求原样转发到这里），
 // 并提供语音面板 /voice/panel.js：在安全上下文里加载面板；局域网 HTTP 下点「语音」带着会话令牌经该端口跳到
-// HTTPS 版，只跳一次（#token= 片段不发给服务器）。语音动作由语音服务自己申请控制权，所以切到语音时把本页的控制权放掉。
+// HTTPS 版，只跳一次（#token= 片段不发给服务器）。语音动作由语音服务自己申请控制权，本页握着控制权时不能切到语音，要先手动释放。
 // App 内的 WebView 不处理录音权限，不显示。
 let voicePort = 0;
 function voiceAvailable() {
@@ -307,7 +312,7 @@ function setMode(mode) {
     }
     return;
   }
-  if (mode === "voice" && status?.owns_control) releaseControl();
+  if (mode === "voice" && status?.owns_control) { tell("你正在控制机器人，要用语音请先释放控制权（「接管控制」旁的按钮）"); return; }
   const voice = mode === "voice";
   document.body.dataset.mode = voice ? "voice" : "control";
   $("mode-control").classList.toggle("active", !voice);

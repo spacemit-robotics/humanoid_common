@@ -30,6 +30,7 @@ struct ActionConfig {
 struct Config {
     double blend_in_duration = 0.25;
     double blend_out_duration = 0.25;
+    double return_max_velocity = 0.0;
     std::vector<ActionConfig> actions;
 
     bool Enabled() const { return !actions.empty(); }

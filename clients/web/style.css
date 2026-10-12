@@ -44,15 +44,14 @@ h1 { font-size: 30px; line-height: 1.2; margin: 0; font-weight: 650; overflow-wr
 h2 { display: flex; align-items: center; gap: 9px; font-size: 15px; margin: 0; line-height: 1.5; font-weight: 650; }
 h2 svg { width: 18px; height: 18px; color: #66735c; }
 #download-app { flex-shrink: 0; font-size: 12px; }
-.mode-switch { display: flex; gap: 2px; padding: 3px; border: 1px solid #41483b; border-radius: 7px; }
-.mode-switch button { min-height: 0; gap: 7px; padding: 7px 14px; border: 0; border-radius: 5px; background: transparent;
-  color: #c9d1c2; font-size: 13px; white-space: nowrap; }
-.mode-switch button svg { width: 16px; height: 16px; }
-.mode-switch button:not(.active):hover:not(:disabled) { background: #2a3125; }
-.mode-switch button.active, .mode-switch button.active:hover { background: var(--accent); color: #1b2907; font-weight: 600; }
-.mode-switch button.locked, .mode-switch button.locked:hover { opacity: .36; cursor: not-allowed; background: transparent; }
-/* 语音模式：只留语音面板（样式由语音服务的 panel.css 提供）、配对和故障提示、底部停止栏 */
+/* The public page has no motor controls. */
 body[data-mode="voice"] :is(.page-heading, .status-band, .authority, .mobile-views, .workspace) { display: none; }
+#voice-placeholder { min-height: 55vh; display: grid; align-content: center; justify-items: center; gap: 20px; }
+#voice-placeholder img { width: 180px; background: #171918; padding: 14px; }
+#voice-placeholder p { color: var(--muted); }
+.admin-entry { flex-shrink: 0; background: transparent; border: 0; color: #69765e; font-size: 12px; }
+#admin-login { display: grid; gap: 12px; margin-top: 24px; }
+#admin-message { min-height: 20px; margin: 0; color: #953d31; }
 .status-band { display: grid; grid-template-columns: 1.25fr 1fr 1fr 1fr; padding: 16px 0; border-top: 1px solid #cbd4c2; border-bottom: 1px solid #cbd4c2; }
 .status-band > div { display: flex; flex-direction: column; gap: 9px; border-left: 1px solid var(--line); padding-left: 30px; min-width: 0; }
 .status-band > div:first-child { border-left: none; padding-left: 0; }
@@ -118,8 +117,6 @@ progress::-moz-progress-bar { background: #86b527; border-radius: 3px; }
 .adopted output { font-size: 17px; color: #d4e4c2; font-variant-numeric: tabular-nums; }
 .command-bar { position: fixed; z-index: 10; left: 0; right: 0; bottom: 0; display: flex; justify-content: space-between; align-items: center; gap: 18px; border-top: 1px solid var(--line); padding: 14px max(32px, calc((100% - 1136px) / 2)); background: #f5f6f5; }
 #message { margin: 0; min-height: 18px; color: #69765e; font-size: 12px; overflow-wrap: anywhere; }
-.stop { min-width: 180px; background: #a93834; color: #fff; border-color: #a93834; }
-.stop:hover:not(:disabled) { background: #902a27; border-color: #902a27; }
 .fault { display: flex; gap: 12px; align-items: center; background: #fff0ed; color: #953d31; border: 1px solid #ebc5bf; padding: 14px; margin-top: 16px; border-radius: 5px; }
 .fault > svg { width: 22px; flex-shrink: 0; }
 .fault > div { flex: 1; min-width: 0; }
@@ -150,8 +147,6 @@ body[data-trajectory="true"] .status-band { grid-template-columns: repeat(3, min
   .states button span { font-size: 8px; }
 }
 @media (max-width: 640px) {
-  .mode-switch button { padding: 6px 10px; font-size: 12px; gap: 5px; }
-  .mode-switch button svg, .mode-switch .long { display: none; }
   .topbar { min-height: 64px; padding: 14px 18px; gap: 12px; }
   .brand img { width: 116px; height: 29px; }
   .header-actions { gap: 6px; }
@@ -196,7 +191,6 @@ body[data-trajectory="true"] .status-band { grid-template-columns: repeat(3, min
   .request { margin-top: 16px; }
   .command-bar { position: fixed; z-index: 10; left: 0; right: 0; bottom: 0; background: #f4f5f2; border-top: 1px solid #cdd6c2; padding: 12px 18px calc(12px + env(safe-area-inset-bottom)); gap: 10px; }
   #message { font-size: 10px; line-height: 1.6; max-height: 34px; overflow: hidden; }
-  .stop { min-width: 115px; white-space: nowrap; min-height: 44px; }
   #login { flex-wrap: wrap; padding: 14px; gap: 10px; }
   .login-copy { flex: 1; }
   #pairing-link { flex-basis: 65%; width: 0; }

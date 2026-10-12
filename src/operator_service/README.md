@@ -58,22 +58,30 @@ hmi_runtime /absolute/path/robot.yaml --real --export-pairing --public-url http:
 `public_url` 应使用固定 IP 或可解析的固定主机名；写入 YAML 后，无界面自启动执行
 同一条 `hmi_runtime robot.yaml` 即可。
 
-凭据首次随机生成，私有保存为 `credential`，跨重启保留。二维码等同操作钥匙，不应
-公开发布；扫描后仍须显式申请控制权，不自动上电。浏览器只在当前标签页的 sessionStorage
+凭据首次随机生成，私有保存为 `credential`，跨重启保留。未配置管理员密码时，二维码等同
+操作钥匙，不应公开发布；扫描后仍须显式申请控制权，扫码本身不触发上电。浏览器只在当前标签页的 sessionStorage
 保留连接凭据，自动移除地址栏中的凭据，不写 localStorage。本机自动连接接口和
 `/pairing.svg` 只允许回环地址、正确 Host 和同源请求；局域网必须通过已有二维码配对。
 
 实机网页可从同一服务下载 `/downloads/SpacemiT-Operator.apk`，支持 GET/HEAD，文件位于
 `operator_web/downloads/`。这是不含凭据的安装包，不要求操作权限；下载不授予控制权。
 APK 缺失时返回 404，网页隐藏下载按钮；仿真仍禁用网页、App 和 APK 下载入口。
-YAML `operator_service.voice_chat_port` 大于 0 时，登录后的网页顶栏显示「控制 | 语音」，在同一页里切换。
+YAML `operator_service.voice_chat_port` 大于 0 时，扫码首页默认语音，底部保留管理员入口。
 手机浏览器只在 HTTPS 页面里允许录音，所以语音由机器人上的语音服务提供：它给本控制台套一层 HTTPS
 （除 `/voice/` 外的请求原样转发到本服务，含 WebSocket），并提供语音面板 `/voice/panel.js`。网页在 HTTPS
-下加载面板；在 HTTP 下点「语音」时带着会话令牌经该端口跳到 HTTPS 版（令牌在 `#` 片段里，不发给服务器），
-不用重新配对。切到语音时网页释放本页的控制权，语音动作由语音服务自己申请；状态里的控制者
-`voice#<会话号>` 显示为「语音」。默认 0 不显示，App 内也不显示。
+下加载面板；HTTP 入口提供语音链接，经该端口跳到 HTTPS 版（令牌在 `#` 片段里，不发给服务器），
+不用重新配对。语音动作由语音服务自己申请控制权；状态里的控制者 `voice#<会话号>` 显示为「语音」。
+动作尚未收回时管理员页面不允许退出管理；取消并收回后再退出。App 保留管理员控制，语音使用浏览器扫码。
 本版本 HTTP/WS 没有链路加密，只用于受信任局域网，不应暴露公网。网页按钮显示的是
 control 实际回报的状态，不把“已受理”当作“已完成”。
+
+配置 `operator_service.admin_password_hash` 可限制公开扫码凭据只能查看状态、访问语音，
+管理员登录后才能申请控制权或发送命令。格式为 `pbkdf2-sha256:100000:<32位盐hex>:<64位摘要hex>`；
+使用随机盐生成，不能填写明文密码。密码验证在后台执行，每 30 秒最多尝试 5 次。
+手机浏览器使用语音 HTTPS 入口输入密码；App 也可扫描 HTTPS 二维码，旧 HTTP 入口仅可用于受信任内网。
+服务另存私有的 `credential.control`；本机 `connection.json.token` 供 TUI/MCP 使用，
+`public_token` 供语音网页和二维码使用。公开二维码不变，私有控制令牌不得进入网页或二维码。
+管理员授权只在当前连接有效，断线后重新登录；登录不自动获取控制权。
 
 ## 操作与安全边界
 
@@ -81,7 +89,7 @@ control 实际回报的状态，不把“已受理”当作“已完成”。
 - 默认控制权有效期 1000 ms，客户端存活期间续租。速度另有有效期，默认 300 ms。
 - 断连、后台、控制权过期或 control 反馈超时会清零速度、取消待处理请求与交互动作。
 - 清零不会自动 DAMP 或掉电，避免站立机器人因遥控断连突然卸力。原 control 安全保护仍有效。
-- 任意已验证客户端可执行停止、DAMP 或 POWER_OFF。DAMP/POWER_OFF 仍按原 FSM 判断。
+- 控制客户端可执行停止、DAMP 或 POWER_OFF；启用管理员密码后，公开扫码会话不能发送这些命令。
 - HOME/ZERO/RL 不跳过前置状态；RL 仍要求 ZERO 已到位，不改变原闭环阈值。
 - 策略只允许在 POWER_OFF/DAMP 选择，策略与动作列表、速度范围均从当前机型 YAML 读取。
 - 请求超时只说明未获确认，不自动重试；操作者应查看真实状态。重新连接不恢复旧命令。
@@ -91,6 +99,7 @@ control 实际回报的状态，不把“已受理”当作“已完成”。
 手动参考动作，`v` 进入速度页。速度页保留 `Q/W/E`、`A/S/D` 六键，空格只清零速度，
 `U` 释放控制权，`X` 确认故障，`Ctrl+C` 退出。速度页 `Esc` 清零后返回。
 按键步长继续读取 `hmi.velocity.step_*`，默认 0.1。终端不承担扫码入口显示。
+网页方块按钮与终端 `C` 都发送 `cancel`，取消当前动作并按配置收回，不掉电；网页不再显示全局停止按钮。
 
 服务在现有 HMI 日志会话的 `events.log` 记录接管、释放、状态/策略/动作请求及确认结果。
 不记录 token、二维码内容或每次速度心跳。完整控制与硬件轨迹仍由原 control/driver 日志负责。
@@ -111,6 +120,7 @@ WebSocket 路径 `/api/v1/ws`；JSON UTF-8 文本，版本 `v: 1`。建立连接
 | --- | --- | --- |
 | acquire / renew / release | `{}` | 申请、续租、释放控制权 |
 | status / catalog / pairing | `{}` | 当前状态、能力目录、固定入口二维码 |
+| admin_login / admin_logout | `{"password":"..."}` / `{}` | 验证管理员密码、退出管理并释放本会话控制权 |
 | state | `{"state":"ZERO"}` | 请求状态切换，返回请求序号 |
 | policy | `{"policy":"name"}` | 请求切换策略 |
 | velocity | `{"vx":0.1,"vy":0,"wz":0,"valid_for_ms":300}` | 短期速度指令，服务按策略范围限幅 |
@@ -120,6 +130,8 @@ WebSocket 路径 `/api/v1/ws`；JSON UTF-8 文本，版本 `v: 1`。建立连接
 | ack | `{}` | POWER_OFF 下确认已解除的锁存故障 |
 
 状态包含 `online/state/zero_ready/policy/velocity/fault/owner/owns_control/interaction/request`。
+网页状态额外包含 `admin/admin_login_pending/admin_login_error`；`admin_login` 返回 `pending` 后
+通过这些字段确认验证结果。C++ 客户端结构和接口保持不变。
 `request.phase` 区分 `accepted/completed/rejected/expired/cancelled`。`completed` 表示
 control 确认状态或接受动作请求，不代表整个动作播放结束；播放状态见 `interaction`。
 `reference_start` 现有内部协议无独立开始确认，返回 `sent`，不伪造完成回执。

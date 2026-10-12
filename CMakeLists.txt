@@ -254,6 +254,7 @@ if(BUILD_RL)
 endif()
 
 # Operator protocol and client SDK have no robot, RL or hardware dependencies.
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 add_library(operator_protocol STATIC src/operator_service/protocol/protocol.cpp)
 target_include_directories(operator_protocol PUBLIC include src/operator_service/protocol)
 target_link_libraries(operator_protocol PUBLIC nlohmann_json::nlohmann_json)
@@ -274,7 +275,7 @@ add_library(operator_service STATIC
 target_include_directories(operator_service PUBLIC src/operator_service/service)
 target_include_directories(operator_service PRIVATE src/runtime/common)
 target_link_libraries(operator_service PUBLIC operator_protocol robot_base
-    PRIVATE operator_qr Boost::headers transport_executor)
+    PRIVATE operator_qr Boost::headers transport_executor OpenSSL::Crypto)
 target_compile_definitions(operator_service PRIVATE BOOST_ERROR_CODE_HEADER_ONLY
     OPERATOR_WEB_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/clients/web")
 
@@ -414,8 +415,10 @@ if(BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --trajectory)
     add_test(NAME operator_trajectory_terminal COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --trajectory --sim)
+    add_test(NAME operator_administrator COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --trajectory --admin)
     set_tests_properties(operator_network operator_terminal_only operator_trajectory
-        operator_trajectory_terminal PROPERTIES RUN_SERIAL TRUE TIMEOUT 20)
+        operator_trajectory_terminal operator_administrator PROPERTIES RUN_SERIAL TRUE TIMEOUT 20)
     add_test(NAME driver_runtime_backend_selection
         COMMAND test_driver_runtime ${DRIVER_RUNTIME_EXAMPLE_CONFIG})
     if(BUILD_WHOLE_BODY_BACKEND)

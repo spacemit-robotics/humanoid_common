@@ -16,6 +16,69 @@
 #include "service.h"
 
 namespace {
+void TestAdministrator() {
+    using namespace operator_service;  // NOLINT(build/namespaces)
+    Config config;
+    config.token = "public-pairing-test";
+    config.control_token = "local-control-test";
+    config.admin_password_hash = "pbkdf2-sha256:100000:00112233445566778899aabbccddeeff:"
+        "ce640bcfa4ac6c9479894ecb9990fe597e6f6e4f6878e84ebbcce384bbb4f7b2";
+    Service service(config);
+    const auto browser = service.Open(), terminal = service.Open();
+    uint64_t request_id = 0;
+    const auto call = [&](uint64_t session, const std::string &op, const Json &args = Json::object()) {
+        return service.Handle(session, {{"v", 1}, {"id", ++request_id}, {"op", op}, {"args", args}});
+    };
+    robot_base::ControlStatus status;
+    status.hmi_connected = true;
+    service.UpdateStatus(status, {});
+    service.UpdateStatus(status, {});
+    assert(call(browser, "hello", {{"token", config.token}}).at("ok"));
+    assert(call(terminal, "hello", {{"token", config.control_token}}).at("ok"));
+    assert(!service.StatusMessage(browser).at("admin") && service.StatusMessage(terminal).at("admin"));
+    assert(service.Catalog().at("admin_required"));
+    assert(service.Catalog().dump().find(config.admin_password_hash) == std::string::npos);
+    assert(call(browser, "status").at("ok"));
+    for (const auto *op : {"acquire", "stop", "cancel", "ack", "velocity", "interaction"})
+        assert(call(browser, op).at("code") == "admin_required");
+    assert(call(browser, "state", {{"state", "POWER_OFF"}}).at("code") == "admin_required");
+    assert(call(terminal, "acquire").at("ok"));
+    const auto await_login = [&] {
+        for (int i = 0; i < 1000 && service.StatusMessage(browser).at("admin_login_pending"); ++i) {
+            // Password work runs independently while normal service requests continue.
+            service.UpdateStatus(status, {});
+            assert(call(terminal, "renew").at("ok"));
+            service.Tick();
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        assert(!service.StatusMessage(browser).at("admin_login_pending"));
+    };
+    assert(call(browser, "admin_login", {{"password", "wrong"}}).at("code") == "pending");
+    await_login();
+    assert(!service.StatusMessage(browser).at("admin"));
+    assert(service.StatusMessage(browser).at("admin_login_error") == "incorrect_password");
+    assert(call(browser, "admin_login", {{"password", "test-admin-only"}}).at("ok"));
+    await_login();
+    assert(service.StatusMessage(browser).at("admin") && !service.Snapshot(browser).owns_control);
+    assert(call(terminal, "release").at("ok"));
+    assert(call(browser, "acquire").at("ok"));
+    assert(call(browser, "admin_logout").at("ok"));
+    assert(!service.StatusMessage(browser).at("admin") && !service.Snapshot(browser).owns_control);
+    assert(service.Command().key == 0);
+    assert(call(browser, "acquire").at("code") == "admin_required");
+    assert(call(terminal, "acquire").at("ok"));
+    for (int i = 0; i < 3; ++i) {
+        assert(call(browser, "admin_login", {{"password", "wrong"}}).at("ok"));
+        await_login();
+    }
+    assert(call(browser, "admin_login", {{"password", "test-admin-only"}}).at("code") == "rate_limited");
+    assert(DecodeStatus(service.StatusMessage(browser)).state == "POWER_OFF");
+    config.admin_password_hash = "invalid";
+    bool rejected = false;
+    try { Service invalid(config); } catch (const std::exception &) { rejected = true; }
+    assert(rejected);
+}
+
 void TestTrajectory() {
     using namespace operator_service;  // NOLINT(build/namespaces)
     char directory[] = "/tmp/operator-trajectory-XXXXXX";
@@ -118,6 +181,7 @@ void TestTrajectory() {
 } // namespace
 
 int main() {
+    TestAdministrator();
     TestTrajectory();
     using operator_service::Config;
     using operator_service::DecodeStatus;

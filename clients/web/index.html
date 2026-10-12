@@ -10,14 +10,10 @@
   <script src="/vendor/lucide.min.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
-<body data-view="control">
+<body data-view="control" data-mode="voice">
   <header class="topbar">
     <a class="brand" href="/" aria-label="SpacemiT 机器人控制台"><img src="/assets/spacemit-logo.svg" alt="SpacemiT 进迭时空"></a>
     <span class="product-name">机器人控制台</span>
-    <nav id="mode-switch" class="mode-switch" aria-label="模式" hidden>
-      <button id="mode-control" class="active" aria-pressed="true"><i data-lucide="sliders-horizontal"></i><span>控制<span class="long">模式</span></span></button>
-      <button id="mode-voice" aria-pressed="false"><i data-lucide="mic"></i><span>语音<span class="long">模式</span></span></button>
-    </nav>
     <div class="header-actions">
       <span id="connection" class="connection">连接中</span>
       <button id="pair" class="icon" title="手机扫码接入" aria-label="手机扫码接入"><i data-lucide="qr-code"></i></button>
@@ -49,7 +45,12 @@
     </section>
     <section id="fault" class="fault" hidden><i data-lucide="triangle-alert"></i>
       <div><strong id="fault-title"></strong><p id="fault-detail"></p></div><button id="ack">确认故障</button></section>
-    <section id="voice-panel" class="voice-panel" aria-label="语音对话" hidden></section>
+    <section id="voice-panel" class="voice-panel" aria-label="语音对话">
+      <div id="voice-placeholder"><img src="/assets/spacemit-logo.svg" alt="SpacemiT 进迭时空">
+        <h1>LingLong 灵龙</h1><p id="voice-message">语音服务连接中</p>
+        <a id="open-voice" class="button" hidden><i data-lucide="mic"></i>打开语音页面</a>
+      </div>
+    </section>
     <nav class="mobile-views" aria-label="操作视图">
       <button data-view="control" class="active"><i data-lucide="sliders-horizontal"></i>状态与动作</button>
       <button data-view="motion"><i data-lucide="move"></i>移动控制</button>
@@ -76,7 +77,7 @@
           <div class="section-heading"><h2><i data-lucide="hand"></i>交互动作</h2><span id="action-state">就绪</span></div>
           <div class="select-row"><label class="sr-only" for="action">交互动作</label><select id="action"></select>
             <button id="start-action" class="primary"><i data-lucide="play"></i>播放</button>
-            <button id="cancel-action" class="icon" title="平滑取消动作" aria-label="取消动作"><i data-lucide="square"></i></button></div>
+            <button id="cancel-action" class="icon" title="取消并缓慢收回" aria-label="取消并缓慢收回"><i data-lucide="square"></i></button></div>
           <button id="start-reference" class="reference-button primary" hidden><i data-lucide="play"></i>开始参考动作</button>
           <div class="progress-row"><progress id="progress" max="1" value="0"></progress><span id="progress-label">0%</span></div>
           <div class="request"><span>最近请求</span><strong id="request">暂无操作</strong></div>
@@ -102,8 +103,19 @@
       </section>
     </div>
     <footer class="command-bar"><p id="message" role="status">正在连接设备</p>
-      <div class="stop-bar"><button id="stop" class="stop"><i data-lucide="octagon-pause"></i><span id="stop-label">停止移动</span></button></div></footer>
+      <button id="admin-entry" class="admin-entry"><i data-lucide="lock-keyhole"></i>管理员</button>
+      <button id="admin-exit" class="admin-entry" hidden><i data-lucide="log-out"></i>退出管理</button></footer>
   </main>
+  <dialog id="admin-dialog">
+    <div class="dialog-head"><h2><i data-lucide="lock-keyhole"></i>管理员登录</h2>
+      <button id="close-admin" class="icon" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></div>
+    <form id="admin-login">
+      <label for="admin-password">管理员密码</label>
+      <input id="admin-password" type="password" autocomplete="current-password" maxlength="128" required>
+      <p id="admin-message" role="status"></p>
+      <button id="admin-submit" class="primary" type="submit"><i data-lucide="log-in"></i>进入管理</button>
+    </form>
+  </dialog>
   <dialog id="pair-dialog">
     <div class="dialog-head"><h2>手机扫码接入</h2><button id="close-pair" class="icon" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button></div>
     <img id="qr" alt="机器人操作二维码">

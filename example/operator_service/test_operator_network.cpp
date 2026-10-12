@@ -61,9 +61,11 @@ int main(int argc, char *argv[]) {
     assert(argc >= 3);
     bool terminal_only = false;
     bool trajectory = false;
+    bool administrator = false;
     for (int i = 3; i < argc; ++i) {
         terminal_only = terminal_only || std::string(argv[i]) == "--sim";
         trajectory = trajectory || std::string(argv[i]) == "--trajectory";
+        administrator = administrator || std::string(argv[i]) == "--admin";
     }
     const auto active_state = trajectory ? "TRAJECTORY" : "RL";
     assert(setenv("XDG_RUNTIME_DIR", "/tmp", 1) == 0);
@@ -76,6 +78,9 @@ int main(int argc, char *argv[]) {
     const std::string apk_data = "PK" + std::string(65536, 'x');
     std::ofstream(apk_path, std::ios::binary) << apk_data;
     auto yaml = YAML::LoadFile(argv[2]);
+    if (administrator) yaml["operator_service"]["admin_password_hash"] =
+        "pbkdf2-sha256:100000:00112233445566778899aabbccddeeff:"
+        "ce640bcfa4ac6c9479894ecb9990fe597e6f6e4f6878e84ebbcce384bbb4f7b2";
     if (trajectory) {
         yaml.remove("rl_policy");
         auto config = yaml["behavior_manager"]["trajectory"];
@@ -198,19 +203,31 @@ int main(int argc, char *argv[]) {
             std::filesystem::remove(apk_path);
             assert(Get(pairing.port, apk_url, host).result_int() == 404);
             assert(Get(pairing.port, apk_url, host, "", http::verb::head).result_int() == 404);
-            assert(alice.PairingUrl().find("/#token=" + connection.token) != std::string::npos);
+            operator_service::PreparePairing(&pairing);
+            assert(alice.PairingUrl().find("/#token=" + pairing.token) != std::string::npos);
             const auto bootstrap = Get(pairing.port, "/api/v1/local-session", host);
-            assert(bootstrap.result_int() == 200 && bootstrap.body().find(connection.token) != std::string::npos);
+            assert(bootstrap.result_int() == 200 && bootstrap.body().find(pairing.token) != std::string::npos);
+            if (administrator) {
+                assert(pairing.token != connection.token && pairing.control_token == connection.token);
+                assert(bootstrap.body().find(connection.token) == std::string::npos);
+                operator_service::Client public_client;
+                auto public_connection = connection;
+                public_connection.token = pairing.token;
+                assert(public_client.Connect(public_connection, &error));
+                assert(public_client.AcquireControl().code == "admin_required");
+                assert(public_client.RequestState("POWER_OFF").code == "admin_required");
+                assert(public_client.Stop().code == "admin_required");
+            }
             for (const auto *path : {"/api/v1/local-session", "/pairing.svg"}) {
                 assert(Get(pairing.port, path, host).result_int() == 200);
                 assert(Get(pairing.port, path, "untrusted.example:" + std::to_string(pairing.port)).result_int() == 403);
                 assert(Get(pairing.port, path, host, "http://untrusted.example").result_int() == 403);
             }
-            operator_service::PreparePairing(&pairing);
             const auto saved_token = pairing.token;
             const auto saved_qr = operator_service::PairingSvg(operator_service::PairingUrl(pairing));
             operator_service::PreparePairing(&pairing);
-            assert(pairing.token == connection.token && pairing.token == saved_token);
+            assert(pairing.token == saved_token);
+            assert((administrator ? pairing.control_token : pairing.token) == connection.token);
             assert(operator_service::PairingSvg(operator_service::PairingUrl(pairing)) == saved_qr);
         }
         alice.Disconnect();

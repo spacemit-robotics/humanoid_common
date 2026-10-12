@@ -7,6 +7,7 @@
 #ifndef SERVICE_H
 #define SERVICE_H
 #include <cstdint>
+#include <future>
 #include <map>
 #include <string>
 #include <vector>
@@ -21,6 +22,8 @@ struct Config {
     uint16_t port = 8765;
     std::string public_url;
     std::string token;
+    std::string control_token;
+    std::string admin_password_hash;
     std::string connection_file;
     std::string credential_file;
     std::string qr_file;
@@ -49,6 +52,7 @@ public:
     void Tick();
     void UpdateStatus(const robot_base::ControlStatus &status, const robot_base::FaultStatus &fault);
     Status Snapshot(uint64_t session = 0) const;
+    Json StatusMessage(uint64_t session) const;
     Json Catalog() const;
     robot_base::Command Command() const;
     uint64_t AcknowledgeSequence() const { return acknowledge_sequence_; }
@@ -58,6 +62,8 @@ public:
 private:
     struct Session {
         bool authenticated = false;
+        bool admin = false;
+        std::string login_error;
         std::string name;
         uint64_t last_id = 0;
     };
@@ -84,6 +90,10 @@ private:
     RequestResult result_;
     std::string pending_target_;
     robot_base::ControlMode source_mode_ = robot_base::ControlMode::POWER_OFF;
+    std::future<bool> login_result_;
+    uint64_t login_session_ = 0;
+    int login_attempts_ = 0;
+    double login_window_until_ = 0;
 };
 } // namespace operator_service
 #endif // SERVICE_H

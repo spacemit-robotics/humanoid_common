@@ -59,7 +59,8 @@ function connect() {
       if (socket !== current) return;
       authenticated = true; catalog = r.data.catalog; status = r.data.status;
       lastStatusAt = performance.now();
-      $("robot").textContent = catalog.robot === 'linglong' ? 'LingLong 灵龙' : catalog.robot;
+      $("robot").textContent = catalog.robot;
+      if ($("voice-robot")) $("voice-robot").textContent = catalog.robot;
       voicePort = Number.isInteger(catalog.voice_chat_port) ? catalog.voice_chat_port : 0;
       showPublicPage();
       document.title = `${catalog.robot} · 操作台`;

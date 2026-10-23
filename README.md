@@ -156,6 +156,11 @@ PR 档含 `humanoid-common-functional`（前三个公共模块跑通离线流程
 `hmi_runtime` 提供的操作服务。核心 driver/control/hmi 仍为三进程，sim2sim 仍为双进程。
 接口、控制权和扫码说明见 [操作服务](src/operator_service/README.md)。
 
+语音等外部智能体通过 [MCP 客户端](clients/mcp/README.md) 调用同一个操作接口；
+网页语音面板和 HTTPS 入口见 [Web 语音接入](clients/web/voice/README.md)。
+两者属于可选客户端，不向 common 引入 ASR、TTS、LLM 或 omni_agent 构建依赖。
+机型的人设、动作白名单、声卡和部署服务放在对应机型仓库。
+
 ```
  ┌───────────┐   HMI cmd    ┌───────────────┐   control cmd   ┌──────────────┐
  │  hmi      │ ───────────▶ │  control      │ ──────────────▶ │  driver      │

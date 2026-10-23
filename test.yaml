@@ -26,3 +26,40 @@ tests:
       commands: [test_robot_base, test_behavior, test_transport_executor, test_driver_runtime]
     command: |
       bash tests/error_path.sh
+
+  - name: humanoid-operator-mcp-protocol
+    description: >
+      Verifies stdio MCP JSON-RPC handling, tool results, error codes and
+      list_changed notifications without a running operator service.
+    category: functional
+    scopes: [pr]
+    timeout_s: 20
+    requires:
+      commands: [test_operator_mcp_protocol]
+    command: |
+      test_operator_mcp_protocol
+
+  - name: humanoid-operator-mcp-integration
+    description: >
+      Drives hmi_runtime with a synthetic loopback control endpoint through MCP;
+      checks action permissions, lease renewal, busy ownership, stop and exit cleanup.
+    category: functional
+    scopes: [pr]
+    timeout_s: 60
+    requires:
+      commands: [test_operator_mcp, hmi_runtime, humanoid_operator_mcp]
+    command: |
+      test_operator_mcp "$(command -v hmi_runtime)" "$(command -v humanoid_operator_mcp)"
+
+  - name: humanoid-operator-voice-web
+    description: >
+      Verifies HTTPS and WebSocket forwarding, pairing isolation and voice
+      lifecycle against synthetic console and speech-engine processes.
+    category: functional
+    scopes: [pr]
+    timeout_s: 120
+    workdir: sdk
+    requires:
+      commands: [python3, openssl]
+    command: |
+      python3 application/native/humanoid_common/example/operator_service/test_voice_web.py

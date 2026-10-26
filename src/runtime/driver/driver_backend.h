@@ -18,6 +18,10 @@
 
 namespace driver_runtime {
 
+// EX_TEMPFAIL: initialization ended before the command loop was entered.
+// Launchers may retry this startup failure, never an ordinary runtime failure.
+constexpr int kHardwareInitUnavailable = 75;
+
 enum class BackendKind {
     MUJOCO,
     WHOLE_BODY,
@@ -41,7 +45,8 @@ public:
 BackendKind ParseBackendKind(const robot_base::YamlFile &yaml_file);
 BackendKind ParseBackendKind(const std::optional<std::string> &backend);
 bool BackendIsCompiled(BackendKind kind);
-std::unique_ptr<DriverBackend> CreateBackend(BackendKind kind, const std::string &yaml_path);
+std::unique_ptr<DriverBackend> CreateBackend(BackendKind kind, const std::string &yaml_path,
+    const std::string &scene_override = "");
 
 }  // namespace driver_runtime
 

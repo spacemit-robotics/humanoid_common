@@ -23,8 +23,10 @@
 #include "backends/whole_body_adapter.h"
 #include "backends/whole_body_diagnostics.h"
 #include "driver_backend.h"
+#include "latest_sample_worker.h"
 #include "runtime_logger.h"
 #include "runtime_timing.h"
+#include "snapshot_worker.h"
 #include "whole_body.h"
 
 namespace driver_runtime {
@@ -49,24 +51,36 @@ enum class FaultContext {
     kCommandAdapter,
 };
 
-void RecordDriverTiming(const runtime_timing::Summary &timing) {
+using DiagnosticsSnapshot = WholeBodyDiagnosticsSnapshot;
+
+struct DriverTimingSnapshot {
+    runtime_timing::Summary timing;
+    uint64_t dropped = 0;
+    bool failed = false;
+    double wall_time = 0;
+};
+
+void RecordDriverTiming(const runtime_timing::Summary &timing, uint64_t dropped, bool failed, double wall_time) {
     std::ostringstream row;
-    row << std::fixed << std::setprecision(6) << WallTime() << ","
+    row << std::fixed << std::setprecision(6) << wall_time << ","
         << timing.samples << "," << timing.period_p95_ms << ","
         << timing.period_p99_ms << "," << timing.period_max_ms << ","
         << timing.lateness_p95_ms << "," << timing.lateness_p99_ms << ","
-        << timing.lateness_max_ms << "," << timing.skipped_cycles;
+        << timing.lateness_max_ms << "," << timing.skipped_cycles << ","
+        << timing.read_mean_ms << "," << timing.read_max_ms << ","
+        << timing.work_mean_ms << "," << timing.work_max_ms << "," << dropped << "," << failed;
     runtime_logging::RecordCsv("driver_timing",
         "wall_time_s,samples,period_p95_ms,period_p99_ms,period_max_ms,"
-        "lateness_p95_ms,lateness_p99_ms,lateness_max_ms,skipped_cycles",
+        "lateness_p95_ms,lateness_p99_ms,lateness_max_ms,skipped_cycles,"
+        "read_mean_ms,read_max_ms,work_mean_ms,work_max_ms,telemetry_dropped,telemetry_failed",
         row.str());
 }
 
 class WholeBodyBackend final : public DriverBackend {
 public:
-    explicit WholeBodyBackend(const std::string &yaml_path) : yaml_path_(yaml_path) {
+    explicit WholeBodyBackend(const std::string &yaml_path) {
         const auto yaml_file = robot_base::YamlFile::Load(yaml_path);
-        fixed_base_ = yaml_file.Read<bool>("robot_base.fixed_base").value_or(false);
+        const bool fixed_base = yaml_file.Read<bool>("robot_base.fixed_base").value_or(false);
         state_template_ = robot_base::RobotData::FromYaml(yaml_path);
         const auto hardware_config = yaml_file.Read<std::string>("whole_body.config_file");
         if (hardware_config) {
@@ -76,17 +90,14 @@ public:
         if (whole_body_create(yaml_path.c_str(), &device_) != WHOLE_BODY_OK)
             throw std::runtime_error("failed to create whole_body from YAML");
         const int has_imu = whole_body_has_imu(device_);
-        if (has_imu < 0) {
+        if (has_imu < 0 || (has_imu == 0 && !fixed_base)) {
             whole_body_destroy(device_);
             device_ = nullptr;
-            throw std::runtime_error("failed to query whole_body IMU configuration");
+            throw std::runtime_error(has_imu < 0
+                ? "failed to query whole_body IMU configuration"
+                : "whole_body without IMU requires explicit robot_base.fixed_base: true");
         }
         imu_configured_ = has_imu != 0;
-        ValidateImuConfiguration();
-        if (!imu_configured_) {
-            runtime_logging::Log(runtime_logging::Level::kInfo,
-                "IMU not configured; base pose and motion are mathematical defaults, not measurements");
-        }
         if (whole_body_get_cycle_s(device_, &cycle_s_) != WHOLE_BODY_OK ||
             !std::isfinite(cycle_s_) || cycle_s_ <= 0.0) {
             whole_body_destroy(device_);
@@ -100,45 +111,28 @@ public:
     int Run(const PublishStateCallback &publish_state,
             const ReceiveCommandCallback &receive_command,
             const ContinueCallback &should_continue) override {
-        int init_result = whole_body_init(device_);
-        while (init_result != WHOLE_BODY_OK) {
+        const int init_result = whole_body_init(device_);
+        if (init_result != WHOLE_BODY_OK) {
             runtime_logging::Log(runtime_logging::Level::kError,
                 std::string("whole_body init failed: ") + whole_body_last_error(device_));
             if (!PublishFault(publish_state,
                     UpdateFault(init_result, FaultContext::kInitialization, nullptr, true))) {
                 return 1;
             }
-            if (init_result != WHOLE_BODY_ERR_DEVICE) return 1;
-            recovery_active_ = true;
-            await_power_off_ = true;
-            // A failed init can release peripheral handles. Recreate them, but
-            // keep the driver transport and operator connection alive.
-            whole_body_destroy(device_);
-            device_ = nullptr;
-            const auto retry_at = std::chrono::steady_clock::now() +
-                std::chrono::seconds(1);
-            while (should_continue() && std::chrono::steady_clock::now() < retry_at) {
-                (void)receive_command();
-                if (!PublishFault(publish_state, current_fault_)) return 1;
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-            if (!should_continue()) return 0;
-            if (whole_body_create(yaml_path_.c_str(), &device_) != WHOLE_BODY_OK) return 1;
-            const int has_imu = whole_body_has_imu(device_);
-            if (has_imu < 0) {
-                (void)PublishFault(publish_state,
-                    UpdateFault(has_imu, FaultContext::kInitialization, nullptr, true));
-                return 1;
-            }
-            imu_configured_ = has_imu != 0;
-            ValidateImuConfiguration();
-            init_result = whole_body_init(device_);
+            return init_result == WHOLE_BODY_ERR_DEVICE ? kHardwareInitUnavailable : 1;
         }
-        if (recovery_active_) (void)whole_body_set_mode(device_, WHOLE_BODY_MODE_SAFETY);
 
         const auto logging_config = runtime_logging::GetConfig();
         const bool monitor_enabled =
             logging_config.driver_monitor_enabled && isatty(STDOUT_FILENO);
+        runtime_logging::LatestSampleWorker<DiagnosticsSnapshot> diagnostics_worker(
+            [this](const DiagnosticsSnapshot &sample) {
+                if (sample.render) RenderWholeBodyDiagnostics(sample.feedback, cycle_s_, imu_configured_);
+                if (sample.record) {
+                    RecordWholeBodyDiagnostics(sample.feedback, sample.command, sample.wall_time, imu_configured_);
+                    RecordTransportDiagnostics(sample.transport, sample.wall_time);
+                }
+            });
         const auto monitor_period =
             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                 std::chrono::duration<double>(
@@ -160,11 +154,19 @@ public:
         int previous_read_result = WHOLE_BODY_OK;
         int previous_command_result = WHOLE_BODY_OK;
         int previous_tick_result = WHOLE_BODY_OK;
+        bool telemetry_motors_enabled = false;
+        runtime_logging::SnapshotWorker<DriverTimingSnapshot, 4> timing_worker(
+            [](const DriverTimingSnapshot &sample) {
+                RecordDriverTiming(sample.timing, sample.dropped, sample.failed, sample.wall_time);
+            });
         runtime_timing::Window timing_window(next_cycle);
-        auto hardware_retry_at = next_cycle;
-        auto wait_for_cycle = [&] {
+        robot_base::RobotData state = state_template_;
+        auto wait_for_cycle = [&](const auto &cycle_started, const auto &read_finished) {
             next_cycle += cycle;
             const auto finished_at = std::chrono::steady_clock::now();
+            timing_window.ObserveWork(
+                std::chrono::duration<double, std::milli>(read_finished - cycle_started).count(),
+                std::chrono::duration<double, std::milli>(finished_at - cycle_started).count());
             if (next_cycle <= finished_at) {
                 const auto behind = finished_at - next_cycle;
                 const uint64_t skipped = 1 + static_cast<uint64_t>(behind / cycle);
@@ -173,32 +175,34 @@ public:
             }
             if (timing_window.IsDue(finished_at, logging_config.timing_window_s)) {
                 const auto timing = timing_window.Consume(finished_at);
-                if (logging_config.telemetry_enabled) RecordDriverTiming(timing);
+                if (logging_config.telemetry_enabled)
+                    timing_worker.Publish({timing, diagnostics_worker.Dropped(), diagnostics_worker.Failed(), WallTime()});
             }
             std::this_thread::sleep_until(next_cycle);
         };
         while (should_continue()) {
             const auto cycle_started = std::chrono::steady_clock::now();
             timing_window.Observe(cycle_started, next_cycle);
-            // Drain even while offline: a queued motion command must never be
-            // replayed when motor power returns.
+            // Consume old motion commands even while waiting for hardware.
             const auto command = receive_command();
-            if (recovery_active_ && cycle_started < hardware_retry_at) {
-                if (!PublishFault(publish_state, current_fault_)) return 1;
-                wait_for_cycle();
-                continue;
-            }
+            if (command) telemetry_motors_enabled = command->enable;
             bool hardware_cycle_failed = false;
             whole_body_state hardware_state{};
             const int read_result = whole_body_read(device_, &hardware_state);
+            const auto read_finished = std::chrono::steady_clock::now();
             bool feedback_fault_active = false;
-            if (read_result == WHOLE_BODY_OK) {
+            if (read_result == WHOLE_BODY_OK || read_result == WHOLE_BODY_RETRY) {
                 RecoverFault(FaultContext::kRead);
-                if (previous_read_result != WHOLE_BODY_OK) {
+                if (read_result != previous_read_result) {
+                    if (read_result == WHOLE_BODY_RETRY)
+                        runtime_logging::TriggerSnapshot("temporary hardware feedback delay");
                     runtime_logging::Log(
-                        runtime_logging::Level::kInfo, "whole_body feedback recovered");
+                        read_result == WHOLE_BODY_RETRY
+                            ? runtime_logging::Level::kWarning : runtime_logging::Level::kInfo,
+                        read_result == WHOLE_BODY_RETRY
+                            ? "temporary feedback delay; retaining current motor state"
+                            : "whole_body feedback recovered");
                 }
-                robot_base::RobotData state;
                 if (!ConvertWholeBodyState(hardware_state, &state, imu_configured_)) {
                     hardware_cycle_failed = true;
                     runtime_logging::Log(runtime_logging::Level::kError,
@@ -236,15 +240,19 @@ public:
                             if (result != WHOLE_BODY_OK &&
                                 result != WHOLE_BODY_ERR_READ_ONLY &&
                                 result != previous_command_result) {
-                                runtime_logging::Log(runtime_logging::Level::kError,
-                                    std::string("whole_body command failed: ") +
+                                if (result == WHOLE_BODY_RETRY)
+                                    runtime_logging::TriggerSnapshot("temporary hardware command retry");
+                                runtime_logging::Log(result == WHOLE_BODY_RETRY
+                                        ? runtime_logging::Level::kWarning : runtime_logging::Level::kError,
+                                    std::string(result == WHOLE_BODY_RETRY
+                                        ? "whole_body command retry: " : "whole_body command failed: ") +
                                         whole_body_last_error(device_));
                             } else if (result == WHOLE_BODY_OK &&
                                 previous_command_result != WHOLE_BODY_OK) {
                                 runtime_logging::Log(runtime_logging::Level::kInfo,
                                     "whole_body command path recovered");
                             }
-                            if (result != WHOLE_BODY_OK &&
+                            if (result < WHOLE_BODY_OK &&
                                 result != WHOLE_BODY_ERR_READ_ONLY) {
                                 hardware_cycle_failed = result == WHOLE_BODY_ERR_DEVICE;
                                 whole_body_diagnostics_v2 diagnostics{};
@@ -254,7 +262,7 @@ public:
                                             &diagnostics, true))) {
                                     return 1;
                                 }
-                            } else {
+                            } else if (result == WHOLE_BODY_OK) {
                                 if (await_power_off_) {
                                     await_power_off_ = false;
                                     current_fault_ = {};
@@ -289,23 +297,29 @@ public:
             const auto sample_time = std::chrono::steady_clock::now();
             const bool render_due =
                 monitor_enabled && sample_time - last_monitor >= monitor_period;
+            const bool idle_telemetry = !telemetry_motors_enabled &&
+                logging_config.idle_rate_hz > 0.0 && !runtime_logging::HighRateRequested();
+            const double sample_period = idle_telemetry ? 1.0 / logging_config.idle_rate_hz :
+                std::chrono::duration<double>(telemetry_period).count();
             const bool telemetry_due = logging_config.telemetry_enabled &&
-                sample_time - last_telemetry >= telemetry_period;
+                std::chrono::duration<double>(sample_time - last_telemetry).count() >= sample_period;
             if (render_due || telemetry_due) {
-                whole_body_diagnostics_v2 diagnostics{};
-                if (whole_body_get_diagnostics_v2(device_, &diagnostics) == WHOLE_BODY_OK) {
+                DiagnosticsSnapshot snapshot;
+                snapshot.wall_time = WallTime();
+                if (whole_body_get_diagnostics_v2(device_, &snapshot.feedback) == WHOLE_BODY_OK) {
                     if (render_due) {
-                        RenderWholeBodyDiagnostics(diagnostics, cycle_s_, imu_configured_);
+                        snapshot.render = true;
                         last_monitor = sample_time;
                     }
                     if (telemetry_due) {
-                        whole_body_motor_command_diagnostics_v2 command_diagnostics{};
                         if (whole_body_get_motor_command_diagnostics_v2(
-                                device_, &command_diagnostics) == WHOLE_BODY_OK) {
-                            RecordWholeBodyDiagnostics(diagnostics, command_diagnostics, imu_configured_);
+                                device_, &snapshot.command) == WHOLE_BODY_OK) {
+                            (void)whole_body_get_transport_diagnostics(device_, &snapshot.transport);
+                            snapshot.record = true;
                         }
                         last_telemetry = sample_time;
                     }
+                    diagnostics_worker.Publish(snapshot);
                 }
             }
 
@@ -316,46 +330,42 @@ public:
                 ? WHOLE_BODY_OK : tick_result;
             if (reported_tick_result != WHOLE_BODY_OK &&
                 reported_tick_result != previous_tick_result) {
+                runtime_logging::TriggerSnapshot("hardware communication/tick fault");
                 runtime_logging::Log(
-                    reported_tick_result == WHOLE_BODY_ERR_TIMEOUT
+                    reported_tick_result == WHOLE_BODY_ERR_TIMEOUT || reported_tick_result == WHOLE_BODY_RETRY
                         ? runtime_logging::Level::kWarning
                         : runtime_logging::Level::kError,
-                    std::string("whole_body tick failed: ") +
+                    std::string(reported_tick_result == WHOLE_BODY_RETRY
+                        ? "whole_body tick retry: " : "whole_body tick failed: ") +
                         whole_body_last_error(device_));
             } else if (reported_tick_result == WHOLE_BODY_OK &&
                 previous_tick_result != WHOLE_BODY_OK) {
                 runtime_logging::Log(
                     runtime_logging::Level::kInfo, "whole_body tick recovered");
             }
-            if (reported_tick_result != WHOLE_BODY_OK) {
+            if (reported_tick_result < WHOLE_BODY_OK) {
                 whole_body_diagnostics_v2 diagnostics{};
                 (void)whole_body_get_diagnostics_v2(device_, &diagnostics);
                 const auto &fault = UpdateFault(
                     reported_tick_result, FaultContext::kTick, &diagnostics, true);
                 if (!PublishFault(publish_state, fault)) return 1;
-            } else if (!secondary_tick_timeout) {
+            } else if (reported_tick_result == WHOLE_BODY_OK && !secondary_tick_timeout) {
                 RecoverFault(FaultContext::kTick);
             }
             previous_tick_result = reported_tick_result;
-            if (tick_result != WHOLE_BODY_OK && tick_result != WHOLE_BODY_ERR_TIMEOUT &&
+            if (tick_result < WHOLE_BODY_OK && tick_result != WHOLE_BODY_ERR_TIMEOUT &&
                 tick_result != WHOLE_BODY_ERR_DEVICE)
                 return 1;
             if (hardware_cycle_failed || tick_result == WHOLE_BODY_ERR_DEVICE) {
                 if (!recovery_active_) {
-                    // Latch the whole_body gate even for a disabled-state write
-                    // failure; its Tick() error alone does not latch safety.
+                    // A disabled Tick() failure does not itself latch safety.
                     (void)whole_body_set_mode(device_, WHOLE_BODY_MODE_SAFETY);
                     runtime_logging::Log(runtime_logging::Level::kWarning,
                         "hardware unavailable; keeping operator access, retrying disabled state");
                 }
                 recovery_active_ = true;
                 await_power_off_ = true;
-                // Once a disable/query write succeeds, resume normal polling
-                // so request/reply motors can become fresh within the watchdog.
-                hardware_retry_at = std::chrono::steady_clock::now() +
-                    (tick_result == WHOLE_BODY_ERR_DEVICE
-                        ? std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                            std::chrono::milliseconds(100)) : cycle);
+                // Continue polling at the normal cycle, including while disabled.
             } else if (recovery_active_ && read_result == WHOLE_BODY_OK &&
                 tick_result == WHOLE_BODY_OK) {
                 recovery_active_ = false;
@@ -364,19 +374,12 @@ public:
                     "hardware communication recovered; motors remain disabled, "
                     "return to POWER_OFF and acknowledge the fault before enabling");
             }
-            wait_for_cycle();
+            wait_for_cycle(cycle_started, read_finished);
         }
         return 0;
     }
 
 private:
-    void ValidateImuConfiguration() {
-        if (imu_configured_ || fixed_base_) return;
-        whole_body_destroy(device_);
-        device_ = nullptr;
-        throw std::runtime_error(
-            "whole_body without IMU requires explicit robot_base.fixed_base: true");
-    }
 
     robot_base::FaultSource ClassifyFaultSource(
         FaultContext context, const whole_body_diagnostics_v2 *diagnostics) const {
@@ -478,12 +481,10 @@ private:
     }
 
     whole_body_dev *device_ = nullptr;
-    std::string yaml_path_;
+    bool imu_configured_ = true;
+    double cycle_s_ = 0.0;
     bool recovery_active_ = false;
     bool await_power_off_ = false;
-    bool imu_configured_ = true;
-    bool fixed_base_ = false;
-    double cycle_s_ = 0.0;
     robot_base::RobotData state_template_;
     std::optional<robot_base::RobotData> last_valid_state_;
     robot_base::FaultStatus current_fault_;

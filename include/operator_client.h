@@ -35,6 +35,7 @@ public:
     Reply RequestState(const std::string &state);
     Reply SelectPolicy(const std::string &policy);
     Reply SetVelocity(const Velocity &velocity, int valid_for_ms = 300);
+    Reply SetTeleopPreset(const std::string &preset);
     Reply Stop();
     Reply StartInteraction(const std::string &action);
     Reply CancelInteraction();

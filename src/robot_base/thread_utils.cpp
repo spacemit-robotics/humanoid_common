@@ -8,8 +8,13 @@
 
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
+#include <malloc.h>
 
 #include <iostream>
+#include <cerrno>
+#include <cstdlib>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -19,6 +24,46 @@
 namespace robot_base {
 
 namespace {
+
+std::vector<int> CurrentCpuAffinity() {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    std::vector<int> result;
+    if (pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) == 0) {
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (CPU_ISSET(cpu, &cpuset)) result.push_back(cpu);
+        }
+    }
+    return result;
+}
+
+// Captured before main applies any per-thread affinity; respects launch-time taskset/cpuset.
+const std::vector<int> kInitialCpuAffinity = CurrentCpuAffinity();
+
+void PrepareRealtimeMemory() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        // Keep reusable heap pages resident instead of repeatedly returning them
+        // to the kernel. Large allocations are served from retained arenas.
+        mallopt(M_TRIM_THRESHOLD, -1);
+        mallopt(M_MMAP_MAX, 0);
+        constexpr size_t kReserveBytes = 32 * 1024 * 1024;
+        auto *reserve = static_cast<volatile unsigned char *>(std::malloc(kReserveBytes));
+        if (reserve) {
+            for (size_t i = 0; i < kReserveBytes; i += 4096) reserve[i] = 0;
+            std::free(const_cast<unsigned char *>(reserve));
+        }
+        // ONFAULT avoids populating unused virtual arenas, while retaining all
+        // touched model/buffer pages and locking future allocations on access.
+        if (mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) == 0)
+            std::cout << "[ThreadLoop] realtime memory locked (on-fault), heap prewarmed\n";
+        else
+            std::cerr << "[ThreadLoop] realtime memory lock failed errno=" << errno
+                << "; check LimitMEMLOCK\n";
+    });
+    volatile unsigned char stack[256 * 1024];
+    for (size_t i = 0; i < sizeof(stack); i += 4096) stack[i] = 0;
+}
 
 int SchedPolicyFromString(const std::string &sched) {
     if (sched == "fifo")
@@ -58,15 +103,13 @@ void SetCpuAffinity(const std::string &name, const std::vector<int> &cpu_ids) {
 
 void SetSchedParam(const std::string &name, const std::string &sched, int priority) {
     int policy = SchedPolicyFromString(sched);
-    if (policy == SCHED_OTHER) {
-        return;  // 默认 CFS 调度器无需设置
-    }
     struct sched_param param;
-    param.sched_priority = priority;
+    param.sched_priority = policy == SCHED_OTHER ? 0 : priority;
     int ret = pthread_setschedparam(pthread_self(), policy, &param);
     if (ret != 0) {
         std::cerr << "[ThreadUtils] " << name << " 调度策略设置失败 (sched=" << sched
-                << ", priority=" << priority << ", errno=" << ret << ")，可能需要 root 权限"
+                << ", priority=" << priority << ", errno=" << ret
+                << ")，请检查配置和实时调度权限"
                 << std::endl;
     }
 }
@@ -94,10 +137,19 @@ ThreadLoop ThreadLoop::FromYaml(const YamlFile &yaml_file, const std::string &th
     }
     t.sched = yaml_file.Read<std::string>(prefix + ".sched").value_or("other");
     t.priority = yaml_file.Read<int>(prefix + ".priority").value_or(0);
+    t.lock_memory = yaml_file.Read<bool>(prefix + ".lock_memory").value_or(false);
     return t;
 }
 
+ThreadLoop ThreadLoop::Background(const std::string &thread_name) {
+    ThreadLoop config;
+    config.name = thread_name;
+    config.cpu_affinity = kInitialCpuAffinity;
+    return config;
+}
+
 void ThreadLoop::Apply() const {
+    if (lock_memory) PrepareRealtimeMemory();
     pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
     if (!cpu_affinity.empty()) {
         SetCpuAffinity(name, cpu_affinity);
@@ -108,8 +160,20 @@ void ThreadLoop::Apply() const {
 
     const std::string cpu_config = cpu_affinity.empty()
         ? std::to_string(cpu_id) : FormatCpuAffinity(cpu_affinity);
-    std::cout << "[ThreadLoop] 线程 " << name << " 配置完成 (cpu=" << cpu_config
-            << ", sched=" << sched << ", priority=" << priority << ")" << std::endl;
+    int actual_policy = 0;
+    sched_param actual{};
+    const int result = pthread_getschedparam(pthread_self(), &actual_policy, &actual);
+    if (result != 0) {
+        std::cerr << "[ThreadLoop] " << name << " 无法读取实际调度 (errno="
+            << result << ")\n";
+        return;
+    }
+    const char *actual_sched = actual_policy == SCHED_FIFO ? "fifo" :
+        (actual_policy == SCHED_RR ? "rr" : (actual_policy == SCHED_OTHER ? "other" : "other-policy"));
+    std::cout << "[ThreadLoop] " << name << " requested(cpu=" << cpu_config
+        << ",sched=" << sched << ",priority=" << priority << ") actual(cpus="
+        << FormatCpuAffinity(CurrentCpuAffinity()) << ",sched=" << actual_sched
+        << ",priority=" << actual.sched_priority << ")\n";
 }
 
 ThreadLoop::~ThreadLoop() {

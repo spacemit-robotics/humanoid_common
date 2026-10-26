@@ -59,7 +59,8 @@ boost::beast::http::response<boost::beast::http::string_body> Get(
 
 int main(int argc, char *argv[]) {
     assert(argc >= 3);
-    bool terminal_only = false;
+    const bool real_terminal = argc > 3 && std::string(argv[3]) == "--terminal-only";
+    bool terminal_only = real_terminal;
     bool trajectory = false;
     bool administrator = false;
     for (int i = 3; i < argc; ++i) {
@@ -73,6 +74,7 @@ int main(int argc, char *argv[]) {
     char directory[] = "/tmp/operator-download-XXXXXX";
     assert(mkdtemp(directory));
     const std::filesystem::path root(directory);
+    std::ofstream(root / "teleop.js") << "/* joystick fixture */";
     std::filesystem::create_directory(root / "downloads");
     const auto apk_path = root / "downloads/SpacemiT-Operator.apk";
     const std::string apk_data = "PK" + std::string(65536, 'x');
@@ -89,6 +91,15 @@ int main(int argc, char *argv[]) {
         config["catalog"] = "standalone_actions";
         std::ofstream(root / "actions.yaml") << "standalone_actions:\n"
             "  action_names: [wave]\n  actions:\n    wave: {display_name: Wave}\n";
+    }
+    if (argc > 3 && std::string(argv[3]) == "--paired") {
+        auto adapter = yaml["rl_policy"]["onnx_infer"]["policies"]["test_policy"]["policy_adapter"];
+        yaml["arm_actions"]["action_names"] = YAML::Clone(adapter["action_names"]);
+        yaml["arm_actions"]["actions"] = YAML::Clone(adapter["actions"]);
+        adapter.remove("action_names");
+        adapter.remove("actions");
+        adapter["type"] = "stance_motion";
+        adapter["joint_trajectory"]["catalog"] = "arm_actions";
     }
     yaml["operator_service"]["web_root"] = root.string();
     const auto config_path = (root / "config.yaml").string();
@@ -133,7 +144,10 @@ int main(int argc, char *argv[]) {
     assert(child >= 0);
     if (child == 0) {
         prctl(PR_SET_PDEATHSIG, SIGTERM);
-        execl(argv[1], argv[1], config_path.c_str(), terminal_only ? "--sim" : "--real", nullptr);
+        if (real_terminal)
+            execl(argv[1], argv[1], config_path.c_str(), "--real", "--terminal-only", nullptr);
+        else
+            execl(argv[1], argv[1], config_path.c_str(), terminal_only ? "--sim" : "--real", nullptr);
         _exit(127);
     }
     const auto file = operator_service::LoadConfig(config_path).connection_file;
@@ -170,6 +184,11 @@ int main(int argc, char *argv[]) {
         }
         assert(alice.AcquireControl().ok);
         assert(!bob.AcquireControl().ok);
+        assert(!bob.SetTeleopPreset("fast").ok);
+        assert(!alice.SetTeleopPreset("invalid").ok);
+        assert(alice.SetTeleopPreset("fast").ok);
+        assert(Wait([&] { return alice.LatestStatus().teleop_preset == "fast"; }));
+        assert(alice.SetTeleopPreset("slow").ok);
         for (const auto *target : {"DAMP", "HOME", "ZERO", active_state}) {
             assert(alice.RenewControl().ok);
             assert(alice.RequestState(target).ok);
@@ -187,11 +206,14 @@ int main(int argc, char *argv[]) {
         const std::string apk_url = "/downloads/SpacemiT-Operator.apk";
         if (terminal_only) {
             assert(alice.PairingUrl().empty());
-            for (const auto *path : {"/", "/app.js", "/api/v1/local-session", "/pairing.svg"})
+            for (const auto *path : {"/", "/app.js", "/teleop.js", "/api/v1/local-session", "/pairing.svg"})
                 assert(Get(pairing.port, path, host).result_int() == 404);
             assert(Get(pairing.port, apk_url, host).result_int() == 404);
         } else {
             namespace http = boost::beast::http;
+            const auto script = Get(pairing.port, "/teleop.js", host);
+            assert(script.result_int() == 200 && script.body() == "/* joystick fixture */");
+            assert(script[http::field::content_type] == "text/javascript");
             const auto header = Get(pairing.port, apk_url, host, "", http::verb::head);
             assert(header.result_int() == 200 && header.body().empty());
             assert(header[http::field::content_length] == std::to_string(apk_data.size()));

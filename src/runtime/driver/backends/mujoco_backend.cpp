@@ -24,14 +24,14 @@ namespace {
 
 class MujocoBackend final : public DriverBackend {
 public:
-    explicit MujocoBackend(const std::string &yaml_path) {
+    MujocoBackend(const std::string &yaml_path, const std::string &scene_override) {
         const auto yaml_file = robot_base::YamlFile::Load(yaml_path);
         const auto robot_name = yaml_file.Read<std::string>("robot_base.name").value();
         const int num_dof = yaml_file.Read<int>("robot_base.num_dof").value();
         const std::string robot_dir =
             yaml_file.ToAbsPath(yaml_file.Read<std::string>("robot_base.robot_dir").value());
-        const std::string scene =
-            yaml_file.Read<std::string>("simulation.mujoco.scene_xml").value_or("scene.xml");
+        const std::string scene = scene_override.empty() ?
+            yaml_file.Read<std::string>("simulation.mujoco.scene_xml").value_or("scene.xml") : scene_override;
         const std::string scene_path = robot_dir + "/resources/xml/" + scene;
         runtime_logging::RecordArtifact("simulation_model", "scene", scene_path);
         const auto default_joint_pos =
@@ -107,8 +107,8 @@ private:
 
 }  // namespace
 
-std::unique_ptr<DriverBackend> CreateMujocoBackend(const std::string &yaml_path) {
-    return std::make_unique<MujocoBackend>(yaml_path);
+std::unique_ptr<DriverBackend> CreateMujocoBackend(const std::string &yaml_path, const std::string &scene) {
+    return std::make_unique<MujocoBackend>(yaml_path, scene);
 }
 
 }  // namespace driver_runtime

@@ -132,6 +132,7 @@ cd ~/spacemit_robot
 - `behavior_manager.safety.max_roll / max_pitch / max_angular_velocity`：control 侧姿态和角速度安全门限，`0` 表示不启用对应门限
 - `behavior_manager.safety.release_duration_s`：反馈仍有效时 SAFETY 逐步卸力的时长，默认 1 秒；反馈无效时立即失能
 - `behavior_manager.rl_safety.first_action_timeout_s / max_action_age_s / inference_deadline_s`：RL 首帧等待、已发布 action 年龄和单次推理时限；也可在单个策略的 `runtime_safety` 下覆盖，`0` 表示不启用
+- `discard_late_inference: true` 丢弃超过推理期限的输出并等待最新观测，不立即锁故障；首帧及 action 年龄仍限制恢复总时长，默认关闭。
 
 **路径解析：** `robot_base.robot_dir` 相对于 YAML 文件；`model_path` 相对于 `robot_dir`。
 

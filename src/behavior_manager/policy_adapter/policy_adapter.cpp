@@ -9,6 +9,8 @@
 #include "policy_adapter.h"
 
 #include "joint_trajectory_policy_adapter.h"
+#include "stance_motion_policy_adapter.h"
+#include "history_actor_policy_adapter.h"
 
 #include <cnpy.h>
 
@@ -1356,12 +1358,77 @@ Config LoadConfig(const std::string &yaml_path,
     }
     if (type) {
         config.type = *type;
-        if (config.type == "joint_trajectory") {
+        if (config.type == "history_actor") {
+            config.history_actor = LoadHistoryActorConfig(yaml_path, adapter_base, robot_dir);
+            return config;
+        }
+        if (config.type == "stance_motion") {
+            config.stance_motion = LoadStanceMotionConfig(yaml_path, adapter_base, robot_dir);
+            if (!yaml.Read<std::string>(adapter_base + ".joint_trajectory.catalog")) return config;
+        }
+        if (config.type == "joint_trajectory" || config.type == "stance_motion") {
+            const std::string trajectory_base = config.type == "stance_motion"
+                ? adapter_base + ".joint_trajectory" : adapter_base;
+            const std::string catalog_base = yaml.Read<std::string>(
+                trajectory_base + ".catalog").value_or(trajectory_base);
             auto &trajectory = config.joint_trajectory;
-            static_cast<joint_trajectory::Config &>(trajectory) =
-                joint_trajectory::LoadConfig(yaml, adapter_base, robot_dir);
             trajectory.applied_action_term = yaml.Read<std::string>(
-                adapter_base + ".applied_action_term").value_or("applied_action");
+                trajectory_base + ".applied_action_term").value_or(
+                    config.type == "stance_motion" ? "" : "applied_action");
+            trajectory.blend_in_duration = yaml.Read<double>(
+                trajectory_base + ".blend_in_duration").value_or(
+                    yaml.Read<double>(catalog_base + ".blend_in_duration")
+                        .value_or(0.25));
+            trajectory.blend_out_duration = yaml.Read<double>(
+                trajectory_base + ".blend_out_duration").value_or(
+                    yaml.Read<double>(catalog_base + ".blend_out_duration")
+                        .value_or(0.25));
+            trajectory.measured_entry_max_velocity = yaml.Read<double>(
+                trajectory_base + ".measured_entry_max_velocity").value_or(
+                    yaml.Read<double>(catalog_base + ".measured_entry_max_velocity").value_or(0.0));
+            trajectory.linear_blend = yaml.Read<bool>(
+                trajectory_base + ".linear_blend").value_or(
+                    yaml.Read<bool>(catalog_base + ".linear_blend").value_or(false));
+            const double default_fps = yaml.Read<double>(
+                catalog_base + ".motion_fps").value_or(50.0);
+            const double default_speed = yaml.Read<double>(
+                catalog_base + ".playback_speed").value_or(1.0);
+            const bool default_hold = yaml.Read<bool>(
+                catalog_base + ".hold_last_frame").value_or(false);
+            const auto action_names = yaml.Read<std::vector<std::string>>(
+                catalog_base + ".action_names")
+                    .value_or(std::vector<std::string>{});
+            for (const auto &name : action_names) {
+                const std::string action_base =
+                    catalog_base + ".actions." + name;
+                JointTrajectoryActionConfig action;
+                action.name = name;
+                const auto file = yaml.Read<std::string>(
+                    action_base + ".file");
+                if (!file || file->empty()) {
+                    throw std::runtime_error(
+                        "[policy_adapter] 缺少 " + action_base + ".file");
+                }
+                action.file = ResolvePath(robot_dir, *file).string();
+                action.joint_indices = yaml.Read<std::vector<int>>(
+                    action_base + ".joint_indices")
+                        .value_or(std::vector<int>{});
+                action.motion_fps = yaml.Read<double>(
+                    action_base + ".motion_fps").value_or(default_fps);
+                action.playback_speed = yaml.Read<double>(
+                    action_base + ".playback_speed").value_or(default_speed);
+                action.hold_last_frame = yaml.Read<bool>(
+                    action_base + ".hold_last_frame").value_or(default_hold);
+                action.max_hold_duration = yaml.Read<double>(
+                    action_base + ".max_hold_duration").value_or(0.0);
+                for (const auto *key : {"kp", "kd"}) {
+                    auto &gains = std::string(key) == "kp" ? action.kp : action.kd;
+                    gains = yaml.Read<std::vector<double>>(action_base + "." + key).value_or(
+                        yaml.Read<std::vector<double>>(catalog_base + "." + key)
+                            .value_or(std::vector<double>{}));
+                }
+                trajectory.actions.push_back(std::move(action));
+            }
             return config;
         }
         config.motion_fps =
@@ -1503,6 +1570,12 @@ std::unique_ptr<PolicyAdapter> Create(
     const rl_policy::PolicyExecutorConfig &policy_config) {
     if (!config.Enabled()) {
         return nullptr;
+    }
+    if (config.type == "stance_motion") {
+        return CreateStanceMotionPolicyAdapter(config, policy_config);
+    }
+    if (config.type == "history_actor") {
+        return CreateHistoryActorPolicyAdapter(config, policy_config);
     }
     if (config.manual_start && config.type != "mjlab" &&
         config.type != "mjlab_tracking") {

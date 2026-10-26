@@ -8,9 +8,10 @@
   <link rel="icon" href="/assets/spacemit-logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/style.css">
   <script src="/vendor/lucide.min.js" defer></script>
+  <script src="/teleop.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
-<body data-view="control" data-mode="voice">
+<body data-view="control" data-mode="voice" data-input-mode="buttons">
   <header class="topbar">
     <a class="brand" href="/" aria-label="SpacemiT 机器人控制台"><img src="/assets/spacemit-logo.svg" alt="SpacemiT 进迭时空"></a>
     <span class="product-name">机器人控制台</span>
@@ -84,21 +85,52 @@
         </section>
       </div>
       <section class="motion" aria-label="移动控制">
-        <div class="section-heading"><h2><i data-lucide="move"></i>移动控制</h2><span id="motion-state">等待接管</span></div>
+        <div class="section-heading"><h2><i data-lucide="move"></i>移动控制</h2>
+          <div class="input-modes" role="group" aria-label="遥控布局">
+            <button data-input-mode="buttons" class="active" aria-pressed="true" title="按键遥控">按键</button>
+            <button data-input-mode="sticks" aria-pressed="false" title="横屏双摇杆">双摇杆</button>
+          </div>
+          <span id="motion-state">等待接管</span>
+        </div>
+        <div class="speed-modes" role="group" aria-label="速度模式">
+          <button data-speed-mode="slow" class="active" aria-pressed="true"><i data-lucide="footprints"></i>慢速</button>
+          <button data-speed-mode="fast" aria-pressed="false"><i data-lucide="zap"></i>快速</button>
+        </div>
+        <p id="speed-limits" class="speed-limits">等待策略限速</p>
         <div class="speed-settings">
           <label>前后 <span>m/s</span><input id="speed-vx" type="number" min="0" max="0" step="0.05" value="0.1"></label>
           <label>左右 <span>m/s</span><input id="speed-vy" type="number" min="0" max="0" step="0.05" value="0.1"></label>
           <label>转向 <span>rad/s</span><input id="speed-wz" type="number" min="0" max="0" step="0.1" value="0.2"></label>
         </div>
-        <div class="direction-pad">
-          <button data-motion="j" title="左转" aria-label="左转"><i data-lucide="rotate-ccw"></i></button>
-          <button data-motion="w" title="前进" aria-label="前进"><i data-lucide="arrow-up"></i></button>
-          <button data-motion="l" title="右转" aria-label="右转"><i data-lucide="rotate-cw"></i></button>
-          <button data-motion="a" title="左移" aria-label="左移"><i data-lucide="arrow-left"></i></button>
+        <div class="direction-pad" role="group" aria-label="方向控制">
+          <button id="direction-j" data-motion="j" title="左转 J" aria-label="左转"><i data-lucide="rotate-ccw"></i></button>
+          <button id="direction-w" data-motion="w" title="前进 W" aria-label="前进"><i data-lucide="arrow-up"></i></button>
+          <button id="direction-l" data-motion="l" title="右转 L" aria-label="右转"><i data-lucide="rotate-cw"></i></button>
+          <button id="direction-a" data-motion="a" title="左移 A" aria-label="左移"><i data-lucide="arrow-left"></i></button>
           <div class="pad-center"><i data-lucide="move"></i></div>
-          <button data-motion="d" title="右移" aria-label="右移"><i data-lucide="arrow-right"></i></button>
-          <span></span><button data-motion="s" title="后退" aria-label="后退"><i data-lucide="arrow-down"></i></button><span></span>
+          <button id="direction-d" data-motion="d" title="右移 D" aria-label="右移"><i data-lucide="arrow-right"></i></button>
+          <span></span><button id="direction-s" data-motion="s" title="后退 S" aria-label="后退"><i data-lucide="arrow-down"></i></button><span></span>
         </div>
+        <div class="dual-sticks" aria-label="双摇杆遥控">
+          <div class="stick-panel move-stick">
+            <p>前后 · 左右横移</p>
+            <div class="joystick" data-stick="move" role="group" aria-label="左摇杆：前后横移" aria-disabled="true">
+              <span class="stick-up">前</span><span class="stick-down">后</span>
+              <span class="stick-left">左移</span><span class="stick-right">右移</span>
+              <span class="joystick-knob"></span>
+            </div>
+          </div>
+          <div class="stick-panel turn-stick">
+            <p>左转 · 右转</p>
+            <div class="joystick" data-stick="turn" role="group" aria-label="右摇杆：转向" aria-disabled="true">
+              <span class="stick-left">左转</span><span class="stick-right">右转</span>
+              <span class="joystick-knob"></span>
+            </div>
+          </div>
+        </div>
+        <p class="motion-hint">按住移动 · 松手缓停 · W A S D / J L<br>快慢档填入速度预设，也可手动调整</p>
+        <p class="stick-hint">横持手机，双拇指操作<br>轻推慢走 · 推满到档位上限 · 松手回零</p>
+        <div class="commanded"><span>发送指令 · 前 / 左 / 转</span><output id="command-velocity">0.00 / 0.00 / 0.00</output></div>
         <div class="adopted"><span>实际采用 · 前 / 左 / 转</span><output id="velocity">0.00 / 0.00 / 0.00</output></div>
       </section>
     </div>

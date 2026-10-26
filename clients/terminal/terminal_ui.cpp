@@ -128,6 +128,11 @@ bool IsManualReferencePolicy(const UiState &state) {
     const auto *policy = ActivePolicy(state);
     return policy && policy->manual_reference;
 }
+std::string PolicyDisplayName(const UiState &state) {
+    const auto *policy = ActivePolicy(state);
+    if (!policy) return state.status.policy.empty() ? "(未加载)" : state.status.policy;
+    return policy->display_name.empty() ? policy->name : policy->display_name;
+}
 const std::vector<operator_service::Action> *ActiveInteractionActions(const UiState &state) {
     if (state.status.trajectory_enabled) return &state.actions;
     const auto *policy = ActivePolicy(state);
@@ -347,7 +352,7 @@ void RenderMainPage(const UiState &state) {
         printf("策略");
         ResetAttr();
         MoveTo(11, layout.content_left);
-        const std::string policy = state.status.policy.empty() ? "(未加载)" : state.status.policy;
+        const std::string policy = PolicyDisplayName(state).empty() ? "(未加载)" : PolicyDisplayName(state);
         SetFg(Color::MAGENTA);
         SetBold();
         printf("当前: %s", Fit(policy, layout.width - 28).c_str());
@@ -432,7 +437,9 @@ void RenderPolicySelectPage(const UiState &state) {
             } else {
                 printf("  ");
             }
-            printf("%-28s", Fit(state.policies[i].name, layout.width - 8).c_str());
+            const auto &policy = state.policies[i];
+            printf("%s", Fit(policy.display_name.empty() ? policy.name : policy.display_name,
+                layout.width - 8).c_str());
             ResetAttr();
         }
     }
@@ -447,7 +454,7 @@ void RenderPolicySelectPage(const UiState &state) {
     printf("↑/↓ 或 j/k 移动    Enter 确认    Esc/P 返回");
     MoveTo(operation_row + 3, layout.content_left);
     SetFg(Color::BRIGHT_YELLOW);
-    printf("仅真实状态为 POWER_OFF 或 DAMP 时允许切换");
+    printf("POWER_OFF/DAMP 可选策略；同一运行组可在 RL 站立后切换");
     ResetAttr();
 
     PrintLastAction(layout, operation_row + 5, state.last_action);
@@ -474,7 +481,7 @@ void RenderInteractionSelectPage(const UiState &state) {
     MoveTo(5, layout.content_left);
     SetDim();
     if (!state.status.trajectory_enabled)
-        printf("策略: %s    ", Fit(state.status.policy, layout.width - 28).c_str());
+        printf("策略: %s    ", Fit(PolicyDisplayName(state), layout.width - 28).c_str());
     printf("动作 %d/%d",
         count == 0 ? 0 : cursor + 1, count);
     ResetAttr();
@@ -556,7 +563,7 @@ void RenderVelocityPage(const UiState &state) {
 
     DrawBox(4, layout.left, layout.width, 5);
     MoveTo(5, layout.content_left);
-    const std::string policy = state.status.policy.empty() ? "-" : state.status.policy;
+    const std::string policy = PolicyDisplayName(state);
     printf("FSM: ");
     SetFg(ModeColor(state.status.state));
     SetBold();

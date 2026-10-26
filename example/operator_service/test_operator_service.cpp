@@ -180,7 +180,7 @@ void TestTrajectory() {
 }
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
     TestAdministrator();
     TestTrajectory();
     using operator_service::Config;
@@ -188,6 +188,30 @@ int main() {
     using operator_service::Encode;
     using operator_service::Json;
     using operator_service::Service;
+    if (argc > 1) {
+        const auto loaded = operator_service::LoadConfig(argv[1]);
+        assert(loaded.teleop.deadzone == 0.08);
+        assert(loaded.teleop.acceleration.vy == 0.7);
+        assert(loaded.teleop.deceleration.wz == 2.5);
+        assert(loaded.teleop.slow_limits->vx == 0.05);
+        assert(loaded.teleop.fast_limits->vx == 0.1);
+        const auto teleop = Service(loaded).Catalog().at("teleop");
+        assert(teleop.at("slow_limits").at("vy") == 0.04);
+        assert(teleop.at("fast_limits").at("wz") == 0.2);
+        assert(!loaded.policies.at(0).client_smoothing);
+        const auto policy = Service(loaded).Catalog().at("policies").at(0);
+        assert(!policy.at("client_smoothing").get<bool>());
+        assert(!operator_service::DecodePolicy(policy).client_smoothing);
+        assert(operator_service::DecodePolicy(policy).display_name == policy.at("name"));
+        auto labelled = policy;
+        labelled["display_name"] = "走跑运控";
+        assert(operator_service::DecodePolicy(labelled).display_name == "走跑运控");
+        labelled.erase("display_name");
+        assert(operator_service::DecodePolicy(labelled).display_name == policy.at("name"));
+        auto legacy = policy;
+        legacy.erase("client_smoothing");
+        assert(operator_service::DecodePolicy(legacy).client_smoothing);
+    }
     Config config;
     config.terminal_only = false;
     config.robot = "test";
@@ -198,12 +222,15 @@ int main() {
     config.request_timeout = 0.08;
     config.policies.push_back({"test_policy", true, {-0.1, -0.2, -0.3}, {0.1, 0.2, 0.3}, {{"wave", "Wave"}}});
     Service service(config);
+    assert(!service.Catalog().at("teleop").contains("slow_limits"));
+    assert(service.Catalog().at("policies").at(0).at("client_smoothing").get<bool>());
     const auto alice = service.Open(), bob = service.Open();
     uint64_t alice_id = 0, bob_id = 0;
     const auto call = [&](uint64_t session, uint64_t *id, const std::string &op, const Json &args = Json::object()) {
         return service.Handle(session, {{"v", 1}, {"id", ++*id}, {"op", op}, {"args", args}});
     };
     assert(!call(alice, &alice_id, "acquire")["ok"].get<bool>());
+    assert(!call(alice, &alice_id, "client_event", {{"event", "direction_down"}})["ok"].get<bool>());
     assert(!call(alice, &alice_id, "hello", {{"token", "wrong"}})["ok"].get<bool>());
     assert(call(alice, &alice_id, "hello", {{"token", config.token}, {"name", "alice"}})["ok"].get<bool>());
     assert(call(bob, &bob_id, "hello", {{"token", config.token}, {"name", "bob"}})["ok"].get<bool>());
@@ -222,6 +249,22 @@ int main() {
     update();
     assert(call(alice, &alice_id, "acquire")["ok"].get<bool>());
     assert(!call(bob, &bob_id, "acquire")["ok"].get<bool>());
+    assert(!call(bob, &bob_id, "client_event",
+        {{"event", "teleop_preset"}, {"detail", "fast"}})["ok"].get<bool>());
+    assert(call(alice, &alice_id, "client_event",
+        {{"event", "teleop_preset"}, {"detail", "fast"}})["ok"].get<bool>());
+    const auto preset = DecodeStatus(Encode(service.Snapshot(alice)));
+    assert(preset.teleop_preset == "fast" && preset.teleop_preset_sequence == 1);
+    assert(!call(alice, &alice_id, "client_event",
+        {{"event", "teleop_preset"}, {"detail", "other"}})["ok"].get<bool>());
+    assert(call(alice, &alice_id, "state", {{"state", "POWER_OFF"}})["ok"].get<bool>());
+    update();
+    assert(service.Command().key == -1);
+    assert(service.Snapshot(alice).request.phase == "accepted");
+    service.MarkCommandSent();
+    update();
+    assert(service.Command().key == 0);
+    assert(service.Snapshot(alice).request.phase == "completed");
     assert(call(alice, &alice_id, "state", {{"state", "DAMP"}})["ok"].get<bool>());
     assert(service.Command().key == 1);
     assert(service.Snapshot(alice).request.phase == "accepted");
@@ -245,6 +288,14 @@ int main() {
         call(alice, &alice_id, "velocity", {{"vx", 9}, {"vy", -9}, {"wz", 0}, {"valid_for_ms", 50}})["ok"].get<bool>());
     assert(service.Command().vx > 0.09F && service.Command().vx < 0.11F);
     assert(service.Command().vy < -0.19F);
+    assert(call(bob, &bob_id, "client_event", {{"event", "page_hidden"}})["ok"].get<bool>());
+    assert(call(alice, &alice_id, "client_event",
+        {{"event", "direction_down"}, {"detail", "w\n"}})["ok"].get<bool>());
+    assert(!call(alice, &alice_id, "client_event", {{"event", "unrecognized"}})["ok"].get<bool>());
+    assert(!call(alice, &alice_id, "client_event",
+        {{"event", "ui_error"}, {"detail", std::string(1025, 'x')}})["ok"].get<bool>());
+    assert(service.Command().vx > 0.09F && service.Command().vy < -0.19F);
+    assert(service.Snapshot(alice).owns_control);
     std::this_thread::sleep_for(std::chrono::milliseconds(55));
     update();
     service.Tick();
@@ -258,6 +309,8 @@ int main() {
     update();
     assert(service.Command().interaction.operation == robot_base::InteractionRequest::Operation::NONE);
     assert(service.Command().interaction.action.empty());
+    const auto interaction = DecodeStatus(Encode(service.Snapshot(alice)));
+    assert(interaction.interaction_accepted && interaction.interaction_sequence == status.interaction.sequence);
     assert(call(alice, &alice_id, "cancel")["ok"].get<bool>());
     service.Disconnect(alice);
     assert(service.Snapshot().request.phase == "cancelled");
@@ -279,6 +332,36 @@ int main() {
     assert(!service.Snapshot().online && service.Snapshot().owner.empty());
     assert(service.Command().key == 0 && service.Command().vx == 0);
     assert(DecodeStatus(Encode(service.Snapshot())).state == "RL");
+    {
+        Config live_config = config;
+        live_config.policies[0].switch_group = "compatible";
+        auto peer = live_config.policies[0];
+        peer.name = "peer";
+        live_config.policies.push_back(peer);
+        peer.name = "incompatible";
+        peer.switch_group.clear();
+        live_config.policies.push_back(peer);
+        Service live(live_config);
+        const auto session = live.Open();
+        uint64_t id = 0;
+        const auto request = [&](const std::string &op, const Json &args) {
+            return live.Handle(session, {{"v", 1}, {"id", ++id}, {"op", op}, {"args", args}});
+        };
+        assert(request("hello", {{"token", config.token}, {"name", "live"}})["ok"].get<bool>());
+        robot_base::ControlStatus running;
+        running.mode = robot_base::ControlMode::RL;
+        running.active_policy = "test_policy";
+        running.hmi_connected = true;
+        live.UpdateStatus(running, {});
+        live.UpdateStatus(running, {});
+        assert(request("acquire", Json::object())["ok"].get<bool>());
+        assert(!request("policy", {{"policy", "hidden"}})["ok"].get<bool>());
+        assert(!request("policy", {{"policy", "incompatible"}})["ok"].get<bool>());
+        assert(request("velocity", {{"vx", 0.1}, {"vy", 0.0}, {"wz", 0.0}})["ok"].get<bool>());
+        assert(request("policy", {{"policy", "peer"}})["ok"].get<bool>());
+        assert(live.Command().vx == 0 && live.Command().switch_policy == "peer");
+        assert(operator_service::DecodePolicy(live.Catalog()["policies"][0]).switch_group == "compatible");
+    }
     std::puts(
         "operator service tests passed: auth, stale cache, lease, readiness, limits, disconnect, stop, replay, QR");
 }

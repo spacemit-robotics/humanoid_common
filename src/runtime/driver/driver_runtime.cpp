@@ -31,6 +31,7 @@ void PrintUsage(const char *program, std::ostream &output) {
     output << "Options:\n";
     output << "  <config.yaml>  Robot configuration file\n";
     output << "  --backend     Override driver.backend for this process\n";
+    output << "  --scene FILE  MuJoCo scene under the robot resources/xml directory\n";
     output << "  -h, --help     Show this help\n";
 }
 
@@ -46,23 +47,31 @@ int main(int argc, char *argv[]) {
     std::unique_ptr<runtime_logging::Session> logging_session;
     try {
         std::optional<std::string> backend_override;
+        std::string scene_override;
         for (int i = 2; i < argc; ++i) {
+            if (std::string(argv[i]) == "--scene" && i + 1 < argc) {
+                if (!scene_override.empty()) throw std::runtime_error("scene specified more than once");
+                scene_override = argv[++i];
+                continue;
+            }
             if (std::string(argv[i]) != "--backend" || i + 1 >= argc)
                 throw std::runtime_error("expected --backend mujoco|whole_body");
             if (backend_override) throw std::runtime_error("backend specified more than once");
             backend_override = argv[++i];
         }
+        if (backend_override) (void)driver_runtime::ParseBackendKind(backend_override);
         const auto yaml_file = robot_base::YamlFile::Load(yaml_path);
         logging_session = std::make_unique<runtime_logging::Session>(
             yaml_file, yaml_path, "driver");
         robot_base::ThreadLoop::FromYaml(yaml_file, "driver_main").Apply();
 
-        const auto backend_setting = backend_override ? backend_override : yaml_file.Read<std::string>("driver.backend");
+        const auto backend_setting = backend_override ? backend_override :
+            yaml_file.Read<std::string>("driver.backend");
         const auto backend_kind = driver_runtime::ParseBackendKind(backend_setting);
         if (!driver_runtime::BackendIsCompiled(backend_kind)) {
             throw std::runtime_error("selected driver backend is unavailable in this build");
         }
-        auto backend = driver_runtime::CreateBackend(backend_kind, yaml_path);
+        auto backend = driver_runtime::CreateBackend(backend_kind, yaml_path, scene_override);
 
         auto transport = transport::CreateV2(yaml_path);
         if (!transport->Init(yaml_path, transport::Role::DRIVER))
@@ -71,6 +80,9 @@ int main(int argc, char *argv[]) {
         std::signal(SIGINT, OnSignal);
         std::signal(SIGTERM, OnSignal);
         runtime_logging::Log(runtime_logging::Level::kInfo, "driver runtime started");
+        runtime_logging::Log(runtime_logging::Level::kInfo,
+            std::string("effective driver backend: ") +
+                (backend_kind == driver_runtime::BackendKind::MUJOCO ? "mujoco" : "whole_body"));
 
         const auto publish_state = [&](const robot_base::RobotData &state,
                 const robot_base::FaultStatus &fault) {

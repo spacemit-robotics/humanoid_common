@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "behavior_state.h"  // 内部实现，位于 src/
+#include "joint_trajectory.h"
 #include "policy_adapter/policy_adapter.h"
 #include "robot_base.h"      // robot_base::ThreadLoop
 #include "rl_service.h"      // rl_policy::PolicyExecutorConfig
@@ -42,6 +43,7 @@ enum class RLRuntimeEventType {
     INFERENCE_FINISH,
     ACTION_PUBLISHED,
     ACTION_APPLIED,
+    INFERENCE_DISCARDED,
 };
 
 struct RLRuntimeEvent {
@@ -79,6 +81,7 @@ struct RLConfig {
     double first_action_timeout_s = 0.0;      // 首帧 action 最长等待时间，0 表示不启用
     double max_action_age_s = 0.0;            // 已发布 action 最大可用年龄，0 表示不启用
     double inference_deadline_s = 0.0;        // 单次推理 deadline，0 表示不启用
+    bool discard_late_inference = false;     // 丢弃过期结果，等待下一份最新观测
 
     // ---- 策略输入协议适配（可选；type 为空表示普通 RL 策略）----
     policy_adapter::Config policy_adapter;

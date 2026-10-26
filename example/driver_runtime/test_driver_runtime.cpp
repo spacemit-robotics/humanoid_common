@@ -209,7 +209,7 @@ void VerifyWholeBodyCommandConversion() {
 namespace driver_runtime {
 
 #ifdef HAS_MUJOCO_BACKEND
-std::unique_ptr<DriverBackend> CreateMujocoBackend(const std::string &) {
+std::unique_ptr<DriverBackend> CreateMujocoBackend(const std::string &, const std::string &) {
     return std::make_unique<StubBackend>();
 }
 #endif
@@ -249,6 +249,14 @@ int main(int argc, char *argv[]) {
 
         VerifyFactory(driver_runtime::BackendKind::MUJOCO);
         VerifyFactory(driver_runtime::BackendKind::WHOLE_BODY);
+        rejected = false;
+        try {
+            driver_runtime::CreateBackend(driver_runtime::BackendKind::WHOLE_BODY,
+                "unused.yaml", "scene_stairs.xml");
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        assert(rejected);
 #ifdef HAS_WHOLE_BODY_BACKEND
         VerifyWholeBodyStateConversion();
         VerifyWholeBodyCommandConversion();

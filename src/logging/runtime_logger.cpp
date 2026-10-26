@@ -10,11 +10,15 @@
 
 #include <fcntl.h>
 #include <spawn.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <cctype>
@@ -33,6 +37,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -41,6 +46,9 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <yaml-cpp/yaml.h>
+
+#include "log_storage.h"
 
 extern char **environ;
 
@@ -55,6 +63,24 @@ extern char **environ;
 namespace runtime_logging {
 namespace {
 
+std::atomic<uint64_t> formatter_drops{0};
+
+class FileLock {
+public:
+    explicit FileLock(const std::filesystem::path &path) {
+        fd_ = open(path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0660);
+        if (fd_ >= 0) (void)fchmod(fd_, 0660);
+        if (fd_ >= 0 && flock(fd_, LOCK_EX | LOCK_NB) != 0) {
+            close(fd_);
+            fd_ = -1;
+        }
+    }
+    ~FileLock() { if (fd_ >= 0) close(fd_); }
+    bool Locked() const { return fd_ >= 0; }
+private:
+    int fd_ = -1;
+};
+
 struct QueueItem {
     std::string stream;
     std::string header;
@@ -67,6 +93,10 @@ struct QueueItem {
     std::string artifact_kind;
     std::string artifact_name;
     std::string artifact_path;
+    bool emit_console = false;
+    bool console_error = false;
+    bool trigger = false;
+    double monotonic_s = 0.0;
 };
 
 struct FileState {
@@ -75,7 +105,21 @@ struct FileState {
     uint64_t bytes = 0;
     std::string header;
     bool csv = false;
+    bool opened_once = false;
+    std::chrono::steady_clock::time_point retry_after{};
 };
+
+double MonotonicSeconds() {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+std::string BootId() {
+    std::ifstream input("/proc/sys/kernel/random/boot_id");
+    std::string id;
+    input >> id;
+    return id;
+}
 
 std::string LevelName(Level level) {
     switch (level) {
@@ -138,8 +182,11 @@ std::string JsonEscape(const std::string &value) {
     output.reserve(value.size());
     for (char c : value) {
         if (c == '\\' || c == '"') output.push_back('\\');
-        if (c == '\n') {
-            output += "\\n";
+        if (static_cast<unsigned char>(c) < 0x20) {
+            constexpr char hex[] = "0123456789abcdef";
+            output += "\\u00";
+            output += hex[(static_cast<unsigned char>(c) >> 4) & 15];
+            output += hex[static_cast<unsigned char>(c) & 15];
         } else {
             output.push_back(c);
         }
@@ -430,10 +477,40 @@ public:
         config.max_files = std::clamp(
             yaml_file.Read<int>("logging.file.max_files").value_or(4),
             1, 32);
+        config.blackbox_enabled = yaml_file.Read<bool>("logging.blackbox.enabled").value_or(false);
+        config.policy_trace_enabled = yaml_file.Read<bool>("logging.telemetry.policy_enabled")
+            .value_or(config.level == Level::kDebug);
+        config.idle_rate_hz = ReadFiniteClamped(yaml_file,
+            "logging.telemetry.idle_rate_hz", 0.0, 0.0, 500.0);
+        config.continuous_rate_hz = ReadFiniteClamped(yaml_file,
+            "logging.telemetry.continuous_rate_hz", 2.0, 0.1, 500.0);
+        config.pre_trigger_s = ReadFiniteClamped(yaml_file,
+            "logging.blackbox.pre_trigger_s", 30.0, 0.0, 120.0);
+        config.post_trigger_s = ReadFiniteClamped(yaml_file,
+            "logging.blackbox.post_trigger_s", 10.0, 0.0, 120.0);
+        config.trigger_cooldown_s = ReadFiniteClamped(yaml_file,
+            "logging.blackbox.cooldown_s", 60.0, 0.0, 3600.0);
+        config.blackbox_memory_mb = std::clamp(
+            yaml_file.Read<int>("logging.blackbox.max_memory_mb").value_or(64), 1, 512);
+        config.queue_memory_mb = std::clamp(
+            yaml_file.Read<int>("logging.queue_memory_mb").value_or(16), 1, 128);
+        config.max_total_size_mb = std::clamp(
+            yaml_file.Read<int>("logging.storage.max_total_mb").value_or(0), 0, 1024 * 1024);
+        config.min_free_space_mb = std::clamp(
+            yaml_file.Read<int>("logging.storage.min_free_mb").value_or(0), 0, 1024 * 1024);
 
         const std::string configured_directory =
             yaml_file.Read<std::string>("logging.directory").value_or("log/humanoid");
         config.directory = yaml_file.ToAbsPath(configured_directory);
+        if (const char *override_directory = std::getenv("HUMANOID_LOG_DIRECTORY")) {
+            config.directory = override_directory;
+            if (config.directory.rfind("/dev/shm/", 0) == 0) {
+                config.max_total_size_mb = 128;
+                config.min_free_space_mb = 16;
+                config.max_file_size_mb = 4;
+                config.max_files = 2;
+            }
+        }
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -444,12 +521,27 @@ public:
             artifacts_stopped_ = false;
             initialized_ = true;
             dropped_.store(0);
+            high_rate_.store(false);
+            queue_bytes_ = 0;
+            last_trigger_ = capture_started_ = -1.0e9;
+            last_maintenance_ = last_health_ = 0.0;
+            seen_capture_.clear();
+            snapshot_pending_.store(false);
+            total_dropped_ = 0;
+            io_errors_ = 0;
+            formatter_drops.store(0);
         }
 
-        if (!config.file_enabled) return;
+        if (!config.file_enabled && !config.console_enabled) return;
         try {
+            if (!config.file_enabled) {
+                worker_ = std::thread(&Logger::Worker, this);
+                return;
+            }
             const std::string robot = Sanitize(
                 yaml_file.Read<std::string>("robot_base.name").value_or("robot"));
+            robot_ = robot;
+            boot_id_ = BootId();
             const std::string session_name = robot + "_" + component_ + "_" +
                 Timestamp("%Y%m%d_%H%M%S", false) + "_" + std::to_string(getpid());
             const std::filesystem::path base_directory(config.directory);
@@ -461,6 +553,8 @@ public:
                 session_directory_ = session.string();
             }
             WriteMetadata(robot);
+            storage_ = std::make_unique<LogStorage>(config.directory, session.string(), robot,
+                config.max_total_size_mb, config.min_free_space_mb);
             worker_ = std::thread(&Logger::Worker, this);
             artifact_worker_ = std::thread(&Logger::ArtifactWorker, this);
             WriteArtifact("config", "runtime_config", yaml_path_);
@@ -505,6 +599,13 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             files_.clear();
             queue_.clear();
+            ring_.clear();
+            csv_headers_.clear();
+            summary_times_.clear();
+            ring_bytes_ = 0;
+            queue_bytes_ = 0;
+            capture_.clear();
+            storage_.reset();
             artifact_queue_.clear();
             initialized_ = false;
             session_directory_.clear();
@@ -522,12 +623,11 @@ public:
         if (level < config.level) return;
         const std::string line = Timestamp("%Y-%m-%d %H:%M:%S", true) +
             " [" + component + "] [" + LevelName(level) + "] " + message;
-        if (emit_console && config.console_enabled) {
-            std::ostream &output =
-                level >= Level::kWarning ? std::cerr : std::cout;
-            output << line << "\n";
-        }
-        if (config.file_enabled) Enqueue({"events", "", line, false});
+        QueueItem item{"events", "", line, false};
+        item.emit_console = emit_console && config.console_enabled;
+        item.console_error = level >= Level::kWarning;
+        item.trigger = level >= Level::kError;
+        if (config.file_enabled || item.emit_console) Enqueue(std::move(item));
     }
 
     void WriteCsv(const std::string &stream, const std::string &header,
@@ -536,6 +636,13 @@ public:
         if (!config.telemetry_enabled) return;
         Enqueue({Sanitize(stream), header, row, true});
     }
+
+    void Trigger(const std::string &reason) {
+        QueueItem item{"events", "", "snapshot requested: " + reason.substr(0, 512), false};
+        item.trigger = true;
+        Enqueue(std::move(item));
+    }
+    bool HighRate() const { return high_rate_.load(std::memory_order_relaxed); }
 
     void WriteArtifact(const std::string &kind, const std::string &name,
         const std::string &path) {
@@ -571,48 +678,102 @@ private:
     ~Logger() { Shutdown(); }
 
     void Enqueue(QueueItem item) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!initialized_ || !config_.file_enabled || stopped_) return;
-        if (queue_.size() >= static_cast<size_t>(config_.queue_capacity)) {
-            ++dropped_;
+        item.monotonic_s = MonotonicSeconds();
+        // CSV callers are background formatters. Waiting for this short queue
+        // mutex cannot stall a realtime producer and avoids splitting paired rows.
+        std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
+        if (item.csv) lock.lock();
+        else lock.try_lock();
+        if (!lock.owns_lock()) {
+            if (!item.trigger || !PreserveCritical(item)) ++dropped_;
             return;
         }
+        if (!initialized_ || stopped_) return;
+        const size_t bytes = ItemBytes(item);
+        if (queue_.size() >= static_cast<size_t>(config_.queue_capacity) ||
+            queue_bytes_ + bytes > static_cast<size_t>(config_.queue_memory_mb) * 1024 * 1024) {
+            if (!item.trigger || !PreserveCritical(item)) ++dropped_;
+            return;
+        }
+        queue_bytes_ += bytes;
         queue_.push_back(std::move(item));
         condition_.notify_one();
     }
 
+    struct CriticalSlot {
+        std::atomic<int> state{0};  // 0 free, 1 producer owns, 2 ready, 3 consumer owns.
+        std::array<char, 4096> line{};
+        double monotonic_s = 0;
+        bool emit_console = false, console_error = false;
+    };
+
+    bool PreserveCritical(const QueueItem &item) {
+        for (auto &slot : critical_) {
+            int expected = 0;
+            if (!slot.state.compare_exchange_strong(expected, 1, std::memory_order_acquire)) continue;
+            const size_t length = std::min(item.line.size(), slot.line.size() - 1);
+            std::copy_n(item.line.data(), length, slot.line.data());
+            slot.line[length] = '\0';
+            slot.monotonic_s = item.monotonic_s;
+            slot.emit_console = item.emit_console;
+            slot.console_error = item.console_error;
+            slot.state.store(2, std::memory_order_release);
+            condition_.notify_one();
+            return true;
+        }
+        snapshot_pending_.store(true);
+        return false;
+    }
+
+    void DrainCritical() {
+        for (auto &slot : critical_) {
+            int expected = 2;
+            if (!slot.state.compare_exchange_strong(expected, 3, std::memory_order_acquire)) continue;
+            QueueItem item{"events", "", slot.line.data(), false};
+            item.monotonic_s = slot.monotonic_s;
+            item.emit_console = slot.emit_console;
+            item.console_error = slot.console_error;
+            item.trigger = true;
+            slot.state.store(0, std::memory_order_release);
+            try { WriteRecord(item); } catch (...) { ++dropped_; snapshot_pending_.store(true); }
+        }
+    }
+
     void Worker() {
+        robot_base::ThreadLoop::Background("log_writer").Apply();
+        (void)setpriority(PRIO_PROCESS, 0, 10);
+#ifdef SYS_ioprio_set
+        (void)syscall(SYS_ioprio_set, 1, 0, (3 << 13));  // Idle I/O class, this thread only.
+#endif
         for (;;) {
             QueueItem item;
+            bool have_item = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                condition_.wait(lock, [this]() { return stopped_ || !queue_.empty(); });
+                condition_.wait_for(lock, std::chrono::milliseconds(100),
+                    [this]() { return stopped_ || !queue_.empty(); });
                 if (queue_.empty() && stopped_) break;
-                item = std::move(queue_.front());
-                queue_.pop_front();
+                if (!queue_.empty()) {
+                    queue_bytes_ -= ItemBytes(queue_.front());
+                    item = std::move(queue_.front());
+                    queue_.pop_front();
+                    have_item = true;
+                }
             }
-            const uint64_t dropped = dropped_.exchange(0);
-            if (dropped > 0) {
-                WriteItem({"events", "",
-                    Timestamp("%Y-%m-%d %H:%M:%S", true) +
-                        " [" + component_ + "] [WARN] dropped " +
-                        std::to_string(dropped) + " log records",
-                    false});
-            }
-            WriteRecord(item);
+            try { Maintain(); } catch (...) { ++dropped_; }
+            if (!have_item) continue;
+            try { WriteRecord(item); } catch (...) { ++dropped_; }
         }
-        const uint64_t dropped = dropped_.exchange(0);
-        if (dropped > 0) {
-            WriteItem({"events", "",
-                Timestamp("%Y-%m-%d %H:%M:%S", true) +
-                    " [" + component_ + "] [WARN] dropped " +
-                    std::to_string(dropped) + " log records",
-                false});
-        }
-        for (auto &[name, file] : files_) file.stream.flush();
+        try {
+            DrainCritical();
+            FinishCapture();
+            WriteHealth();
+            for (auto &[name, file] : files_) file.stream.flush();
+        } catch (...) { /* Logging failures must never terminate the robot process. */ }
     }
 
     void ArtifactWorker() {
+        robot_base::ThreadLoop::Background("log_artifacts").Apply();
         for (;;) {
             QueueItem item;
             {
@@ -624,11 +785,21 @@ private:
                 item = std::move(artifact_queue_.front());
                 artifact_queue_.pop_front();
             }
-            Enqueue(BuildArtifactRecord(item));
+            try { Enqueue(BuildArtifactRecord(item)); } catch (...) { ++dropped_; }
         }
     }
 
     void WriteRecord(const QueueItem &item) {
+        if (item.trigger && config_.file_enabled && config_.blackbox_enabled) {
+            try { RequestCapture(item.line); } catch (...) { ++dropped_; }
+        }
+        if (item.emit_console) {
+            std::ostream &output = item.console_error ? std::cerr : std::cout;
+            // Launchers also consume this stream when stdout is a regular file.
+            // Flush on the background writer, never on the real-time caller.
+            output << item.line << std::endl;
+        }
+        if (!config_.file_enabled) return;
         if (item.csv) {
             std::string reason;
             if (!ValidateCsvItem(item, &reason)) {
@@ -640,7 +811,210 @@ private:
                 return;
             }
         }
-        WriteItem(item);
+        if (item.csv && config_.blackbox_enabled && item.stream != "artifacts" &&
+            item.stream.find("_inventory") == std::string::npos &&
+            item.stream.find("_timing") == std::string::npos) {
+            RecordTelemetry(item);
+        } else {
+            WriteItem(item);
+        }
+    }
+
+    static size_t ItemBytes(const QueueItem &item) {
+        return sizeof(item) + item.stream.capacity() + item.header.capacity() + item.line.capacity();
+    }
+
+    void RecordTelemetry(const QueueItem &item) {
+        csv_headers_[item.stream] = item.header;
+        QueueItem cached{item.stream, "", item.line, true};
+        cached.monotonic_s = item.monotonic_s;
+        ring_bytes_ += ItemBytes(cached);
+        ring_.push_back(std::move(cached));
+        while (!ring_.empty() && (ring_bytes_ >
+                static_cast<size_t>(config_.blackbox_memory_mb) * 1024 * 1024 ||
+                item.monotonic_s - ring_.front().monotonic_s > config_.pre_trigger_s)) {
+            ring_bytes_ -= ItemBytes(ring_.front());
+            ring_.pop_front();
+        }
+        if (!capture_.empty()) WriteCaptureItem(item);
+        // Rows from the same sampled frame (e.g. several buses) stay together.
+        const double sample = std::strtod(item.line.c_str(), nullptr);
+        auto &last = summary_times_[item.stream];
+        if (sample == last || sample < last || sample - last >= 1.0 / config_.continuous_rate_hz) {
+            last = sample;
+            WriteItem(item);
+        }
+    }
+
+    void RequestCapture(const std::string &reason) {
+        const double now = MonotonicSeconds();
+        if (now - last_trigger_ < config_.trigger_cooldown_s) return;
+        FileLock guard(std::filesystem::path(config_.directory) / ("." + robot_ + ".capture.lock"));
+        if (!guard.Locked()) { snapshot_pending_.store(true); return; }
+        last_trigger_ = now;
+        const std::string id = std::to_string(static_cast<uint64_t>(now * 1e9)) +
+            "_" + std::to_string(getpid());
+        const auto request = std::filesystem::path(config_.directory) / ("." + robot_ + ".capture.json");
+        // All processes reuse the first trigger in a burst, so their files share one incident ID.
+        if (!std::filesystem::is_symlink(request) && std::filesystem::is_regular_file(request) &&
+            std::filesystem::file_size(request) <= 4096) {
+            try {
+                const auto value = YAML::LoadFile(request.string());
+                const double age = now - value["monotonic_s"].as<double>();
+                if (value["boot_id"].as<std::string>() == boot_id_ && age >= 0 &&
+                    age < std::max(config_.post_trigger_s, config_.trigger_cooldown_s)) {
+                    StartCapture(value["id"].as<std::string>(), value["reason"].as<std::string>(),
+                        std::max(0.0, config_.post_trigger_s - age));
+                    return;
+                }
+            } catch (...) { /* Replace a malformed request. */ }
+        }
+        const auto temporary = request.string() + "." + std::to_string(getpid()) + ".tmp";
+        std::ofstream output(temporary);
+        output << "{\"id\":\"" << id << "\",\"boot_id\":\"" << boot_id_
+            << "\",\"monotonic_s\":" << std::setprecision(17) << now
+            << ",\"reason\":\"" << JsonEscape(reason.substr(0, 512)) << "\"}";
+        output.close();
+        if (output) std::filesystem::rename(temporary, request);
+        StartCapture(id, reason, config_.post_trigger_s);
+    }
+
+    void StartCapture(const std::string &id, const std::string &reason, double post_s) {
+        if (id == seen_capture_) return;
+        seen_capture_ = id;
+        const double now = MonotonicSeconds();
+        if (!capture_.empty()) return;  // Coalesce a fault storm into the current incident.
+        if (now - capture_started_ < config_.trigger_cooldown_s) return;
+        if (storage_ && !storage_->Allow(2048, false)) return;
+        while (!ring_.empty() && now - ring_.front().monotonic_s > config_.pre_trigger_s) {
+            ring_bytes_ -= ItemBytes(ring_.front());
+            ring_.pop_front();
+        }
+        capture_started_ = now;
+        capture_write_failed_ = false;
+        capture_deadline_ = now + std::clamp(post_s, 0.0, 120.0);
+        capture_ = "incident_" + Sanitize(id);
+        std::error_code error;
+        std::filesystem::create_directory(std::filesystem::path(session_directory_) / capture_, error);
+        if (error) { capture_.clear(); ++dropped_; return; }
+        std::ofstream metadata(std::filesystem::path(session_directory_) / capture_ / "trigger.json");
+        metadata << "{\"id\":\"" << JsonEscape(id) << "\",\"reason\":\""
+            << JsonEscape(reason) << "\",\"trigger_monotonic_s\":" << std::setprecision(17)
+            << now << ",\"buffer_records\":" << ring_.size()
+            << ",\"buffer_bytes\":" << ring_bytes_
+            << ",\"retained_seconds\":" << (ring_.empty() ? 0.0 : now - ring_.front().monotonic_s)
+            << "}";
+        metadata.close();
+        if (!metadata) { capture_write_failed_ = true; ++io_errors_; }
+        high_rate_.store(true);
+        for (const auto &item : ring_) WriteCaptureItem(item);
+        // Save the pre-trigger evidence now, not after the post-trigger window.
+        // This runs only on log_writer; realtime producers never wait for I/O.
+        SyncCapture();
+    }
+
+    void WriteCaptureItem(const QueueItem &item) {
+        QueueItem captured = item;
+        captured.header = csv_headers_[item.stream];
+        captured.stream = capture_ + "/" + item.stream;
+        WriteItem(captured);
+    }
+
+    static bool SyncPath(const std::filesystem::path &path, bool directory = false) {
+        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW |
+            (directory ? O_DIRECTORY : 0));
+        if (fd < 0) return false;
+        int result;
+        do { result = fsync(fd); } while (result < 0 && errno == EINTR);
+        const int closed = close(fd);
+        return result == 0 && closed == 0;
+    }
+
+    bool SyncCapture() {
+        last_capture_sync_ = MonotonicSeconds();
+        bool ok = true;
+        for (auto &[name, file] : files_) {
+            if (name.rfind(capture_ + "/", 0) != 0) continue;
+            file.stream.flush();
+            if (!file.stream.good()) { capture_write_failed_ = true; ok = false; }
+        }
+        const auto directory = std::filesystem::path(session_directory_) / capture_;
+        std::error_code error;
+        for (std::filesystem::directory_iterator it(directory, error), end; !error && it != end; it.increment(error)) {
+            if (it->is_regular_file(error) && !SyncPath(it->path())) ok = false;
+        }
+        if (error || !SyncPath(directory, true) ||
+            !SyncPath(session_directory_, true) || !SyncPath(config_.directory, true)) ok = false;
+        if (!ok) ++io_errors_;
+        return ok;
+    }
+
+    void FinishCapture() {
+        if (capture_.empty()) return;
+        const bool synced = SyncCapture() && !capture_write_failed_;
+        for (auto it = files_.begin(); it != files_.end();) {
+            if (it->first.rfind(capture_ + "/", 0) == 0) it = files_.erase(it);
+            else ++it;
+        }
+        if (synced) {
+            const auto directory = std::filesystem::path(session_directory_) / capture_;
+            const auto pending = directory / ".complete.pending";
+            std::ofstream complete(pending);
+            complete << "durable=1\nsuppressed_records=" << (storage_ ? storage_->Suppressed() : 0) << '\n';
+            complete << "dropped_records=" << total_dropped_ + dropped_.load()
+                << "\nformatter_drops=" << formatter_drops.load() << '\n';
+            complete.close();
+            std::error_code error;
+            if (complete && SyncPath(pending)) {
+                std::filesystem::rename(pending, directory / ".complete", error);
+                if (error || !SyncPath(directory, true)) {
+                    ++io_errors_;
+                    std::filesystem::remove(directory / ".complete", error);
+                }
+            } else { ++io_errors_; }
+        }
+        capture_.clear();
+        high_rate_.store(false);
+    }
+
+    void Maintain() {
+        DrainCritical();
+        const double now = MonotonicSeconds();
+        if (!capture_.empty() && now >= capture_deadline_) FinishCapture();
+        if (now - last_maintenance_ < 0.25) return;
+        last_maintenance_ = now;
+        if (!capture_.empty() && now - last_capture_sync_ >= 1.0) SyncCapture();
+        if (storage_) storage_->Refresh();
+        if (config_.file_enabled && now - last_health_ >= 5.0) {
+            last_health_ = now;
+            WriteHealth();
+        }
+        if (!config_.file_enabled || !config_.blackbox_enabled) return;
+        if (snapshot_pending_.exchange(false)) RequestCapture("fault trigger preserved after queue overflow");
+        const auto request = std::filesystem::path(config_.directory) / ("." + robot_ + ".capture.json");
+        std::error_code error;
+        if (std::filesystem::is_symlink(request, error) ||
+            !std::filesystem::is_regular_file(request, error) ||
+            std::filesystem::file_size(request, error) > 4096) return;
+        try {
+            const auto value = YAML::LoadFile(request.string());
+            const double time = value["monotonic_s"].as<double>();
+            if (value["boot_id"].as<std::string>() != boot_id_ || now - time > 2.0 || time > now) return;
+            StartCapture(value["id"].as<std::string>(), value["reason"].as<std::string>(),
+                value["post_s"].as<double>(config_.post_trigger_s));
+        } catch (...) { /* An invalid/stale request cannot affect the runtime. */ }
+    }
+
+    void WriteHealth() {
+        total_dropped_ += dropped_.exchange(0);
+        if (!config_.file_enabled || (storage_ && !storage_->Allow(512, true))) return;
+        std::ofstream health(std::filesystem::path(session_directory_) / "logger_health.json");
+        health << "{\"monotonic_s\":" << std::setprecision(17) << MonotonicSeconds()
+            << ",\"queue_drops\":" << total_dropped_
+            << ",\"formatter_drops\":" << formatter_drops.load()
+            << ",\"io_errors\":" << io_errors_
+            << ",\"storage_suppressed\":" << (storage_ ? storage_->Suppressed() : 0)
+            << ",\"ring_bytes\":" << ring_bytes_ << ",\"ring_records\":" << ring_.size() << "}";
     }
 
     bool ValidateCsvItem(const QueueItem &item, std::string *reason) const {
@@ -686,13 +1060,24 @@ private:
     }
 
     void WriteItem(const QueueItem &item) {
+        if (storage_ && !storage_->Allow(item.line.size() + item.header.size() + 2, !item.csv))
+            return;
         FileState &file = OpenFile(item);
-        if (!file.stream.is_open()) return;
+        if (!file.stream.is_open()) {
+            if (!capture_.empty() && item.stream.rfind(capture_ + "/", 0) == 0)
+                capture_write_failed_ = true;
+            return;
+        }
         const std::string line = item.line + "\n";
         const uint64_t limit =
             static_cast<uint64_t>(config_.max_file_size_mb) * 1024ULL * 1024ULL;
         if (file.bytes + line.size() > limit) {
             Rotate(item.stream, &file);
+        }
+        if (!file.stream.is_open()) {
+            if (!capture_.empty() && item.stream.rfind(capture_ + "/", 0) == 0)
+                capture_write_failed_ = true;
+            return;
         }
         file.stream << line;
         file.bytes += line.size();
@@ -702,6 +1087,13 @@ private:
             file.stream.flush();
             file.last_flush = now;
         }
+        if (!file.stream.good()) {
+            ++io_errors_;
+            if (!capture_.empty() && item.stream.rfind(capture_ + "/", 0) == 0)
+                capture_write_failed_ = true;
+            file.stream.close();
+            file.retry_after = now + std::chrono::seconds(1);
+        }
     }
 
     FileState &OpenFile(const QueueItem &item) {
@@ -710,8 +1102,9 @@ private:
         if (inserted) {
             file.header = item.header;
             file.csv = item.csv;
-            Open(item.stream, &file);
         }
+        if (!file.stream.is_open() && std::chrono::steady_clock::now() >= file.retry_after)
+            Open(item.stream, &file, file.opened_once);
         return file;
     }
 
@@ -722,18 +1115,26 @@ private:
         return std::filesystem::path(session_directory_) / filename;
     }
 
-    void Open(const std::string &stream, FileState *file) {
+    void Open(const std::string &stream, FileState *file, bool append = false) {
         const auto path = FilePath(stream, file->csv);
-        file->stream.open(path, std::ios::out | std::ios::trunc);
+        file->stream.clear();
+        file->stream.open(path, std::ios::out | (append ? std::ios::app : std::ios::trunc));
         file->bytes = 0;
         file->last_flush = std::chrono::steady_clock::now();
+        file->retry_after = file->last_flush + std::chrono::seconds(1);
+        if (!file->stream.is_open()) { ++io_errors_; return; }
+        file->opened_once = true;
+        std::error_code size_error;
+        if (append) file->bytes = std::filesystem::file_size(path, size_error);
+        if (size_error) file->bytes = 0;
         if (file->stream.is_open() && !PrepareLogFile(path)) {
             file->stream.close();
             std::error_code error;
-            std::filesystem::remove(path, error);
+            if (!append) std::filesystem::remove(path, error);
+            ++io_errors_;
             return;
         }
-        if (file->stream.is_open() && file->csv && !file->header.empty()) {
+        if (file->stream.is_open() && file->bytes == 0 && file->csv && !file->header.empty()) {
             file->stream << file->header << "\n";
             file->bytes = file->header.size() + 1;
         }
@@ -779,6 +1180,9 @@ private:
             << "  \"robot\": \"" << JsonEscape(robot) << "\",\n"
             << "  \"component\": \"" << JsonEscape(component_) << "\",\n"
             << "  \"pid\": " << getpid() << ",\n"
+            << "  \"boot_id\": \"" << boot_id_ << "\",\n"
+            << "  \"started_monotonic_s\": " << std::setprecision(17)
+            << MonotonicSeconds() << ",\n"
             << "  \"started_at\": \"" << Timestamp("%Y-%m-%dT%H:%M:%S", false)
             << "\",\n"
             << "  \"config_path\": \"" << JsonEscape(yaml_path_) << "\",\n"
@@ -805,6 +1209,22 @@ private:
     std::thread worker_;
     std::thread artifact_worker_;
     std::atomic<uint64_t> dropped_{0};
+    std::atomic<bool> high_rate_{false};
+    std::atomic<bool> snapshot_pending_{false};
+    std::array<CriticalSlot, 8> critical_;
+    uint64_t total_dropped_ = 0;
+    uint64_t io_errors_ = 0;
+    double last_health_ = 0.0;
+    size_t queue_bytes_ = 0, ring_bytes_ = 0;
+    std::deque<QueueItem> ring_;
+    std::map<std::string, std::string> csv_headers_;
+    std::map<std::string, double> summary_times_;
+    std::unique_ptr<LogStorage> storage_;
+    std::string robot_, boot_id_, capture_, seen_capture_;
+    double capture_deadline_ = 0.0, capture_started_ = -3600.0;
+    double last_capture_sync_ = 0.0;
+    bool capture_write_failed_ = false;
+    double last_trigger_ = -3600.0, last_maintenance_ = 0.0;
     Config config_;
     std::string component_ = "runtime";
     std::string yaml_path_;
@@ -830,6 +1250,10 @@ Session::~Session() {
 void Log(Level level, const std::string &message, bool emit_console) {
     Logger::Instance().WriteLog(level, message, emit_console);
 }
+
+void TriggerSnapshot(const std::string &reason) { Logger::Instance().Trigger(reason); }
+bool HighRateRequested() { return Logger::Instance().HighRate(); }
+void ReportTelemetryDrop() { formatter_drops.fetch_add(1, std::memory_order_relaxed); }
 
 void RecordCsv(
     const std::string &stream, const std::string &header, const std::string &row) {

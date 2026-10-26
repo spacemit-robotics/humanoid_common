@@ -44,6 +44,26 @@ void FSM::ReplaceState(StateName name, std::unique_ptr<State> state) {
     }
 }
 
+std::unique_ptr<State> FSM::ReplaceStateDeferred(StateName name, std::unique_ptr<State> state) {
+    state->name = name;
+    state->sensor_ = sensor_;
+    state->command_ = command_;
+    state->output_ = output_;
+    const bool active = current_ && name == current_name_;
+    if (active) current_->SuspendForReplacement();
+    auto retired = std::move(states_[name]);
+    states_[name] = std::move(state);
+    if (active) {
+        current_ = states_[name].get();
+        current_->OnEnter();
+    }
+    return retired;
+}
+
+bool FSM::ReadyForPolicySwitch() const {
+    return current_ && current_->ReadyForPolicySwitch();
+}
+
 void FSM::SetDataPointers(robot_base::RobotData *sensor,
                         robot_base::Command *cmd,
                         ControlOutput *output) {

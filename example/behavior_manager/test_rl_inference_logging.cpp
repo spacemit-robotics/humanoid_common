@@ -20,6 +20,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <yaml-cpp/yaml.h>
 
 #include "behavior_fsm.h"
 #include "rl_test_model.h"
@@ -125,12 +126,20 @@ public:
     void OnRuntimeInitialized(const rl_policy::InferenceRuntimeInfo &) override {}
 
     void OnRuntimeEvent(const RLRuntimeEvent &event) noexcept override {
+        if (event.type == RLRuntimeEventType::INFERENCE_START) {
+            const int delay = delay_ms.exchange(0);
+            if (delay > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        }
         if (event.type == RLRuntimeEventType::ACTION_PUBLISHED) {
             published.fetch_add(1, std::memory_order_release);
         }
+        if (event.type == RLRuntimeEventType::INFERENCE_DISCARDED)
+            discarded.fetch_add(1, std::memory_order_release);
     }
 
     std::atomic<int> published{0};
+    std::atomic<int> discarded{0};
+    std::atomic<int> delay_ms{0};
 };
 
 void CheckCsv(const fs::path &path, bool timeout) {
@@ -176,13 +185,15 @@ void CheckCsv(const fs::path &path, bool timeout) {
         "failed frame action payload is missing");
 }
 
-void TestLogging(bool timeout, bool debug) {
+void TestLogging(bool timeout, bool debug, bool retry = false) {
     const Fixture fixture;
     const auto yaml_path = fixture.WriteConfig(debug);
     auto config = behavior_manager::LoadRLStateConfig(
         yaml_path.string(), "probe", fixture.Directory().string());
     // A one-nanosecond budget deterministically rejects a completed inference.
     config.inference_deadline_s = timeout ? 1.0e-9 : 0.0;
+    config.discard_late_inference = retry;
+    config.first_action_timeout_s = config.max_action_age_s = 0.2;
     Observer observer;
     config.runtime_observer = &observer;
     fs::path log_directory;
@@ -212,11 +223,21 @@ void TestLogging(bool timeout, bool debug) {
         rl_state->Run(0.02F, 0.02F);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         while (!rl_state->CurrentFault().latched && observer.published.load() == 0 &&
+                observer.discarded.load() == 0 &&
                 std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         const auto fault = rl_state->CurrentFault();
-        if (timeout) {
+        if (retry) {
+            Require(!fault.latched && observer.discarded.load() == 1,
+                "late inference did not leave the controller waiting for fresh input");
+            Require(observer.published.load() == 0 && !output.enable,
+                "late inference was incorrectly published");
+            Require(rl_state->CheckTransition() == StateName::RL, "retry entered safety");
+            std::this_thread::sleep_for(std::chrono::milliseconds(210));
+            rl_state->Run(0.001F, 0.02F);
+            Require(rl_state->CurrentFault().latched, "retry bypassed the first-action deadline");
+        } else if (timeout) {
             Require(fault.latched && fault.code == robot_base::FaultCode::INFERENCE_TIMEOUT,
                 "expected inference timeout was not latched");
             Require(rl_state->CheckTransition() == StateName::SAFETY,
@@ -233,13 +254,23 @@ void TestLogging(bool timeout, bool debug) {
     }
     if (debug) {
         CheckCsv(log_directory / "control_policy_probe.csv", timeout);
+        const auto progress = ReadText(log_directory / "control_inference_progress_probe.csv");
+        const auto health = YAML::LoadFile((log_directory / "logger_health.json").string());
+        const bool snapshot_dropped = health["formatter_drops"].as<int>() > 0;
+        for (const char *stage : {",release,", ",start,", ",prepare_done,", ",obs_done,", ",model_done,", ",finish,"})
+            Require(progress.find(stage) != std::string::npos || snapshot_dropped,
+                std::string("missing progress without accounted queue drop: ") + stage);
+        Require(progress.find("voluntary_switches,involuntary_switches") != std::string::npos,
+            "scheduler counters missing from inference progress");
+        if (retry) Require(progress.find(",discarded,") != std::string::npos || snapshot_dropped,
+            "discard stage missing without accounted queue drop");
         Require(fs::exists(log_directory / "control_policy_apply_probe.csv") == !timeout,
             "incorrect applied-action trace for rejected inference");
     } else {
         Require(!fs::exists(log_directory / "control_policy_probe.csv"),
             "debug trace was emitted with telemetry disabled");
     }
-    if (timeout) {
+    if (timeout && !retry) {
         const auto events = ReadText(log_directory / "events.log");
         for (const auto *field : {"RL inference missed its release-to-finish deadline",
                 "policy=\"probe\"", "release_sequence=1", "total_ms=", "deadline_ms=",
@@ -252,6 +283,55 @@ void TestLogging(bool timeout, bool debug) {
     }
 }
 
+void TestDelayedInferenceRecovery() {
+    const Fixture fixture;
+    const auto yaml_path = fixture.WriteConfig(true);
+    auto config = behavior_manager::LoadRLStateConfig(yaml_path.string(), "probe", fixture.Directory().string());
+    config.inference_deadline_s = 0.05;
+    config.first_action_timeout_s = config.max_action_age_s = 0.2;
+    config.discard_late_inference = true;
+    Observer observer;
+    config.runtime_observer = &observer;
+    const auto yaml = robot_base::YamlFile::Load(yaml_path.string());
+    runtime_logging::Session logging(yaml, yaml_path.string(), "control", false);
+    auto sensor = robot_base::RobotData::Create(3);
+    sensor.base_quat = {1, 0, 0, 0};
+    sensor.gyro = {0.2, -0.1, 0.3};
+    robot_base::Command command;
+    behavior_manager::ControlOutput output;
+    behavior_manager::FSM fsm;
+    auto state = behavior_manager::CreateStateRl(config);
+    auto *rl_state = state.get();
+    fsm.AddState(StateName::POWER_OFF, behavior_manager::CreateStatePowerOff());
+    fsm.AddState(StateName::RL, std::move(state));
+    fsm.SetDataPointers(&sensor, &command, &output);
+    fsm.Init();
+    fsm.ForceSwitch(StateName::RL, "bounded recovery test");
+    rl_state->Run(0.02F, 0.02F);
+    const auto ready = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!observer.published.load() && std::chrono::steady_clock::now() < ready)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    Require(observer.published.load() == 1, "first action did not arrive");
+    rl_state->Run(0.001F, 0.02F);
+    const auto held_target = output.target_pos;
+    observer.delay_ms.store(120);
+    rl_state->Run(0.02F, 0.02F);
+    const auto recovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (observer.published.load() < 2 && std::chrono::steady_clock::now() < recovery_deadline) {
+        rl_state->Run(0.002F, 0.02F);
+        Require(!rl_state->CurrentFault().latched && output.enable && output.target_pos == held_target,
+            "120 ms inference pause disabled control or changed the held target");
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    Require(observer.published.load() >= 2 && observer.discarded.load() >= 1,
+        "late inference was not discarded and replaced by a fresh result");
+    // Stop releasing new observations; the bounded hold must still expire.
+    std::this_thread::sleep_for(std::chrono::milliseconds(220));
+    rl_state->Run(0.001F, 0.02F);
+    Require(rl_state->CurrentFault().latched, "action hold exceeded the 200 ms lease");
+    fsm.ForceSwitch(StateName::POWER_OFF, "bounded recovery test complete");
+}
+
 }  // namespace
 
 int main() {
@@ -259,6 +339,8 @@ int main() {
         TestLogging(false, true);
         TestLogging(true, true);
         TestLogging(true, false);
+        TestLogging(true, true, true);
+        TestDelayedInferenceRecovery();
         std::cout << "StateRL inference logging regression passed\n";
         return 0;
     } catch (const std::exception &error) {

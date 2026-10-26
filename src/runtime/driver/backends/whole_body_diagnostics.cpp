@@ -62,11 +62,6 @@ const char *HealthName(whole_body_health_state state) {
     return "未知";
 }
 
-double WallTimeSeconds() {
-    return std::chrono::duration<double>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-}
-
 std::array<double, 3> ImuRpy(const whole_body_imu_diagnostic_v2 &imu) {
     std::array<double, 4> quaternion = {
         imu.quaternion[0], imu.quaternion[1], imu.quaternion[2], imu.quaternion[3]};
@@ -376,9 +371,36 @@ void RenderWholeBodyDiagnostics(
     std::cout << output.str() << std::flush;
 }
 
+void RecordTransportDiagnostics(const whole_body_transport_diagnostics &diagnostics,
+    double wall_time_s) {
+    for (uint32_t i = 0; i < diagnostics.bus_count; ++i) {
+        const auto &bus = diagnostics.buses[i];
+        const auto &d = bus.transport;
+        std::ostringstream row;
+        row << std::fixed << std::setprecision(9) << wall_time_s << ',' << bus.name
+            << ',' << bus.device << ',' << d.rx_bytes << ',' << d.tx_bytes
+            << ',' << d.valid_frames << ',' << d.crc_errors << ',' << d.decode_errors
+            << ',' << d.resync_discarded_bytes << ',' << d.unknown_id_frames
+            << ',' << d.read_errors << ',' << d.write_errors << ',' << d.poll_errors
+            << ',' << d.transactions << ',' << d.timeouts << ',' << d.last_rx_us
+            << ',' << d.last_failure_us << ',' << d.failure_elapsed_us
+            << ',' << d.failure_deadline_late_us << ',' << d.failure_rx_bytes
+            << ',' << d.failure_valid_frames << ',' << d.failure_crc_errors
+            << ',' << d.failure_expected_bytes << ',' << d.failure_sent_bytes
+            << ',' << d.failure_missing_ids << ',' << d.failure_errno;
+        runtime_logging::RecordCsv("driver_bus",
+            "wall_time_s,bus,device,rx_bytes,tx_bytes,valid_frames,crc_errors,decode_errors,"
+            "resync_discarded_bytes,unknown_id_frames,read_errors,write_errors,poll_errors,"
+            "transactions,timeouts,last_rx_us,last_failure_us,failure_elapsed_us,"
+            "failure_deadline_late_us,failure_rx_bytes,failure_valid_frames,failure_crc_errors,"
+            "failure_expected_bytes,failure_sent_bytes,failure_missing_ids,failure_errno",
+            row.str());
+    }
+}
+
 void RecordWholeBodyDiagnostics(const whole_body_diagnostics_v2 &diagnostics,
-    const whole_body_motor_command_diagnostics_v2 &command_diagnostics, bool imu_configured) {
-    const double wall_time = WallTimeSeconds();
+    const whole_body_motor_command_diagnostics_v2 &command_diagnostics, double wall_time,
+    bool imu_configured) {
 
     static bool inventory_recorded = false;
     if (!inventory_recorded) {

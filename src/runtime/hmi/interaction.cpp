@@ -22,12 +22,12 @@ InteractionActionMap LoadInteractionActions(
             "rl_policy.onnx_infer.policies." + policy + ".policy_adapter";
         const std::string type = yaml.Read<std::string>(
             adapter_base + ".type").value_or("");
-        if (type != "joint_trajectory" && type != "sonic") {
+        if (type != "joint_trajectory" && type != "sonic" && type != "stance_motion") {
             continue;
         }
         const auto configured_catalog = yaml.Read<std::string>(
-            adapter_base + ".catalog");
-        if (type == "sonic" &&
+            adapter_base + (type == "stance_motion" ? ".joint_trajectory.catalog" : ".catalog"));
+        if (type != "joint_trajectory" &&
             (!configured_catalog || configured_catalog->empty())) {
             continue;
         }

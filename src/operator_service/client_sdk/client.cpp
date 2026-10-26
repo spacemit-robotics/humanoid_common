@@ -266,6 +266,9 @@ Reply Client::SetVelocity(const Velocity &v, int ttl) {
     args["valid_for_ms"] = ttl;
     return DecodeReply(impl_->Call("velocity", args));
 }
+Reply Client::SetTeleopPreset(const std::string &preset) {
+    return DecodeReply(impl_->Call("client_event", {{"event", "teleop_preset"}, {"detail", preset}}));
+}
 Reply Client::Stop() { return DecodeReply(impl_->Call("stop")); }
 Reply Client::StartInteraction(const std::string &s) {
     return DecodeReply(impl_->Call("interaction", {{"action", s}}));

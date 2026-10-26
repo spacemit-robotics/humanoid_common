@@ -50,6 +50,7 @@ Config LoadConfig(const robot_base::YamlFile &yaml, const std::string &base,
         .value_or(catalog.Read<double>(key + ".blend_in_duration").value_or(0.25));
     result.blend_out_duration = yaml.Read<double>(base + ".blend_out_duration")
         .value_or(catalog.Read<double>(key + ".blend_out_duration").value_or(0.25));
+    result.return_max_velocity = yaml.Read<double>(base + ".return_max_velocity").value_or(0.0);
     const double fps = catalog.Read<double>(key + ".motion_fps").value_or(50.0);
     const double speed = catalog.Read<double>(key + ".playback_speed").value_or(1.0);
     const bool hold = catalog.Read<bool>(key + ".hold_last_frame").value_or(false);
@@ -112,13 +113,15 @@ struct Player::Impl {
     std::vector<double> source;
     double phase_start = 0.0;
     double playback_start = 0.0;
+    double return_duration = -1.0;
     uint64_t sequence = 0;
     robot_base::InteractionStatus status;
 
     Impl(const Config &input, int count) : config(input), num_dof(count) {
         if (count <= 0 || !config.Enabled() || !std::isfinite(config.blend_in_duration) ||
             config.blend_in_duration < 0.0 || !std::isfinite(config.blend_out_duration) ||
-            config.blend_out_duration < 0.0) throw std::runtime_error("joint_trajectory: invalid config");
+            config.blend_out_duration < 0.0 || !std::isfinite(config.return_max_velocity) ||
+            config.return_max_velocity < 0.0) throw std::runtime_error("joint_trajectory: invalid config");
         for (const auto &action : config.actions) {
             if (action.name.empty() || action.file.empty() || action.joint_indices.empty() ||
                 names.count(action.name) || !std::isfinite(action.motion_fps) || action.motion_fps <= 0.0 ||
@@ -178,8 +181,10 @@ void Player::Request(const robot_base::InteractionRequest &request, double elaps
     if (request.operation == Operation::CANCEL) {
         p.status.request_accepted = true;
         if (p.active) {
+            if (p.status.phase == Phase::BLEND_OUT) return;
             p.CaptureSource();
             p.phase_start = elapsed_s;
+            p.return_duration = -1.0;
             p.status.phase = Phase::BLEND_OUT;
             p.status.progress = 1.0F;
         } else {
@@ -236,13 +241,28 @@ void Player::Apply(double elapsed_s, std::vector<double> &position) {
                 } else {
                     p.status.phase = Phase::BLEND_OUT;
                     p.phase_start = elapsed_s;
+                    p.return_duration = -1.0;
                     for (size_t i = 0; i < p.source.size(); ++i) p.source[i] = p.active->Position(i, duration);
                 }
             }
         }
         if (p.status.phase == Phase::BLEND_OUT) {
-            const double alpha = p.config.blend_out_duration == 0.0 ? 1.0 :
-                SmoothStep((elapsed_s - p.phase_start) / p.config.blend_out_duration);
+            if (p.return_duration < 0.0) {
+                p.return_duration = p.config.blend_out_duration;
+                if (p.config.return_max_velocity > 0.0) {
+                    // The quintic has peak slope 1.875; the return target is the fixed ready pose.
+                    for (size_t i = 0; i < p.source.size(); ++i) {
+                        const double distance = std::abs(position[p.active->config.joint_indices[i]] - p.source[i]);
+                        p.return_duration = std::max(p.return_duration,
+                            1.875 * distance / p.config.return_max_velocity);
+                    }
+                }
+            }
+            const double progress = p.return_duration == 0.0 ? 1.0 :
+                std::clamp((elapsed_s - p.phase_start) / p.return_duration, 0.0, 1.0);
+            const double alpha = p.config.return_max_velocity > 0.0
+                ? progress * progress * progress * (10.0 + progress * (-15.0 + 6.0 * progress))
+                : SmoothStep(progress);
             for (size_t i = 0; i < p.source.size(); ++i) {
                 const int joint = p.active->config.joint_indices[i];
                 position[joint] = (1.0 - alpha) * p.source[i] + alpha * position[joint];

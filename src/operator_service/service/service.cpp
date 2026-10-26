@@ -6,6 +6,8 @@
  */
 #include "service.h"
 
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -84,6 +86,27 @@ bool TokenEqual(const std::string &a, const std::string &b) {
     for (size_t i = 0; i < a.size(); ++i) difference |= a[i] ^ b[i];
     return difference == 0;
 }
+constexpr char kPasswordPrefix[] = "pbkdf2-sha256:100000:";
+bool ValidPasswordHash(const std::string &value) {
+    const size_t prefix = sizeof(kPasswordPrefix) - 1;
+    if (value.size() != prefix + 32 + 1 + 64 || value.compare(0, prefix, kPasswordPrefix) != 0 ||
+        value[prefix + 32] != ':') return false;
+    return value.substr(prefix, 32).find_first_not_of("0123456789abcdef") == std::string::npos &&
+        value.substr(prefix + 33).find_first_not_of("0123456789abcdef") == std::string::npos;
+}
+bool CheckPassword(const std::string &encoded, const std::string &password) {
+    const size_t prefix = sizeof(kPasswordPrefix) - 1;
+    const auto byte = [](const std::string &s, size_t i) {
+        const auto digit = [](char c) { return c <= '9' ? c - '0' : c - 'a' + 10; };
+        return static_cast<unsigned char>((digit(s[i]) << 4) | digit(s[i + 1]));
+    };
+    unsigned char salt[16], expected[32], actual[32];
+    for (size_t i = 0; i < sizeof(salt); ++i) salt[i] = byte(encoded, prefix + i * 2);
+    for (size_t i = 0; i < sizeof(expected); ++i) expected[i] = byte(encoded, prefix + 33 + i * 2);
+    return PKCS5_PBKDF2_HMAC(password.data(), static_cast<int>(password.size()), salt, sizeof(salt),
+        100000, EVP_sha256(), sizeof(actual), actual) == 1 &&
+        CRYPTO_memcmp(actual, expected, sizeof(actual)) == 0;
+}
 std::string StateRoot() {
     const char *state = std::getenv("XDG_STATE_HOME");
     const char *home = std::getenv("HOME");
@@ -125,6 +148,9 @@ Config LoadConfig(const std::string &path) {
     if (port < 1 || port > 65535) throw std::runtime_error("invalid operator port");
     c.port = static_cast<uint16_t>(port);
     c.public_url = yaml.Read<std::string>("operator_service.public_url").value_or("");
+    c.voice_chat_port = yaml.Read<int>("operator_service.voice_chat_port").value_or(0);
+    c.admin_password_hash = yaml.Read<std::string>("operator_service.admin_password_hash").value_or("");
+    if (c.voice_chat_port < 0 || c.voice_chat_port > 65535) throw std::runtime_error("invalid voice chat port");
     c.connection_file =
         yaml.Read<std::string>("operator_service.connection_file").value_or(DefaultConnectionFile(c.robot));
     const auto pairing_dir = StateRoot() + "/humanoid-operator/" + c.robot;
@@ -188,7 +214,12 @@ Config LoadConfig(const std::string &path) {
     return c;
 }
 
-Service::Service(Config config) : config_(std::move(config)) {}
+Service::Service(Config config) : config_(std::move(config)) {
+    if (!config_.admin_password_hash.empty() && !ValidPasswordHash(config_.admin_password_hash))
+        throw std::runtime_error("invalid operator admin_password_hash");
+    if (!config_.admin_password_hash.empty() && TokenEqual(config_.control_token, config_.token))
+        throw std::runtime_error("public and control tokens must differ when administrator access is enabled");
+}
 uint64_t Service::Open() {
     if (sessions_.size() >= 32) return 0;
     const auto id = ++next_session_;
@@ -201,6 +232,7 @@ bool Service::Authenticated(uint64_t session) const {
 }
 void Service::Disconnect(uint64_t session) {
     if (owner_ == session) ClearInput("operator disconnected");
+    if (login_session_ == session) login_session_ = 0;
     sessions_.erase(session);
 }
 bool Service::Online() const {
@@ -242,6 +274,16 @@ void Service::ClearInput(const std::string &reason) {
 }
 void Service::Tick() {
     const auto now = Now();
+    // Password derivation must not block the HMI command heartbeat.
+    if (login_result_.valid() && login_result_.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+        const bool valid = login_result_.get();
+        const auto it = sessions_.find(login_session_);
+        if (it != sessions_.end()) {
+            it->second.admin = valid;
+            it->second.login_error = valid ? "" : "incorrect_password";
+        }
+        login_session_ = 0;
+    }
     if (owner_ && (now >= lease_until_ || !Online())) ClearInput("control lease or feedback expired");
     if (now >= velocity_until_ || status_.mode != robot_base::ControlMode::RL)
         command_.vx = command_.vy = command_.wz = 0;
@@ -310,6 +352,14 @@ Status Service::Snapshot(uint64_t session) const {
     s.request = result_;
     return s;
 }
+Json Service::StatusMessage(uint64_t session) const {
+    auto message = Encode(Snapshot(session));
+    const auto viewer = sessions_.find(session);
+    message["admin"] = viewer != sessions_.end() && viewer->second.admin;
+    message["admin_login_pending"] = session != 0 && login_session_ == session;
+    message["admin_login_error"] = viewer != sessions_.end() ? viewer->second.login_error : "";
+    return message;
+}
 Json Service::Catalog() const {
     Json policies = Json::array();
     for (const auto &p : config_.policies) policies.push_back(Encode(p));
@@ -317,7 +367,8 @@ Json Service::Catalog() const {
     for (const auto &a : config_.actions) actions.push_back({{"key", a.key}, {"display_name", a.display_name}});
     return {{"robot", config_.robot}, {"policies", policies}, {"lease_ms", config_.lease_ms},
         {"velocity_step", Encode(config_.velocity_step)}, {"trajectory_enabled", config_.trajectory_enabled},
-        {"actions", actions}};
+        {"actions", actions}, {"voice_chat_port", config_.voice_chat_port},
+        {"admin_required", !config_.admin_password_hash.empty()}};
 }
 Json Service::ReplyTo(
     uint64_t id, bool ok, const std::string &code, const std::string &message, const Json &data) const {
@@ -343,24 +394,53 @@ Json Service::Handle(uint64_t session, const Json &request) {
         const auto args = request.value("args", Json::object());
         if (!args.is_object()) return fail("bad_request", "args must be an object");
         if (op == "hello") {
-            if (!TokenEqual(args.value("token", ""), config_.token)) return fail("unauthorized", "invalid token");
+            if (it->second.authenticated) return fail("bad_request", "already authenticated");
+            const auto token = args.value("token", "");
+            const bool control = TokenEqual(token, config_.control_token);
+            if (!control && !TokenEqual(token, config_.token)) return fail("unauthorized", "invalid token");
             const auto name = args.value("name", "client");
             if (name.empty() || name.size() > 48 ||
                 std::any_of(name.begin(), name.end(), [](unsigned char c) { return c < 32 || c == 127; }))
                 return fail("bad_request", "invalid client name");
             it->second.authenticated = true;
+            it->second.admin = control || config_.admin_password_hash.empty();
             it->second.name = name;
             return ReplyTo(
-                id, true, "ok", "authenticated", {{"catalog", Catalog()}, {"status", Encode(Snapshot(session))}});
+                id, true, "ok", "authenticated", {{"catalog", Catalog()}, {"status", StatusMessage(session)}});
         }
         if (!it->second.authenticated) return fail("unauthorized", "authenticate first");
-        if (op == "status") return ReplyTo(id, true, "ok", "", {{"status", Encode(Snapshot(session))}});
+        if (op == "status") return ReplyTo(id, true, "ok", "", {{"status", StatusMessage(session)}});
         if (op == "catalog") return ReplyTo(id, true, "ok", "", {{"catalog", Catalog()}});
         if (op == "pairing") {
             if (config_.terminal_only) return fail("unsupported", "simulation supports the local terminal only");
             const std::string url = PairingUrl(config_);
             return ReplyTo(id, true, "ok", "", {{"url", url}, {"qr_svg", PairingSvg(url)}});
         }
+        if (op == "admin_login") {
+            if (it->second.admin) return ReplyTo(id, true, "ok", "already authorized");
+            if (login_result_.valid()) return fail("busy", "password verification is in progress");
+            const auto password = args.value("password", "");
+            if (password.empty() || password.size() > 128) return fail("bad_request", "invalid password length");
+            const auto now = Now();
+            if (now >= login_window_until_) {
+                login_attempts_ = 0;
+                login_window_until_ = now + 30;
+            }
+            if (login_attempts_ >= 5) return fail("rate_limited", "wait before retrying administrator login");
+            ++login_attempts_;
+            it->second.login_error.clear();
+            login_result_ = std::async(std::launch::async, CheckPassword, config_.admin_password_hash, password);
+            login_session_ = session;
+            return ReplyTo(id, true, "pending", "verifying administrator password");
+        }
+        if (op == "admin_logout") {
+            if (owner_ == session) ClearInput("administrator signed out");
+            if (login_session_ == session) login_session_ = 0;
+            it->second.admin = config_.admin_password_hash.empty();
+            it->second.login_error.clear();
+            return ReplyTo(id, true, "ok", "administrator signed out");
+        }
+        if (!it->second.admin) return fail("admin_required", "administrator login required");
         if (op == "stop") {
             ClearInput("stopped by authenticated client");
             return ReplyTo(id, true, "ok", "velocity cleared; pending requests cancelled");

@@ -254,6 +254,7 @@ if(BUILD_RL)
 endif()
 
 # Operator protocol and client SDK have no robot, RL or hardware dependencies.
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 add_library(operator_protocol STATIC src/operator_service/protocol/protocol.cpp)
 target_include_directories(operator_protocol PUBLIC include src/operator_service/protocol)
 target_link_libraries(operator_protocol PUBLIC nlohmann_json::nlohmann_json)
@@ -274,7 +275,7 @@ add_library(operator_service STATIC
 target_include_directories(operator_service PUBLIC src/operator_service/service)
 target_include_directories(operator_service PRIVATE src/runtime/common)
 target_link_libraries(operator_service PUBLIC operator_protocol robot_base
-    PRIVATE operator_qr Boost::headers transport_executor)
+    PRIVATE operator_qr Boost::headers transport_executor OpenSSL::Crypto)
 target_compile_definitions(operator_service PRIVATE BOOST_ERROR_CODE_HEADER_ONLY
     OPERATOR_WEB_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/clients/web")
 
@@ -283,6 +284,16 @@ target_link_libraries(hmi_runtime PRIVATE operator_service)
 add_executable(hmi_tui clients/terminal/hmi_tui.cpp clients/terminal/terminal_ui.cpp)
 target_link_libraries(hmi_tui PRIVATE operator_client)
 install(TARGETS hmi_runtime hmi_tui RUNTIME DESTINATION bin)
+
+add_executable(humanoid_operator_mcp
+    clients/mcp/main.cpp
+    clients/mcp/mcp_stdio_server.cpp
+    clients/mcp/operator_tools.cpp)
+target_include_directories(humanoid_operator_mcp PRIVATE clients/mcp)
+target_link_libraries(humanoid_operator_mcp PRIVATE
+    operator_client nlohmann_json::nlohmann_json Threads::Threads)
+install(TARGETS humanoid_operator_mcp RUNTIME DESTINATION bin)
+
 install(TARGETS operator_client LIBRARY DESTINATION lib)
 install(FILES include/operator_client.h include/operator_types.h DESTINATION include)
 install(DIRECTORY clients/web/ DESTINATION share/humanoid_common/operator_web)
@@ -414,8 +425,37 @@ if(BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --trajectory)
     add_test(NAME operator_trajectory_terminal COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --trajectory --sim)
+    add_test(NAME operator_administrator COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --trajectory --admin)
     set_tests_properties(operator_network operator_terminal_only operator_trajectory
-        operator_trajectory_terminal PROPERTIES RUN_SERIAL TRUE TIMEOUT 20)
+        operator_trajectory_terminal operator_administrator PROPERTIES RUN_SERIAL TRUE TIMEOUT 20)
+
+    add_executable(test_operator_mcp_protocol
+        example/operator_service/test_operator_mcp_protocol.cpp
+        clients/mcp/mcp_stdio_server.cpp)
+    target_include_directories(test_operator_mcp_protocol PRIVATE clients/mcp)
+    target_link_libraries(test_operator_mcp_protocol PRIVATE nlohmann_json::nlohmann_json)
+    target_compile_options(test_operator_mcp_protocol PRIVATE -UNDEBUG)
+    add_test(NAME operator_mcp_protocol COMMAND test_operator_mcp_protocol)
+    set_tests_properties(operator_mcp_protocol PROPERTIES TIMEOUT 20)
+
+    add_executable(test_operator_mcp example/operator_service/test_operator_mcp.cpp)
+    target_link_libraries(test_operator_mcp PRIVATE operator_client transport_executor
+        nlohmann_json::nlohmann_json Threads::Threads)
+    target_compile_options(test_operator_mcp PRIVATE -UNDEBUG)
+    add_dependencies(test_operator_mcp hmi_runtime humanoid_operator_mcp)
+    add_test(NAME operator_mcp COMMAND test_operator_mcp
+        $<TARGET_FILE:hmi_runtime> $<TARGET_FILE:humanoid_operator_mcp>)
+    set_tests_properties(operator_mcp PROPERTIES RUN_SERIAL TRUE TIMEOUT 60)
+    install(TARGETS test_operator_mcp_protocol test_operator_mcp RUNTIME DESTINATION bin)
+
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        add_test(NAME operator_voice_web COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/test_voice_web.py)
+        set_tests_properties(operator_voice_web PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
+    endif()
+
     add_test(NAME driver_runtime_backend_selection
         COMMAND test_driver_runtime ${DRIVER_RUNTIME_EXAMPLE_CONFIG})
     if(BUILD_WHOLE_BODY_BACKEND)

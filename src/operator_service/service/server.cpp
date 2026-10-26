@@ -103,7 +103,8 @@ public:
             lock_ = -1;
             throw std::runtime_error("cannot create connection file");
         }
-        const auto data = Json{{"v", 1}, {"endpoint", endpoint}, {"token", c.token}}.dump();
+        const auto data = Json{{"v", 1}, {"endpoint", endpoint},
+            {"token", c.control_token.empty() ? c.token : c.control_token}, {"public_token", c.token}}.dump();
         const bool ok =
             fchmod(fd, 0600) == 0 && write(fd, data.data(), data.size()) == static_cast<ssize_t>(data.size());
         close(fd);
@@ -143,6 +144,12 @@ void PreparePairing(Config *config) {
         config->credential_file == config->connection_file || config->qr_file == config->connection_file)
         throw std::runtime_error("credential, QR and connection files must be distinct paths");
     config->token = PersistentSecret(config->credential_file);
+    if (!config->admin_password_hash.empty()) {
+        if (config->credential_file + ".control" == config->connection_file ||
+            config->credential_file + ".control" == config->qr_file)
+            throw std::runtime_error("control credential requires a separate path");
+        config->control_token = PersistentSecret(config->credential_file + ".control");
+    }
     WritePrivate(config->qr_file, PairingSvg(PairingUrl(*config)), O_CREAT);
 }
 
@@ -231,7 +238,7 @@ public:
             if (service.Authenticated(session->Id())) {
                 if (publish)
                     session->Send(
-                        {{"v", 1}, {"event", "status"}, {"data", Encode(service.Snapshot(session->Id()))}}, true);
+                        {{"v", 1}, {"event", "status"}, {"data", service.StatusMessage(session->Id())}}, true);
             } else if (session->AuthenticationExpired()) session->Stop();
             ++it;
         }
@@ -462,6 +469,7 @@ int Run(Config config, const std::string &yaml_path) {
         config.bind_address = "127.0.0.1";
         config.public_url.clear();
         config.token = Secret();
+        config.control_token = Secret();
     } else {
         PreparePairing(&config);
     }

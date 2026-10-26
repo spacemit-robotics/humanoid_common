@@ -7,13 +7,14 @@ try {
   else token = sessionStorage.getItem("operator.session") || "";
 } catch (_) { /* Browser privacy mode can disable tab storage. */ }
 let held = "", lastActionCatalog = "", lastPolicyCatalog = "", lastVelocityAt = 0;
-let activeRequest = 0;
+let activeRequest = 0, adminLoginWaiting = false;
 const pending = new Map();
-const messages = {not_owner:"请先接管控制",busy:"其他客户端持有控制权，或请求正在处理",not_ready:"操作条件尚未满足",fault:"故障已锁存",unauthorized:"配对已失效，请重新扫描操作二维码",timeout:"确认超时，请检查当前状态"};
+const messages = {not_owner:"请先接管控制",busy:"其他客户端持有控制权，或请求正在处理",not_ready:"操作条件尚未满足",fault:"故障已锁存",unauthorized:"配对已失效，请重新扫描操作二维码",timeout:"确认超时，请检查当前状态",admin_required:"请先登录管理员",rate_limited:"尝试次数过多，请稍后再试"};
 const operationNames = {state:"状态切换",policy:"策略切换",interaction:"开始动作",cancel:"取消动作",ack:"故障确认",reference_start:"开始参考动作"};
 const phaseNames = {accepted:"待确认",completed:"已确认",rejected:"已拒绝",expired:"确认超时",cancelled:"已撤销",sent:"已发送"};
 const actionPhases = {IDLE:"就绪",BLEND_IN:"进入",PLAYING:"播放",HOLDING:"保持",BLEND_OUT:"收回",FINISHED:"完成",REJECTED:"拒绝"};
 const descriptions = {"control acquired":"已取得控制权","released":"控制权已释放","control renewed":"控制权已续期","velocity accepted":"速度请求已受理","velocity cleared; pending requests cancelled":"速度已清零，控制权及待处理请求已撤销","control entered requested state":"机器人已切换状态","control selected requested policy":"机器人已采用所选策略","control handled action request":"机器人已处理动作请求","control acknowledged fault":"故障已确认","already in requested state":"已经在请求状态"};
+const inApp = navigator.userAgent.includes("SpaceMITOperatorApp");
 history.replaceState(null, "", location.pathname);
 window.addEventListener('hashchange', () => {
   const paired = new URLSearchParams(location.hash.slice(1)).get('token');
@@ -47,7 +48,7 @@ function connect() {
   if (socket) socket.close();
   for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error("连接已替换")); }
   pending.clear(); held = "";
-  id = 0; authenticated = false; activeRequest = 0;
+  id = 0; authenticated = false; activeRequest = 0; adminLoginWaiting = false;
   socket = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/api/v1/ws`);
   const current = socket;
   $("connection").textContent = "连接中";
@@ -58,10 +59,13 @@ function connect() {
       if (socket !== current) return;
       authenticated = true; catalog = r.data.catalog; status = r.data.status;
       lastStatusAt = performance.now();
-      $("robot").textContent = catalog.robot === 'linglong' ? 'LingLong 灵龙' : catalog.robot;
+      $("robot").textContent = catalog.robot;
+      if ($("voice-robot")) $("voice-robot").textContent = catalog.robot;
+      voicePort = Number.isInteger(catalog.voice_chat_port) ? catalog.voice_chat_port : 0;
+      showPublicPage();
       document.title = `${catalog.robot} · 操作台`;
       $("login").hidden = true;
-      tell("已连接，尚未申请控制权"); render();
+      tell("设备已连接"); render();
     } catch (e) { if (socket === current) { tell(e.message); $("login").hidden = false; current.close(); } }
   };
   socket.onmessage = event => {
@@ -84,7 +88,11 @@ function connect() {
   socket.onclose = () => {
     if (socket !== current) return;
     authenticated = false; held = "";
+    adminLoginWaiting = false;
+    $("admin-submit").disabled = false;
+    if ($("admin-dialog").open) $("admin-message").textContent = "连接已断开，请重连后登录";
     if (status) { status.online = false; status.owns_control = false; }
+    setMode('voice');
     for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error("连接已断开")); }
     pending.clear(); render();
   };
@@ -102,14 +110,14 @@ function render() {
   activeMode.dataset.state = trajectory ? 'TRAJECTORY' : 'RL';
   activeMode.querySelector('strong').textContent = trajectory ? '动作' : '策略控制';
   activeMode.querySelector('span').textContent = trajectory ? 'TRAJECTORY' : 'RL';
-  $("stop-label").textContent = trajectory ? '停止动作' : '停止移动';
   const online = authenticated && status?.online && performance.now() - lastStatusAt < 1000;
-  const owns = online && status.owns_control;
+  const admin = authenticated && (status?.admin || !catalog?.admin_required);
+  const owns = online && admin && status.owns_control;
   const fault = status?.fault;
   const busy = status?.request.phase === "accepted";
   $("connection").textContent = online ? "控制链路在线" : authenticated ? "等待控制程序" : "未连接";
   $("connection").classList.toggle("online", !!online);
-  $("owner").textContent = owns ? "本客户端" : (status?.owner || "无人持有");
+  $("owner").textContent = owns ? "本客户端" : ownerLabel(status?.owner);
   $("state").textContent = status?.state === 'TRAJECTORY' ? '动作' : status?.state || "—";
   const stateLabels = {POWER_OFF:'电机未上电',DAMP:'阻尼保护',HOME:'复位姿态',ZERO:'准备姿态',RL:'策略运行中',TRAJECTORY:'TRAJECTORY',SAFETY:'安全保护'};
   $("state-label").textContent = stateLabels[status?.state] || '等待状态';
@@ -118,22 +126,26 @@ function render() {
   $("frequency").textContent = `${(status?.rl_hz || 0).toFixed(1)} Hz`;
   $("age").textContent = online ? `${status.age_ms.toFixed(0)} ms` : "—";
   $("active-policy").textContent = status?.policy || "—";
-  $("acquire").disabled = !online || !!status?.owner;
+  $("acquire").disabled = !online || !admin || !!status?.owner;
   $("release").disabled = !owns;
+  const managing = document.body.dataset.mode === 'control';
+  $("admin-entry").hidden = managing;
+  $("admin-entry").disabled = !authenticated;
+  $("admin-exit").hidden = !managing;
   $("pair").disabled = !authenticated;
   $("disconnect").disabled = !authenticated;
   $("disconnect").hidden = !authenticated;
   $("reconnect").hidden = authenticated || !token;
-  $("stop").disabled = !authenticated;
   $("fault").hidden = !fault?.latched;
   $("fault-title").textContent = fault ? `${fault.source}/${fault.code}${fault.active ? " · 活动" : " · 锁存"}` : "";
   $("fault-detail").textContent = fault?.detail || "";
   $("ack").disabled = !owns || status?.state !== "POWER_OFF" || fault?.active;
+  $("ack").hidden = !managing;
   const before = {HOME:"DAMP",ZERO:"HOME",RL:"ZERO",TRAJECTORY:"ZERO"};
   document.querySelectorAll("[data-state]").forEach(b => {
     const target = b.dataset.state;
     b.classList.toggle("active", status?.state === target);
-    b.disabled = !online || status.state === target ||
+    b.disabled = !online || !admin || status.state === target ||
       (!['POWER_OFF','DAMP'].includes(target) && (!owns || busy || fault?.latched ||
         before[target] !== status.state || (['RL','TRAJECTORY'].includes(target) && !status.zero_ready))) ||
       (target === 'DAMP' && status.state === 'SAFETY');
@@ -187,7 +199,29 @@ function render() {
     b.disabled = !rl || !Math.max(Math.abs(p?.minimum[axis] || 0), p?.maximum[axis] || 0);
     b.classList.toggle('active', held === b.dataset.motion);
   });
+  if (adminLoginWaiting && !status?.admin_login_pending) {
+    adminLoginWaiting = false;
+    $("admin-submit").disabled = false;
+    if (status?.admin) {
+      $("admin-dialog").close();
+      setMode('control');
+      tell('已进入管理员界面，操作前请接管控制');
+    } else {
+      $("admin-message").textContent = '密码不正确';
+      $("admin-password").focus();
+    }
+  }
+  // 语音面板据此显示现在能不能让机器人做动作（谁握着控制权、什么状态、在做什么动作）
+  window.dispatchEvent(new CustomEvent("operator-status", {detail: {status, catalog, online: !!online, authenticated}}));
 }
+// 先把本地的持有标记清掉再发 release：否则服务端推来新状态前，每 300 ms 的续租可能紧跟着发出去，报「请先接管控制」
+function releaseControl() {
+  endMotion();
+  if (status) status.owns_control = false;
+  return request("release");
+}
+// 语音服务做动作时以 voice#<会话号> 持有控制权
+function ownerLabel(owner) { return !owner ? "无人持有" : owner.startsWith("voice#") ? "语音（正在做动作）" : owner; }
 function velocity() {
   const v = {vx:0,vy:0,wz:0,valid_for_ms:300};
   const key = held;
@@ -211,8 +245,7 @@ document.querySelectorAll('[data-motion]').forEach(b => {
   b.onpointerup = b.onpointercancel = b.onlostpointercapture = () => endMotion();
 });
 $("acquire").onclick = () => request('acquire');
-$("release").onclick = () => { endMotion(); request('release'); };
-$("stop").onclick = () => { endMotion(false); request('stop'); };
+$("release").onclick = () => releaseControl();
 $("select-policy").onclick = () => request('policy', {policy:$("policy").value});
 $("start-action").onclick = () => request('interaction', {action:$("action").value});
 $("cancel-action").onclick = () => request('cancel');
@@ -250,7 +283,12 @@ window.addEventListener('pagehide', () => window.operatorDisconnect());
 window.addEventListener('blur', () => endMotion());
 window.addEventListener('keydown', e => {
   if (['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName) || e.repeat) return;
-  if (e.code === 'Space') { e.preventDefault(); endMotion(false); request('stop'); }
+  if (document.body.dataset.mode !== 'control') return;
+  if (e.code === 'Space') {
+    e.preventDefault(); endMotion(false);
+    if (status?.owns_control && status.state === 'RL') request('velocity', {vx:0,vy:0,wz:0,valid_for_ms:300});
+  }
+  if (e.key.toLowerCase() === 'c' && !$("cancel-action").disabled) request('cancel');
   if ('wsadjl'.includes(e.key) && e.key.length === 1) { e.preventDefault(); beginMotion(e.key); }
 });
 window.addEventListener('keyup', e => { if (e.key === held) endMotion(); });
@@ -273,6 +311,81 @@ setInterval(() => {
   }
 }, 100);
 if (window.lucide) lucide.createIcons();
+// Voice runs through the existing HTTPS proxy. Control authorization is per WebSocket session.
+let voicePort = 0;
+function setMode(mode) {
+  if (mode === 'control' && (!authenticated || (catalog?.admin_required && !status?.admin))) return;
+  const voice = mode === "voice";
+  document.body.dataset.mode = voice ? "voice" : "control";
+  $("admin-entry").hidden = !voice;
+  $("admin-exit").hidden = voice;
+  $("voice-panel").hidden = !voice;
+  window.voicePanel?.setActive(voice);
+}
+function showPublicPage() {
+  if (!catalog?.admin_required && !voicePort && !window.voicePanel) { setMode('control'); return; }
+  setMode('voice');
+  if (!window.voicePanel && voicePort > 0 && token) {
+    const url = `http://${location.hostname}:${voicePort}/#token=${encodeURIComponent(token)}`;
+    if ($("open-voice")) { $("open-voice").href = url; $("open-voice").hidden = window.isSecureContext || inApp; }
+  }
+  if ($("voice-message")) $("voice-message").textContent = inApp ? '语音会话在手机浏览器中打开' :
+    window.isSecureContext ? '语音服务连接中' : '语音交互';
+}
+$("admin-entry").onclick = () => {
+  if (status?.admin || !catalog?.admin_required) { setMode('control'); render(); return; }
+  if (!window.isSecureContext && voicePort > 0 && !inApp) {
+    location.assign(`http://${location.hostname}:${voicePort}/#token=${encodeURIComponent(token)}`);
+    return;
+  }
+  $("admin-password").value = '';
+  $("admin-message").textContent = '';
+  $("admin-dialog").showModal();
+  $("admin-password").focus();
+};
+$("close-admin").onclick = () => $("admin-dialog").close();
+$("admin-dialog").onclose = () => {
+  $("admin-password").value = '';
+  if (adminLoginWaiting) call('admin_logout').catch(() => {});
+  adminLoginWaiting = false;
+  $("admin-submit").disabled = false;
+};
+$("admin-login").onsubmit = async e => {
+  e.preventDefault();
+  $("admin-submit").disabled = true;
+  $("admin-message").textContent = '正在验证';
+  let password = $("admin-password").value;
+  $("admin-password").value = '';
+  try {
+    await call('admin_login', {password});
+    password = '';
+    if (!$("admin-dialog").open) { await call('admin_logout'); return; }
+    adminLoginWaiting = true;
+    const result = await call('status');
+    status = result.data.status;
+    render();
+  } catch (error) {
+    password = '';
+    adminLoginWaiting = false;
+    $("admin-submit").disabled = false;
+    $("admin-message").textContent = error.message;
+  }
+};
+$("admin-exit").onclick = async () => {
+  if (status?.owns_control && ['BLEND_IN','PLAYING','HOLDING','BLEND_OUT'].includes(status.interaction.phase)) {
+    tell('动作执行中，请先取消并等待收回完成'); return;
+  }
+  if (!await request('admin_logout')) return;
+  if (status) { status.admin = false; status.owns_control = false; }
+  setMode('voice'); render();
+};
+if (window.isSecureContext && !inApp) {
+  const script = document.createElement("script");
+  script.src = "/voice/panel.js";
+  script.onload = () => { if (document.body.dataset.mode === 'voice') window.voicePanel?.setActive(true); };
+  script.onerror = () => { if ($("voice-message")) $("voice-message").textContent = '语音服务暂不可用'; };
+  document.head.append(script);
+}
 async function initialize() {
   if (!navigator.userAgent.includes('SpaceMITOperatorApp')) {
     fetch('/downloads/SpacemiT-Operator.apk', {method:'HEAD', cache:'no-store'})

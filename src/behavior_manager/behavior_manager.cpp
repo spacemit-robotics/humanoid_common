@@ -194,6 +194,8 @@ public:
     std::string active_policy;                // 当前已加载的策略名
     bool has_rl = false;                      // 是否配置了 RL 状态
     bool fixed_base = false;
+    bool startup_prepare_pending = false;
+    bool sensor_received = false;
     std::atomic<double> rl_freq_hz{0.0};      // RL 实时推理频率（Hz）
     robot_base::ThreadLoop infer_thread_cfg;  // 推理线程配置（robot_base.threads.rl_infer）
     SafetyMonitorConfig safety_monitor;
@@ -526,6 +528,10 @@ public:
         fixed_base = yaml_file.Read<bool>("robot_base.fixed_base").value_or(false);
         const bool trajectory_enabled = yaml_file.Read<bool>(
             "behavior_manager.trajectory.enabled").value_or(false);
+        startup_prepare_pending = yaml_file.Read<bool>(
+            "behavior_manager.trajectory.prepare_on_start").value_or(false);
+        if (startup_prepare_pending && (!fixed_base || !trajectory_enabled))
+            throw std::runtime_error("automatic preparation requires fixed-base trajectory control");
         if (trajectory_enabled && (!fixed_base || yaml_file.Read<std::string>("rl_policy.type"))) {
             throw std::runtime_error(
                 "trajectory behavior requires fixed_base=true and no rl_policy");
@@ -848,7 +854,28 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
         }
     }
 
+    const int requested_key = impl_->command.key;
+    if (impl_->startup_prepare_pending) {
+        if (impl_->fault.latched || requested_key != 0) {
+            impl_->startup_prepare_pending = false;
+            runtime_logging::Log(runtime_logging::Level::kWarning,
+                "automatic preparation cancelled by fault or operator request", false);
+        } else if (impl_->sensor_received) {
+            if (current == StateName::POWER_OFF) {
+                impl_->fsm.ForceSwitch(StateName::HOME, "configured fixed-base startup preparation");
+            } else if (current == StateName::HOME) {
+                impl_->command.key = 2;
+            } else if (current == StateName::ZERO) {
+                impl_->command.key = 3;
+            } else if (current == StateName::TRAJECTORY) {
+                impl_->startup_prepare_pending = false;
+                runtime_logging::Log(runtime_logging::Level::kInfo,
+                    "fixed-base preparation complete; waiting for an action request", false);
+            }
+        }
+    }
     impl_->fsm.Step(control_dt, rl_dt);
+    if (requested_key == 0) impl_->command.key = 0;
 
     const auto state_fault_after_step = impl_->fsm.CurrentFault();
     if (state_fault_after_step.active || state_fault_after_step.latched) {
@@ -902,6 +929,7 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
 
 void BehaviorManagerClass::SetSensorData(const robot_base::RobotData &data) {
     impl_->sensor = data;
+    impl_->sensor_received = true;
 }
 
 void BehaviorManagerClass::SetSensorFault(const robot_base::FaultStatus &fault) {

@@ -181,6 +181,19 @@ to the active profile's joint names. Missing joints are errors, not skipped.
 Motion files resolve against the catalog configuration's `robot_base.robot_dir`.
 `trajectory.kp/kd` are optional and otherwise use the ZERO gains.
 
+`trajectory.prepare_on_start: true` opts a fixed-base profile into one-time
+POWER_OFF -> HOME -> ZERO -> TRAJECTORY preparation after feedback arrives.
+It keeps the HOME timing and ZERO readiness gate, then waits without playing an
+action. A fault or explicit state request cancels automatic preparation;
+acknowledgement does not re-enable it. The default is false; full-body RL is unchanged.
+
+`trajectory.return_max_velocity` (rad/s, default 0) limits the nominal return
+trajectory to the fixed ready pose. A positive value uses quintic interpolation
+and extends `blend_out_duration` as needed. Cancellation retains motor enable
+and gains; repeated cancellation does not restart the return. This is a target
+speed limit, not a guarantee of measured motor speed or torque; hardware
+protections remain active. Keep it at 0 for adapters returning to a moving RL target.
+
 Fixed-base mode disables body-attitude safety checks, not joint or transport
 faults. Configure optional sensors explicitly in the hardware backend; a
 mathematical default base pose is not an IMU measurement. Operator clients use

@@ -430,9 +430,6 @@ public:
         config.max_files = std::clamp(
             yaml_file.Read<int>("logging.file.max_files").value_or(4),
             1, 32);
-        config.retention_days = std::clamp(
-            yaml_file.Read<int>("logging.file.retention_days").value_or(0),
-            0, 3650);
 
         const std::string configured_directory =
             yaml_file.Read<std::string>("logging.directory").value_or("log/humanoid");
@@ -466,11 +463,6 @@ public:
             WriteMetadata(robot);
             worker_ = std::thread(&Logger::Worker, this);
             artifact_worker_ = std::thread(&Logger::ArtifactWorker, this);
-            if (config.retention_days > 0) {
-                retention_stop_.store(false);
-                retention_worker_ = std::thread(&Logger::RetentionWorker, this,
-                    base_directory, session, robot + "_", config.retention_days);
-            }
             WriteArtifact("config", "runtime_config", yaml_path_);
             const auto artifacts = yaml_file.Read<std::vector<std::string>>(
                 "logging.artifacts").value_or(std::vector<std::string>{});
@@ -492,18 +484,11 @@ public:
     }
 
     void Shutdown() {
-        std::thread retention_worker;
         std::thread artifact_worker;
         std::thread worker;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!initialized_) return;
-            retention_stop_.store(true);
-            retention_worker = std::move(retention_worker_);
-        }
-        if (retention_worker.joinable()) retention_worker.join();
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
             artifacts_stopped_ = true;
             artifact_condition_.notify_all();
             artifact_worker = std::move(artifact_worker_);
@@ -640,64 +625,6 @@ private:
                 artifact_queue_.pop_front();
             }
             Enqueue(BuildArtifactRecord(item));
-        }
-    }
-
-    // Age is the newest mtime of the directory or its direct entries, so a
-    // long-running session that is still writing is never treated as stale.
-    static std::filesystem::file_time_type LatestWriteTime(
-        const std::filesystem::path &directory) {
-        std::error_code error;
-        auto latest = std::filesystem::last_write_time(directory, error);
-        if (error) latest = std::filesystem::file_time_type::max();
-        std::filesystem::directory_iterator it(directory, error);
-        for (; !error && it != std::filesystem::directory_iterator();
-             it.increment(error)) {
-            std::error_code entry_error;
-            const auto time = it->last_write_time(entry_error);
-            if (!entry_error && time > latest) latest = time;
-        }
-        return latest;
-    }
-
-    void RetentionWorker(std::filesystem::path base_directory,
-        std::filesystem::path current_session, std::string prefix, int days) {
-        const auto cutoff = std::filesystem::file_time_type::clock::now() -
-            std::chrono::hours(24) * days;
-        std::vector<std::filesystem::path> stale;
-        std::error_code error;
-        std::filesystem::directory_iterator it(base_directory, error);
-        for (; !error && it != std::filesystem::directory_iterator();
-             it.increment(error)) {
-            if (retention_stop_.load()) return;
-            std::error_code status_error;
-            if (!it->is_directory(status_error) || status_error) continue;
-            if (it->is_symlink(status_error)) continue;
-            const auto path = it->path();
-            if (path.filename() == current_session.filename()) continue;
-            if (path.filename().string().rfind(prefix, 0) != 0) continue;
-            if (LatestWriteTime(path) < cutoff) stale.push_back(path);
-        }
-
-        size_t removed = 0;
-        size_t failed = 0;
-        for (const auto &path : stale) {
-            if (retention_stop_.load()) break;
-            std::error_code remove_error;
-            std::filesystem::remove_all(path, remove_error);
-            // Driver, control and HMI prune concurrently; losing the race is fine.
-            if (remove_error && std::filesystem::exists(path)) {
-                ++failed;
-            } else {
-                ++removed;
-            }
-        }
-        if (removed > 0 || failed > 0) {
-            WriteLog(failed > 0 ? Level::kWarning : Level::kInfo,
-                "log retention (" + std::to_string(days) + " days) removed " +
-                    std::to_string(removed) + " session directories" +
-                    (failed > 0 ? ", failed " + std::to_string(failed) : ""),
-                false);
         }
     }
 
@@ -877,8 +804,6 @@ private:
     std::map<std::string, FileState> files_;
     std::thread worker_;
     std::thread artifact_worker_;
-    std::thread retention_worker_;
-    std::atomic<bool> retention_stop_{false};
     std::atomic<uint64_t> dropped_{0};
     Config config_;
     std::string component_ = "runtime";

@@ -36,7 +36,6 @@ struct Config {
     int queue_capacity = 4096;
     int max_file_size_mb = 64;
     int max_files = 4;
-    int retention_days = 0;
     std::string directory;
 };
 

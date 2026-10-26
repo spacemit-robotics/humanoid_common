@@ -369,13 +369,6 @@ target_include_directories(test_runtime_timing PRIVATE
 add_test(NAME runtime_timing COMMAND test_runtime_timing)
 install(TARGETS test_runtime_timing RUNTIME DESTINATION bin)
 
-add_executable(test_log_retention example/runtime/test_log_retention.cpp)
-target_include_directories(test_log_retention PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/logging)
-target_link_libraries(test_log_retention PRIVATE robot_base)
-add_test(NAME log_retention COMMAND test_log_retention)
-
 add_executable(test_transport_executor example/transport_executor/test_transport_executor.cpp)
 target_include_directories(test_transport_executor PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include

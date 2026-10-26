@@ -221,7 +221,6 @@ logging:
     enabled: true
     max_size_mb: 32
     max_files: 3
-    retention_days: 3                    # 0 或不配置表示不清理
   queue_capacity: 8192
   artifacts:
     - "config/hardware.yaml"
@@ -248,11 +247,6 @@ driver 终端以固定屏限频刷新，
 不会按控制频率刷屏。落盘由有界后台队列完成，磁盘跟不上时丢弃日志并记录丢弃数，
 不会阻塞控制循环。
 
-`max_size_mb` / `max_files` 只限制单个 session 内每个流的轮转大小；跨 session 的
-清理由 `retention_days` 控制：大于 0 时，runtime 启动后在后台删除 `logging.directory`
-下以 `<robot_base.name>_` 开头、且目录及其文件最近修改时间早于该天数的 session
-目录（含 `<robot>_launch_*`）。当前 session 和仍在写入的 session 不会被删除，
-其他机型的目录和普通文件不受影响，删除数量记入 `events.log`。
 `metadata.json` 记录启动配置、common 构建版本和工作区状态。配置中的
 `logging.artifacts` 以及运行期加载的硬件配置、仿真模型、策略模型和参考动作会登记到
 `artifacts.csv`；文件大小和 SHA256 由日志线程异步计算。CSV 写入前会检查表头、列数

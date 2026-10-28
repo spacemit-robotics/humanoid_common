@@ -55,13 +55,21 @@ std::unique_ptr<State> FSM::ReplaceStateDeferred(StateName name, std::unique_ptr
     states_[name] = std::move(state);
     if (active) {
         current_ = states_[name].get();
-        current_->OnEnter();
+        current_->OnPolicyHandoff();
     }
     return retired;
 }
 
 bool FSM::ReadyForPolicySwitch() const {
     return current_ && current_->ReadyForPolicySwitch();
+}
+
+void FSM::RequestPolicySwitch(bool requested) {
+    if (current_) current_->RequestPolicySwitch(requested);
+}
+
+bool FSM::PolicyFinished() const {
+    return current_ && current_->PolicyFinished();
 }
 
 void FSM::SetDataPointers(robot_base::RobotData *sensor,

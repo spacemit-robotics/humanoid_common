@@ -102,6 +102,7 @@ struct Config {
     int anchor_body_index = -1;
     std::vector<int> anchor_waist_joint_indices;
     bool anchor_yaw_align = true;
+    bool anchor_xy_align = false;
 
     int future_frames = 0;
     int future_step = 1;
@@ -200,6 +201,15 @@ public:
     /** @brief Ready for a running handoff once stationary and without an active action. */
     virtual bool ReadyForPolicySwitch() const { return false; }
 
+    /** @brief Finish the current reference cycle instead of starting another one. */
+    virtual void PreparePolicySwitch(bool requested, double elapsed_s) {
+        (void)requested;
+        (void)elapsed_s;
+    }
+
+    /** @brief A finite reference has reached its end; continuous policies return false. */
+    virtual bool PlaybackFinished() const { return false; }
+
     /** @brief 推理前根据机器人状态和参考数据注入自定义模型输入 */
     virtual void PrepareInputs(const robot_base::RobotData &robot,
         double elapsed_s,
@@ -211,7 +221,7 @@ public:
      * 适配器可以保存模型输出供下一帧使用，也可以改写送往通用关节目标映射的
      * action。PolicyExecutor 内部状态不受改写影响。
      */
-    virtual void OnAction(std::vector<double> &action) {}
+    virtual void OnAction(std::vector<double> &) {}
 
     /** @brief Current external takeover weight, evaluated before building observations. */
     virtual double InteractionWeight() const { return 0.0; }
@@ -223,7 +233,7 @@ public:
     }
 
     /** @brief 开始手动参考时间轴；重复请求不会重新计时。 */
-    virtual bool StartPlayback(double elapsed_s) { return false; }
+    virtual bool StartPlayback(double) { return false; }
 
     /** @brief 接收一次带序号的交互动作请求 */
     virtual void HandleInteractionRequest(

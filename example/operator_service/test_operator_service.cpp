@@ -372,6 +372,8 @@ int main(int argc, char **argv) {
         assert(!request("policy", {{"policy", "hidden"}})["ok"].get<bool>());
         assert(!request("policy", {{"policy", "incompatible"}})["ok"].get<bool>());
         assert(request("velocity", {{"vx", 0.1}, {"vy", 0.0}, {"wz", 0.0}})["ok"].get<bool>());
+        running.interaction.phase = robot_base::InteractionStatus::Phase::PLAYING;
+        live.UpdateStatus(running, {});
         assert(request("policy", {{"policy", "peer"}})["ok"].get<bool>());
         assert(live.Command().vx == 0 && live.Command().switch_policy == "peer");
         assert(operator_service::DecodePolicy(live.Catalog()["policies"][0]).switch_group == "compatible");

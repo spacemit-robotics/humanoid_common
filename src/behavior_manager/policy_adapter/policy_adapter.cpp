@@ -99,6 +99,50 @@ PlaybackSample SamplePlayback(double elapsed_s,
         config.playback_speed, config.loop, config.loop_pause);
 }
 
+// A live handoff finishes the current cycle and holds its final reference.
+// Once the last frame is reached, keep it even if the request is cancelled.
+// Resuming the old wall clock would otherwise jump into a later loop cycle.
+class ReferenceHandoff {
+public:
+    void Reset() { requested_ = ready_ = finished_ = holding_ = false; }
+
+    void Request(bool requested, double elapsed, int frames, const Config &config) {
+        if (requested && !requested_) {
+            const double duration = frames / (config.motion_fps * config.playback_speed);
+            const double cycle = duration + config.loop_pause;
+            end_ = config.loop
+                ? std::floor(std::max(0.0, elapsed) / cycle) * cycle + duration : duration;
+        }
+        requested_ = requested;
+    }
+
+    PlaybackSample Sample(double elapsed, int frames, const Config &config, bool waiting = false) {
+        PlaybackSample sample;
+        if (!waiting) {
+            holding_ = holding_ || (requested_ && elapsed >= end_);
+            if (holding_) {
+                sample = SamplePlayback(frames / (config.motion_fps * config.playback_speed),
+                    frames, config.motion_fps, config.playback_speed, false, 0.0);
+            } else {
+                sample = SamplePlayback(elapsed, frames, config);
+            }
+        }
+        ready_ = waiting || sample.hold_last_frame;
+        finished_ = !waiting && !config.loop && sample.hold_last_frame;
+        return sample;
+    }
+
+    bool Ready() const { return ready_; }
+    bool Finished() const { return finished_; }
+
+private:
+    bool requested_ = false;
+    bool ready_ = false;
+    bool finished_ = false;
+    bool holding_ = false;
+    double end_ = 0.0;
+};
+
 Eigen::Quaternionf RobotQuaternion(const robot_base::RobotData &robot) {
     Eigen::Quaternionf quat(static_cast<float>(robot.base_quat[0]),
                             static_cast<float>(robot.base_quat[1]),
@@ -175,19 +219,31 @@ public:
 
     const char *Type() const override { return "mjlab"; }
 
+    bool ReadyForPolicySwitch() const override { return handoff_.Ready(); }
+    bool PlaybackFinished() const override { return handoff_.Finished(); }
+    void PreparePolicySwitch(bool requested, double elapsed_s) override {
+        handoff_.Request(requested, elapsed_s - playback_start_elapsed_, num_frames_, config_);
+    }
+
     void Reset(const robot_base::RobotData &robot) override {
+        handoff_.Reset();
         reference_sample_ready_ = false;
         playback_start_elapsed_ = 0.0;
         playback_started_ = !config_.manual_start;
-        if (!config_.anchor_yaw_align) {
-            heading_offset_ = Eigen::Quaternionf::Identity();
-            return;
+        heading_offset_ = Eigen::Quaternionf::Identity();
+        if (config_.anchor_yaw_align) {
+            const Eigen::Quaternionf robot_anchor =
+                AnchorQuaternion(robot, config_.anchor_waist_joint_indices);
+            heading_offset_ = YawQuaternion(QuaternionYaw(robot_anchor)) *
+                YawQuaternion(QuaternionYaw(reference_quat_[0])).conjugate();
+            heading_offset_.normalize();
         }
-        const Eigen::Quaternionf robot_anchor =
-            AnchorQuaternion(robot, config_.anchor_waist_joint_indices);
-        heading_offset_ = YawQuaternion(QuaternionYaw(robot_anchor)) *
-            YawQuaternion(QuaternionYaw(reference_quat_[0])).conjugate();
-        heading_offset_.normalize();
+        origin_offset_.setZero();
+        if (config_.anchor_xy_align) {
+            const Eigen::Vector3f first = heading_offset_ * reference_pos_[0];
+            origin_offset_.x() = static_cast<float>(robot.base_pos[0]) - first.x();
+            origin_offset_.y() = static_cast<float>(robot.base_pos[1]) - first.y();
+        }
     }
 
     bool StartPlayback(double elapsed_s) override {
@@ -204,8 +260,8 @@ public:
         double elapsed_s,
         rl_policy::PolicyExecutor &policy) override {
         const bool waiting = config_.manual_start && !playback_started_;
-        const PlaybackSample sample = waiting ? PlaybackSample{} :
-            SamplePlayback(elapsed_s - playback_start_elapsed_, num_frames_, config_);
+        const PlaybackSample sample = handoff_.Sample(
+            elapsed_s - playback_start_elapsed_, num_frames_, config_, waiting);
         const Eigen::VectorXf &pos0 = reference_joint_pos_[sample.frame0];
         const Eigen::VectorXf &pos1 = reference_joint_pos_[sample.frame1];
         const Eigen::VectorXf &vel0 = reference_joint_vel_[sample.frame0];
@@ -234,7 +290,7 @@ public:
         Eigen::Quaternionf reference_quat = reference_quat_[sample.frame0]
             .slerp(sample.alpha, reference_quat_[sample.frame1])
             .normalized();
-        reference_pos = heading_offset_ * reference_pos;
+        reference_pos = heading_offset_ * reference_pos + origin_offset_;
         reference_quat = (heading_offset_ * reference_quat).normalized();
 
         const Eigen::Vector3f position_body = robot_anchor.conjugate() *
@@ -486,11 +542,13 @@ private:
     std::vector<Eigen::Vector3f> reference_pos_;
     std::vector<Eigen::Quaternionf> reference_quat_;
     Eigen::Quaternionf heading_offset_ = Eigen::Quaternionf::Identity();
+    Eigen::Vector3f origin_offset_ = Eigen::Vector3f::Zero();
     std::vector<float> motion_command_;
     std::array<float, 3> anchor_pos_body_ = {};
     std::array<float, 6> anchor_ori_body_ = {};
     int action_dim_ = 0;
     bool reference_sample_ready_ = false;
+    ReferenceHandoff handoff_;
     bool playback_started_ = true;
     double playback_start_elapsed_ = 0.0;
     std::vector<ReferenceActionBinding> reference_action_bindings_;
@@ -545,7 +603,14 @@ public:
 
     const char *Type() const override { return "protomotions"; }
 
+    bool ReadyForPolicySwitch() const override { return handoff_.Ready(); }
+    bool PlaybackFinished() const override { return handoff_.Finished(); }
+    void PreparePolicySwitch(bool requested, double elapsed_s) override {
+        handoff_.Request(requested, elapsed_s, static_cast<int>(motion_.size()), config_);
+    }
+
     void Reset(const robot_base::RobotData &robot) override {
+        handoff_.Reset();
         const Eigen::Quaternionf robot_heading_source =
             ProtomotionsAnchorQuaternion(robot);
         heading_offset_ = YawQuaternion(
@@ -557,7 +622,7 @@ public:
     void PrepareInputs(const robot_base::RobotData &robot,
         double elapsed_s,
         rl_policy::PolicyExecutor &policy) override {
-        const PlaybackSample sample = SamplePlayback(
+        const PlaybackSample sample = handoff_.Sample(
             elapsed_s, static_cast<int>(motion_.size()), config_);
         frame_index_ = sample.frame0;
         SetProtomotionsInputs(robot, policy);
@@ -730,6 +795,7 @@ private:
             AppendDofInModelOrder(future.dof_pos, future_dof_pos);
             AppendDofInModelOrder(future.dof_vel, future_dof_vel);
         }
+        if (handoff_.Ready()) std::fill(future_dof_vel.begin(), future_dof_vel.end(), 0.0F);
         policy.SetModelInput("mimic_future_anchor_rot", future_anchor.data(),
             future_anchor.size());
         policy.SetModelInput("mimic_future_dof_pos", future_dof_pos.data(),
@@ -743,6 +809,7 @@ private:
     int robot_dof_count_ = 0;
     int model_dof_count_ = 0;
     std::vector<ProtomotionsFrame> motion_;
+    ReferenceHandoff handoff_;
     int frame_index_ = 0;
     Eigen::Quaternionf heading_offset_ = Eigen::Quaternionf::Identity();
 };
@@ -779,7 +846,28 @@ public:
 
     const char *Type() const override { return "sonic"; }
 
+    bool ReadyForPolicySwitch() const override {
+        return interactive_ ? !transition_active_ &&
+            (!playback_active_ || status_.phase == robot_base::InteractionStatus::Phase::FINISHED)
+            : handoff_.Ready();
+    }
+    bool PlaybackFinished() const override {
+        return interactive_ ? status_.phase == robot_base::InteractionStatus::Phase::FINISHED &&
+            playback_active_ : handoff_.Finished();
+    }
+    void PreparePolicySwitch(bool requested, double elapsed_s) override {
+        if (interactive_) {
+            if (requested && !canceling_ && (playback_active_ || transition_active_))
+                BeginTransition(default_clip_index_, elapsed_s, false, true);
+        } else {
+            const auto &clip = ActiveClip();
+            handoff_.Request(requested, PlaybackElapsed(elapsed_s),
+                static_cast<int>(clip.frames.size()), config_);
+        }
+    }
+
     void Reset(const robot_base::RobotData &robot) override {
+        handoff_.Reset();
         active_clip_index_ = default_clip_index_;
         playback_start_elapsed_ = 0.0;
         transition_start_elapsed_ = 0.0;
@@ -801,6 +889,8 @@ public:
         }
         last_robot_quat_ = RobotQuaternion(robot);
         UpdateInteractionStatus(elapsed_s);
+        if (!interactive_) handoff_.Sample(PlaybackElapsed(elapsed_s),
+            static_cast<int>(ActiveClip().frames.size()), config_);
 
         const PlaybackSample sample = ActiveSample(elapsed_s);
         const double transition_alpha = TransitionAlpha(elapsed_s);
@@ -1107,6 +1197,12 @@ private:
 
     PlaybackSample ActiveSample(double elapsed_s) const {
         const auto &clip = ActiveClip();
+        if (!interactive_ && handoff_.Ready()) {
+            return SamplePlayback(static_cast<double>(clip.frames.size()) /
+                (clip.config.motion_fps * clip.config.playback_speed),
+                static_cast<int>(clip.frames.size()), clip.config.motion_fps,
+                clip.config.playback_speed, false, 0.0);
+        }
         return SamplePlayback(PlaybackElapsed(elapsed_s),
             static_cast<int>(clip.frames.size()), clip.config.motion_fps,
             clip.config.playback_speed, clip.config.loop,
@@ -1316,6 +1412,7 @@ private:
     std::size_t default_clip_index_ = 0;
     std::size_t active_clip_index_ = 0;
     bool interactive_ = false;
+    ReferenceHandoff handoff_;
     bool playback_active_ = false;
     bool transition_active_ = false;
     bool canceling_ = false;
@@ -1520,6 +1617,8 @@ Config LoadConfig(const std::string &yaml_path,
                 .value_or(std::vector<int>{});
         config.anchor_yaw_align = yaml.Read<bool>(
             adapter_base + ".anchor_yaw_align").value_or(true);
+        config.anchor_xy_align = yaml.Read<bool>(
+            adapter_base + ".anchor_xy_align").value_or(false);
         config.future_frames = yaml.Read<int>(
             adapter_base + ".future_frames").value_or(0);
         config.future_step = yaml.Read<int>(
@@ -1562,6 +1661,8 @@ Config LoadConfig(const std::string &yaml_path,
             .value_or(std::vector<int>{});
     config.anchor_yaw_align = yaml.Read<bool>(
         policy_base + ".anchor_yaw_align").value_or(true);
+    config.anchor_xy_align = yaml.Read<bool>(
+        policy_base + ".anchor_xy_align").value_or(false);
     return config;
 }
 

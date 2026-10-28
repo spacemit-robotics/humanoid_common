@@ -277,6 +277,13 @@ public:
         return settings_.command_type == "gait" ? stationary_ : current_motion_ == 0 &&
             !switch_pending_ && status_.phase != Phase::BLEND_OUT;
     }
+    void PreparePolicySwitch(bool requested, double elapsed_s) override {
+        (void)elapsed_s;
+        if (requested && settings_.command_type != "gait" && current_motion_ != 0) {
+            pending_motion_ = 0;
+            switch_pending_ = true;
+        }
+    }
     std::string ActiveModelName() const override {
         return settings_.command_type == "gait" ? (stationary_ ? "stand" : "gait")
             : settings_.motions[current_motion_].name;

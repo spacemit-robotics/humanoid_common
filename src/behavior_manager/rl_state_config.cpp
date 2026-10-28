@@ -102,6 +102,15 @@ RLConfig LoadRLStateConfig(const std::string &yaml_path,
     config.entry_target_transition_duration =
         yaml.Read<double>(base + ".entry_target_transition_duration")
             .value_or(0.0);
+    const auto switch_node = YAML::LoadFile(yaml_path)["rl_policy"]
+        ["onnx_infer"]["policies"][policy_name]["policy_switch"];
+    if (switch_node && switch_node["transition_duration"]) {
+        config.switch_transition_duration = switch_node["transition_duration"].as<double>();
+    }
+    if (!std::isfinite(config.switch_transition_duration) ||
+        config.switch_transition_duration < 0.0) {
+        throw std::runtime_error("[BehaviorManager] invalid policy_switch.transition_duration");
+    }
     if (!std::isfinite(config.entry_target_transition_duration) ||
         config.entry_target_transition_duration < 0.0) {
         throw std::runtime_error(

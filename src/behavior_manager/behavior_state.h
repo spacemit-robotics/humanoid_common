@@ -33,6 +33,9 @@ public:
     // Quiesce a replaced state; expensive destruction may happen off the control thread.
     virtual void SuspendForReplacement() { OnExit(); }
     virtual bool ReadyForPolicySwitch() const { return false; }
+    virtual void RequestPolicySwitch(bool requested) { (void)requested; }
+    virtual bool PolicyFinished() const { return false; }
+    virtual void OnPolicyHandoff() { OnEnter(); }
     // 当前状态是否已满足进入 RL 的前置条件（仅 ZERO 覆盖）
     virtual bool ReadyForRl() const { return false; }
     // 当前状态内部产生的安全故障（仅故障状态覆盖）

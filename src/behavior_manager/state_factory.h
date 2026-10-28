@@ -87,6 +87,7 @@ struct RLConfig {
     policy_adapter::Config policy_adapter;
     std::vector<double> zero_target_pos;  // ZERO 阶段目标位姿（可选，空则用 rl_default_pos）
     double entry_target_transition_duration = 0.0;  // RL 入场目标位置过渡时长（秒）
+    double switch_transition_duration = 0.0;  // Live handoff position and gain blend, seconds.
 
     // 可选目标位置限位，按机器人关节顺序，单位 rad；两组为空时禁用。
     std::vector<double> target_position_lower;

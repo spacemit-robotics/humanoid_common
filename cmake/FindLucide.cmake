@@ -4,6 +4,8 @@ include("${CMAKE_CURRENT_LIST_DIR}/FetchThirdParty.cmake")
 fetch_thirdparty(
     NAME lucide/0.468.0
     ARCHIVE_URL https://registry.npmjs.org/lucide/-/lucide-0.468.0.tgz
+    ARCHIVE_FALLBACK_URLS https://registry.npmmirror.com/lucide/-/lucide-0.468.0.tgz
+    ARCHIVE_SHA256 cab2924552d273da12de0beab51d81ef2e2d397b0ac0eef010eaa02fd4ae5764
     ARCHIVE_SUBDIR package
     OUT_SOURCE_DIR _lucide_source_dir
 )

@@ -10,6 +10,9 @@
   by `cmake/FindLucide.cmake` from the published package. The browser bundle and
   ISC license are installed under `share/humanoid_common/operator_web/vendor/`.
   The ISC notice is also retained in `LICENSE.lucide`.
+  Downloads retry each source twice, then use the npm mirror with the same
+  pinned archive SHA256; bundle and license hashes are checked independently.
+  Each attempt has a 60-second total and 15-second inactivity timeout.
 
 Sources and packages are cached in `~/.cache/thirdparty/`. Set the environment
 variable `SROBOTIS_THIRDPARTY_CACHE` to use another cache root. For offline builds,

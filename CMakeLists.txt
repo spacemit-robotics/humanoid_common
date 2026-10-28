@@ -416,6 +416,8 @@ target_link_libraries(test_audio_player PRIVATE Threads::Threads)
 add_test(NAME audio_player COMMAND test_audio_player)
 find_package(Python3 QUIET COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+    add_test(NAME thirdparty_fetch COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/runtime/test_fetch_thirdparty.py)
     add_test(NAME log_tools COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/example/runtime/test_log_tools.py)
     add_test(NAME audio_process COMMAND ${Python3_EXECUTABLE}

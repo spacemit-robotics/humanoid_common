@@ -487,6 +487,12 @@ if(BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/test_web_connection.js)
     endif()
     enable_testing()
+    add_executable(test_status_reporting example/transport_executor/test_status_reporting.cpp)
+    target_include_directories(test_status_reporting PRIVATE
+        src/runtime/control src/transport/transport_executor)
+    target_link_libraries(test_status_reporting PRIVATE transport_executor robot_base)
+    target_compile_options(test_status_reporting PRIVATE -UNDEBUG)
+    add_test(NAME status_reporting COMMAND test_status_reporting)
     add_executable(test_operator_service example/operator_service/test_operator_service.cpp)
     target_link_libraries(test_operator_service PRIVATE operator_service)
     target_compile_options(test_operator_service PRIVATE -UNDEBUG)
@@ -602,6 +608,7 @@ if(BUILD_RL)
     target_include_directories(test_policy_adapter PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/transport_executor
         ${RL_INCLUDE_DIR}
     )
     target_link_libraries(test_policy_adapter PRIVATE

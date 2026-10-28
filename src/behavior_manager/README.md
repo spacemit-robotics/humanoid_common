@@ -165,6 +165,8 @@ HMI 的 `x` 才能清除锁存。重复收到同一条已确认的恢复状态�
 - **前置策略链调度：** 目标策略可在 yaml 配置 `prerequisite: { policy, duration }`，behavior_manager 收到切换请求后自动先切前置策略，在 RL 状态运行 `duration` 秒后再切目标策略；用户感知层面只发一次切换命令。典型场景：`dance` / `kungfu` 配 `prerequisite: stand`，先用 LocoMode 站稳并预热 LSTM，再进 dance/kungfu，避免直接从 PD 锁位的 ZERO 切动态动作时摔倒
 - **安全保护：** driver 故障、状态超时、无效数据、姿态超限和 RL 推理/action 超时统一触发安全状态并跨进程锁存
 - **状态回传：** `CurrentState()`、`IsZeroReady()`、当前策略和 RL 频率由 control_runtime 组装为 `ControlStatus` 发给 HMI
+- **交互取消：** `history_actor` 在待命时确认取消并保持 IDLE；重复取消不重置动作退出进度，尚未执行的动作也可取消。
+- **交互状态校验：** 交互元数据无效时保留同一策略最近一次有效交互信息，继续发送当前 FSM、故障和控制状态；切换策略时清除缓存。其他状态字段仍按原规则校验。
 - **参数隔离：** damp_kd ≈ policy kd / 5（不同阶段刚度需求不同）
 ## Fixed-Base Trajectory Behavior
 

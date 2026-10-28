@@ -244,6 +244,18 @@ public:
         status_.sequence = request.sequence;
         status_.request_accepted = true;
         if (request.operation == Op::CANCEL) {
+            if (current_motion_ == 0) {
+                // Repeated cancellation must not restart a return already in
+                // progress. Cancelling standby (or a not-yet-selected start)
+                // is an acknowledged no-op, never an unnamed BLEND_OUT.
+                if (status_.phase == Phase::BLEND_OUT) return;
+                pending_motion_ = 0;
+                switch_pending_ = false;
+                status_ = {};
+                status_.sequence = request.sequence;
+                status_.request_accepted = true;
+                return;
+            }
             pending_motion_ = 0;
             switch_pending_ = true;
             return;

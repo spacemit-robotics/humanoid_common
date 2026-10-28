@@ -7,6 +7,7 @@
  */
 
 #include "policy_adapter/policy_adapter.h"
+#include "transport_packet.h"
 
 #include <algorithm>
 #include <array>
@@ -391,6 +392,32 @@ void TestHistoryActorCommands() {
     robot = robot_base::RobotData::Create(10);
     robot.base_quat = {1, 0, 0, 0};
     adapter->Reset(robot);
+    const auto require_status = [&]() {
+        robot_base::ControlStatus status;
+        status.mode = robot_base::ControlMode::RL;
+        status.active_policy = "dance";
+        status.interaction = adapter->GetInteractionStatus();
+        Require(transport::CanEncodeStatus(status, {}), "Dance metadata must never block the status heartbeat");
+    };
+    // Exhibition failure: RT alone cancelled standby before any dance started.
+    for (uint64_t sequence = 1; sequence < 4; ++sequence) {
+        adapter->HandleInteractionRequest({sequence, robot_base::InteractionRequest::Operation::CANCEL, ""}, 0);
+        for (int frame = 0; frame < 40; ++frame) {
+            auto &selected = adapter->SelectExecutor({}, policy);
+            adapter->PrepareInputs(robot, frame * s.dt, selected);
+            require_status();
+            Require(adapter->GetInteractionStatus().phase == robot_base::InteractionStatus::Phase::IDLE &&
+                adapter->GetInteractionStatus().request_accepted && adapter->ReadyForPolicySwitch(),
+                "Idle cancellation must stay ready and acknowledge the request");
+        }
+    }
+    // A start cancelled before decoder selection must not leave a phantom dance.
+    adapter->HandleInteractionRequest({4, robot_base::InteractionRequest::Operation::START, "root"}, 0);
+    adapter->HandleInteractionRequest({5, robot_base::InteractionRequest::Operation::CANCEL, ""}, 0);
+    adapter->SelectExecutor({}, policy);
+    require_status();
+    Require(adapter->ReadyForPolicySwitch(), "Pending start cancellation must stay in standby");
+    adapter->Reset(robot);
     robot_base::InteractionRequest request;
     request.sequence = 1;
     request.action = "root";
@@ -421,6 +448,14 @@ void TestHistoryActorCommands() {
     action.assign(10, 2.0);
     adapter->OnAction(action);
     Require(action == last_output, "Cancellation during blending must preserve output continuity");
+    // Repeated lease-clear cancellations must not perpetually restart BLEND_OUT.
+    for (uint64_t sequence = 3; sequence < 43; ++sequence) {
+        adapter->HandleInteractionRequest({sequence, robot_base::InteractionRequest::Operation::CANCEL, ""}, 0);
+        auto &selected = adapter->SelectExecutor({}, policy);
+        adapter->PrepareInputs(robot, sequence * s.dt, selected);
+        require_status();
+    }
+    Require(adapter->ReadyForPolicySwitch(), "Repeated cancellation must finish returning to standby");
 
     s.motions.back().mask_root_position = true;
     adapter = Create(config, policy_config);

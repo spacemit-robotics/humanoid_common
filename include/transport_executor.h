@@ -145,6 +145,9 @@ std::unique_ptr<TransportBase> Create(const std::string& yaml_path);
 /** @brief 创建支持结构化运行时故障传输的 v2 实例。 */
 std::unique_ptr<TransportBaseV2> CreateV2(const std::string &yaml_path);
 
+/** @brief Check interaction metadata against the status wire contract, without sending. */
+bool IsValidInteractionStatus(const robot_base::InteractionStatus &status);
+
 }  // namespace transport
 
 #endif  // TRANSPORT_EXECUTOR_H

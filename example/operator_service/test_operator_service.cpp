@@ -221,6 +221,20 @@ int main(int argc, char **argv) {
     config.status_timeout = 0.08;
     config.request_timeout = 0.08;
     config.policies.push_back({"test_policy", true, {-0.1, -0.2, -0.3}, {0.1, 0.2, 0.3}, {{"wave", "Wave"}}});
+    {
+        Service offline(config);
+        const auto spectator = offline.Open();
+        uint64_t id = 0;
+        const auto request = [&](const std::string &op, const Json &args) {
+            return offline.Handle(spectator, {{"v", 1}, {"id", ++id}, {"op", op}, {"args", args}});
+        };
+        assert(!request("state", {{"state", "POWER_OFF"}})["ok"].get<bool>());
+        assert(request("hello", {{"token", config.token}, {"name", "spectator"}})["ok"].get<bool>());
+        assert(!offline.Snapshot(spectator).online && !offline.Snapshot(spectator).owns_control);
+        assert(!request("state", {{"state", "RL"}})["ok"].get<bool>());
+        assert(request("state", {{"state", "POWER_OFF"}})["ok"].get<bool>());
+        assert(offline.Command().key == -1 && !offline.Snapshot(spectator).owns_control);
+    }
     Service service(config);
     assert(!service.Catalog().at("teleop").contains("slow_limits"));
     assert(service.Catalog().at("policies").at(0).at("client_smoothing").get<bool>());

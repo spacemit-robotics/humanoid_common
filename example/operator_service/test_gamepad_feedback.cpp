@@ -8,7 +8,97 @@
 #include <cassert>
 #include <cstdio>
 
+namespace {
+struct Probe {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::vector<std::string> starts;
+    bool release = false;
+    int completed = 0;
+};
+
+void WaitFor(const std::shared_ptr<Probe> &probe, const std::function<bool()> &ready) {
+    std::unique_lock<std::mutex> lock(probe->mutex);
+    assert(probe->wake.wait_for(lock, std::chrono::seconds(2), ready));
+}
+
+void TestBlockedOutput() {
+    auto probe = std::make_shared<Probe>();
+    operator_gamepad::Rumble rumble([probe](const auto &session) {
+        {
+            std::unique_lock<std::mutex> lock(probe->mutex);
+            probe->starts.push_back(session->config.device);
+            probe->wake.notify_all();
+            if (session->config.device == "blocked")
+                probe->wake.wait(lock, [&] { return probe->release; });
+        }
+        {
+            std::unique_lock<std::mutex> lock(session->mutex);
+            session->wake.wait(lock, [&] { return session->stop; });
+            assert(!session->pulse);
+        }
+        std::lock_guard<std::mutex> lock(probe->mutex);
+        ++probe->completed;
+        probe->wake.notify_all();
+    });
+    operator_gamepad::FeedbackConfig config;
+    config.device = "blocked";
+    rumble.Start(config, "", 0, 0);
+    WaitFor(probe, [&] { return probe->starts.size() == 1; });
+    const auto start = std::chrono::steady_clock::now();
+    rumble.Pulse();
+    rumble.Stop();
+    for (int i = 0; i < 32; ++i) {
+        config.device = "replaced";
+        rumble.Start(config, "", 0, 0);
+    }
+    config.device = "latest";
+    rumble.Start(config, "", 0, 0);
+    assert(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500));
+    {
+        std::lock_guard<std::mutex> lock(probe->mutex);
+        assert(probe->starts.size() == 1);  // One worker, even with a blocked USB write.
+        probe->release = true;
+        probe->wake.notify_all();
+    }
+    WaitFor(probe, [&] { return probe->starts.size() == 2; });
+    {
+        std::lock_guard<std::mutex> lock(probe->mutex);
+        assert(probe->starts.back() == "latest");
+    }
+    rumble.Stop();
+    WaitFor(probe, [&] { return probe->completed == 2; });
+}
+
+void TestBoundedShutdown() {
+    auto probe = std::make_shared<Probe>();
+    auto rumble = std::make_unique<operator_gamepad::Rumble>([probe](const auto &session) {
+        std::unique_lock<std::mutex> lock(probe->mutex);
+        probe->starts.push_back(session->config.device);
+        probe->wake.notify_all();
+        probe->wake.wait(lock, [&] { return probe->release; });
+        ++probe->completed;
+        probe->wake.notify_all();
+    });
+    operator_gamepad::FeedbackConfig config;
+    config.device = "blocked";
+    rumble->Start(config, "", 0, 0);
+    WaitFor(probe, [&] { return !probe->starts.empty(); });
+    const auto start = std::chrono::steady_clock::now();
+    rumble.reset();
+    assert(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500));
+    {
+        std::lock_guard<std::mutex> lock(probe->mutex);
+        probe->release = true;
+        probe->wake.notify_all();
+    }
+    WaitFor(probe, [&] { return probe->completed == 1; });
+}
+}  // namespace
+
 int main() {
+    TestBlockedOutput();
+    TestBoundedShutdown();
     operator_gamepad::SuccessFeedback feedback;
     operator_service::Status status;
     status.online = true;

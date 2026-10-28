@@ -29,6 +29,8 @@
 #include <utility>
 #include <vector>
 
+#include <yaml-cpp/yaml.h>
+
 #include "behavior_fsm.h"      // 内部实现，位于 src/
 #include "runtime_logger.h"
 #include "state_factory.h"     // 内部实现，位于 src/
@@ -659,6 +661,16 @@ public:
             yaml_file.Read<std::vector<double>>("behavior_manager.home.kd").value_or(robot_kd);
         ValidateGainVector(home_kp, num_dof, "behavior_manager.home.kp");
         ValidateGainVector(home_kd, num_dof, "behavior_manager.home.kd");
+        std::vector<double> home_lower, home_upper;
+        // Safety limits require strict YAML parsing: conversion errors must not
+        // be interpreted as an omitted optional setting.
+        const auto home_node = YAML::LoadFile(path)["behavior_manager"]["home"];
+        if (home_node && (home_node["target_position_lower"] || home_node["target_position_upper"])) {
+            home_lower = home_node["target_position_lower"].as<std::vector<double>>();
+            home_upper = home_node["target_position_upper"].as<std::vector<double>>();
+            if (home_lower.empty() || home_upper.empty())
+                throw std::runtime_error("HOME target limits must not be empty when configured");
+        }
         const auto zero_kp_opt =
             yaml_file.Read<std::vector<double>>("behavior_manager.zero.kp");
         const auto zero_kd_opt =
@@ -691,7 +703,7 @@ public:
         fsm.AddState(StateName::DAMP, CreateStateDamp(damp_kd));
         fsm.AddState(StateName::HOME,
             CreateStateHome(default_joint_pos, home_gain_ramp_duration,
-                            home_move_duration, home_kp, home_kd));
+                            home_move_duration, home_kp, home_kd, home_lower, home_upper));
 
         // RL 状态配置：调用 policy_executor 提供的统一解析接口
         // ZERO 目标位置跟随当前策略，控制增益使用 behavior_manager.zero。

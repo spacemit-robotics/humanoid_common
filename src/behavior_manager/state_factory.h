@@ -118,7 +118,9 @@ std::unique_ptr<State> CreateStateHome(const std::vector<double> &default_pos,
         double gain_ramp_duration,
         double move_duration,
         const std::vector<double> &kp,
-        const std::vector<double> &kd);
+        const std::vector<double> &kd,
+        const std::vector<double> &target_lower = {},
+        const std::vector<double> &target_upper = {});
 std::unique_ptr<State> CreateStateZero(const std::vector<double> &default_pos,
                                         const ZeroTransitionConfig &transition_config,
                                         const std::vector<double> &kp,

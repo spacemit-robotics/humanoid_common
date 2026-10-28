@@ -7,11 +7,13 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
-#include "behavior_state.h"
+#include "state_factory.h"
 
 namespace behavior_manager {
 namespace {
@@ -29,7 +31,21 @@ public:
             double gain_ramp_duration,
             double move_duration,
             const std::vector<double> &kp,
-            const std::vector<double> &kd) {
+            const std::vector<double> &kd,
+            const std::vector<double> &target_lower,
+            const std::vector<double> &target_upper) {
+        if (!target_lower.empty() || !target_upper.empty()) {
+            if (target_lower.size() != default_pos.size() || target_upper.size() != default_pos.size())
+                throw std::runtime_error("HOME target limits must match joint dimensions");
+            for (std::size_t i = 0; i < default_pos.size(); ++i) {
+                if (!std::isfinite(target_lower[i]) || !std::isfinite(target_upper[i]) ||
+                    target_lower[i] >= target_upper[i] || !std::isfinite(default_pos[i]) ||
+                    default_pos[i] < target_lower[i] || default_pos[i] > target_upper[i])
+                    throw std::runtime_error("HOME target limits or default pose are invalid");
+            }
+        }
+        target_lower_ = target_lower;
+        target_upper_ = target_upper;
         default_pos_ = default_pos;
         gain_ramp_duration_ = gain_ramp_duration;
         move_duration_ = move_duration;
@@ -45,6 +61,10 @@ public:
         if (!output_ || init_pos_.size() != default_pos_.size()) return;
 
         const std::size_t num_dof = default_pos_.size();
+        // A freely hanging joint can be outside the command envelope. Start
+        // the gain ramp at the nearest legal target; never alter sensor data.
+        for (std::size_t i = 0; i < target_lower_.size(); ++i)
+            init_pos_[i] = std::clamp(init_pos_[i], target_lower_[i], target_upper_[i]);
         output_->enable = true;
         output_->actuation_mode = robot_base::ActuationMode::HYBRID;
         output_->target_pos = init_pos_;
@@ -111,6 +131,8 @@ private:
     std::vector<double> init_pos_;
     std::vector<double> kp_;
     std::vector<double> kd_;
+    std::vector<double> target_lower_;
+    std::vector<double> target_upper_;
     double gain_ramp_duration_ = 1.0;
     double move_duration_ = 3.0;
     double timer_ = 0.0;
@@ -121,9 +143,11 @@ std::unique_ptr<State> CreateStateHome(const std::vector<double> &default_pos,
         double gain_ramp_duration,
         double move_duration,
         const std::vector<double> &kp,
-        const std::vector<double> &kd) {
+        const std::vector<double> &kd,
+        const std::vector<double> &target_lower,
+        const std::vector<double> &target_upper) {
     auto state = std::make_unique<StateHome>();
-    state->SetConfig(default_pos, gain_ramp_duration, move_duration, kp, kd);
+    state->SetConfig(default_pos, gain_ramp_duration, move_duration, kp, kd, target_lower, target_upper);
     return state;
 }
 

@@ -125,6 +125,7 @@ cd ~/spacemit_robot
 - `behavior_manager.damp_kd`：阻尼状态 kd（≈ policy kd / 5）
 - `behavior_manager.home.gain_ramp_duration / move_duration`：HOME 建立增益和移动时长，`move_duration` 默认 3 秒
 - `behavior_manager.home.kp/kd`（可选）：HOME 增益；未配置时使用 `robot_base.kp/kd`
+- `behavior_manager.home.target_position_lower / target_position_upper`（可选）：HOME 目标位置范围，按关节顺序、单位 rad，须成对配置。初始反馈越界时，增益渐入阶段从最近的有效目标开始，再平滑移向默认姿态；反馈不修改。默认姿态本身越界则拒绝配置。未配置时保持原行为。
 - `behavior_manager.zero_pos`：未配置 RL 策略时的 ZERO 目标位置；配置策略后使用 `rl_policy.onnx_infer.policies.<name>.zero_target_pos` 或 `rl_default_pos`
 - `behavior_manager.zero.move_duration / kp / kd`：ZERO 移动时长和独立安全增益，`move_duration` 默认 3 秒；kp/kd 必须同时配置
 - `behavior_manager.zero.position_tolerance / velocity_tolerance / settle_duration`：ZERO 到位条件，默认分别为 0.15 rad、0.10 rad/s、0.20 秒

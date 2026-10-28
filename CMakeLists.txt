@@ -610,6 +610,11 @@ if(BUILD_RL)
 
     if(BUILD_TESTS)
         add_test(NAME policy_adapter COMMAND test_policy_adapter)
+        add_executable(test_home_limits example/behavior_manager/test_home_limits.cpp)
+        target_include_directories(test_home_limits PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager ${RL_INCLUDE_DIR})
+        target_link_libraries(test_home_limits PRIVATE behavior_manager robot_base Eigen3::Eigen)
+        add_test(NAME home_limits COMMAND test_home_limits)
         add_executable(test_trajectory example/behavior_manager/test_trajectory.cpp)
         target_include_directories(test_trajectory PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager)

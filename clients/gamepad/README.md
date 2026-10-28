@@ -11,8 +11,9 @@ hid-generic 驱动，避免加载 hid-playstation 后错误解释相同 VID/PID�
 输入读取为 O_RDONLY、不使用 EVIOCGRAB，不修改接收器固件或配对状态。
 默认不写 HID；显式配置可选 `rumble` 后，仅独立反馈线程写入震动报告。
 
-每条 binding 支持一个键或两个不同按键，operation 为 control/state/policy/preset/action/cancel/ack。
+每条 binding 支持一个键或两个不同按键，operation 为 control/state/policy/preset/action/reference/cancel/ack。
 control 切换控制权持有状态；其余操作复用现有 HMI 校验和控制链路。
+`reference` 启动当前策略的手动参考播放，与 TUI 的 G 和网页“开始参考”一致，不需要 value。
 显式 `POWER_OFF` 按键在服务已连接、已认证时，不要求状态回传新鲜或已持有控制权；
 网页同样保留此人工掉电入口，并保留管理员校验。状态过期、网络断开或手柄断开
 不会自动触发该操作。

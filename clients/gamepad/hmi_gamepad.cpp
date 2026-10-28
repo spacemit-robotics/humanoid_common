@@ -185,6 +185,7 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
             } else if (command.operation == "policy") reply = client.SelectPolicy(command.value);
             else if (command.operation == "action") reply = client.StartInteraction(command.value);
             else if (command.operation == "cancel") reply = client.CancelInteraction();
+            else if (command.operation == "reference") reply = client.StartReference();
             else if (command.operation == "ack") reply = client.AcknowledgeFault();
             Report(label, reply);
             feedback.Track(command.operation, command.value, status, reply);

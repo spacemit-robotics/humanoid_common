@@ -108,6 +108,7 @@ void Run(operator_service::Client *client) {
     const auto step = client->VelocityStep();
     auto last_renew = Clock::now(), last_velocity = last_renew, highlight_until = last_renew;
     uint64_t pending = 0;
+    std::string previous_policy;
     const auto reply = [&](const operator_service::Reply &r, const std::string &label) {
         view.last_action = label + "：" + ReplyMessage(r);
         if (r.ok && r.request.phase == "accepted") pending = r.request.sequence;
@@ -126,6 +127,10 @@ void Run(operator_service::Client *client) {
         const auto now = Clock::now();
         view.status = client->LatestStatus();
         const auto &s = view.status;
+        if (s.policy != previous_policy) {
+            view.target_command = {};
+            previous_policy = s.policy;
+        }
         if (!s.owns_control || !s.online || s.state != "RL") view.target_command = {};
         if (pending && s.request.sequence == pending && s.request.phase != "accepted") {
             view.last_action =
@@ -196,8 +201,11 @@ void Run(operator_service::Client *client) {
             if (key == kUp || key == 'k') cursor = std::max(0, cursor - 1);
             if (key == kDown || key == 'j') cursor = std::min(std::max(0, count - 1), cursor + 1);
             if ((key == '\r' || key == '\n') && count) {
-                if (policies) reply(client->SelectPolicy(view.policies[cursor].name), "选择策略");
-                else reply(client->StartInteraction((*actions)[cursor].key), "播放动作");
+                if (policies) clear();
+                const auto response = policies ? client->SelectPolicy(view.policies[cursor].name)
+                    : client->StartInteraction((*actions)[cursor].key);
+                reply(response, policies ? "选择策略" : "播放动作");
+                if (response.ok) view.page = Page::MAIN;
             }
             if ((policies && key == 'p') || (!policies && key == 'a')) view.page = Page::MAIN;
         } else {
@@ -265,7 +273,7 @@ int main(int argc, char *argv[]) {
         std::signal(SIGINT, Signal);
         std::signal(SIGTERM, Signal);
         Run(&client);
-        if (!client.Connected()) throw std::runtime_error("连接已断开：" + client.LastError());
+        if (running && !client.Connected()) throw std::runtime_error("连接已断开：" + client.LastError());
     } catch (const std::exception &e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;

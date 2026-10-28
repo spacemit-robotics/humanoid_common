@@ -256,6 +256,7 @@ struct Command {
     float vy = 0.0f;            ///< 横向速度 (m/s)
     float wz = 0.0f;            ///< 旋转角速度 (rad/s)
     std::string switch_policy;  ///< 策略切换请求，空字符串表示无切换
+    uint64_t policy_request_sequence = 0;       ///< 策略请求序号；零保留旧调用方式
     InteractionRequest interaction;
 };
 
@@ -293,7 +294,23 @@ enum class ControlMode : int8_t {
     RL = 3,         ///< RL 策略动态控制
     SAFETY = 4,     ///< 安全保护
     HOME = 5,       ///< 机型默认姿态复位
-    TRAJECTORY = 6  ///< 独立关节轨迹动作控制，不依赖 RL 策略
+    TRAJECTORY = 6  ///< 独立关节轨迹动作控制
+};
+
+/** @brief 策略切换请求的结果；失败不作为整机故障锁存。 */
+struct PolicySwitchStatus {
+    enum class Phase : uint8_t {
+        IDLE = 0,
+        PREPARING = 1,
+        READY = 2,
+        FAILED = 3,
+        REJECTED = 4,
+    };
+
+    uint64_t sequence = 0;  ///< 对应 Command::policy_request_sequence
+    Phase phase = Phase::IDLE;
+    std::string policy;    ///< 请求的策略；有前置链时可不同于 active_policy
+    std::string detail;    ///< 失败原因；传输时可能截断，完整信息写入 Control 日志
 };
 
 /**
@@ -310,8 +327,9 @@ struct ControlStatus {
     float vy = 0.0f;                            ///< Control 实际采用的横向速度 (m/s)
     float wz = 0.0f;                            ///< Control 实际采用的转向角速度 (rad/s)
     float rl_frequency_hz = 0.0f;               ///< RL 当前推理频率 (Hz)
-    std::string active_policy;                  ///< 当前实际生效策略；独立轨迹模式为空
+    std::string active_policy;                  ///< 当前实际生效策略
     InteractionStatus interaction;              ///< RL 或 TRAJECTORY 交互动作状态
+    PolicySwitchStatus policy_switch;           ///< 最近一次策略切换的处理结果
 };
 
 /**
@@ -362,6 +380,7 @@ public:
     std::vector<int> cpu_affinity;  ///< 可迁移的 CPU 集合；非空时代替 cpu_id
     std::string sched = "other";  ///< 调度策略："other" | "fifo" | "rr"
     int priority = 0;             ///< 优先级（fifo/rr: 1~99；other 忽略）
+    bool lock_memory = false;     ///< 进程内存驻留与线程栈预触页，默认关闭
 
     ThreadLoop() = default;
     ~ThreadLoop();
@@ -369,13 +388,14 @@ public:
     /// 拷贝构造/赋值：仅复制配置字段，不复制线程状态
     ThreadLoop(const ThreadLoop &other)
         : name(other.name), cpu_id(other.cpu_id), cpu_affinity(other.cpu_affinity),
-            sched(other.sched), priority(other.priority) {}
+            sched(other.sched), priority(other.priority), lock_memory(other.lock_memory) {}
     ThreadLoop &operator=(const ThreadLoop &other) {
         name = other.name;
         cpu_id = other.cpu_id;
         cpu_affinity = other.cpu_affinity;
         sched = other.sched;
         priority = other.priority;
+        lock_memory = other.lock_memory;
         return *this;
     }
 
@@ -387,7 +407,10 @@ public:
      */
     static ThreadLoop FromYaml(const YamlFile &yaml_file, const std::string &thread_name);
 
-    /// 对调用线程应用当前配置（fifo/rr 需 root）；Start() 内部自动调用
+    /// 普通后台线程配置，恢复进程启动时的 CPU 集合，不继承创建者的实时调度。
+    static ThreadLoop Background(const std::string &thread_name);
+
+    /// 对当前线程应用配置并报告实际值；fifo/rr 需要 RLIMIT_RTPRIO 或相应权限。
     void Apply() const;
 
     /// 启动线程，循环执行 func，返回 false 时退出

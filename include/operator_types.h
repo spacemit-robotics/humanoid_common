@@ -25,6 +25,9 @@ struct Policy {
     Velocity minimum;
     Velocity maximum;
     std::vector<Action> actions;
+    bool client_smoothing = true;  // Web/WebView velocity ramps; false delegates smoothing to the policy.
+    std::string switch_group;  // Explicitly compatible live-switch policies; empty disables it.
+    std::string display_name;
 };
 struct Fault {
     bool active = false;
@@ -56,6 +59,11 @@ struct Status {
     std::string interaction_phase = "IDLE";
     std::string interaction_action;
     double interaction_progress = 0;
+    uint64_t interaction_sequence = 0;
+    bool interaction_accepted = false;
+    // Client-selected speed preset, not the locomotion network's walk/run branch.
+    std::string teleop_preset;
+    uint64_t teleop_preset_sequence = 0;
     RequestResult request;
     bool trajectory_enabled = false;
 };

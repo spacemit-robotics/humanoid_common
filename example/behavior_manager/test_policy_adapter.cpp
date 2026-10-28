@@ -256,7 +256,7 @@ private:
 
 class TempSonicOnnx {
 public:
-    TempSonicOnnx() {
+    explicit TempSonicOnnx(const char *encoded = kSonicReferenceProbeOnnx) {
         const auto nonce = std::chrono::steady_clock::now()
             .time_since_epoch().count();
         path_ = fs::temp_directory_path() /
@@ -265,7 +265,7 @@ public:
         if (!output) {
             throw std::runtime_error("无法创建 SONIC 测试 ONNX");
         }
-        const auto bytes = DecodeBase64(kSonicReferenceProbeOnnx);
+        const auto bytes = DecodeBase64(encoded);
         output.write(reinterpret_cast<const char *>(bytes.data()),
             static_cast<std::streamsize>(bytes.size()));
         if (!output) {
@@ -338,6 +338,141 @@ rl_policy::PolicyExecutorConfig MakeSonicProbePolicyConfig(
     output.target = rl_policy::ModelOutputTarget::ACTION;
     config.model_io.outputs.push_back(output);
     return config;
+}
+
+void TestHistoryActorCommands() {
+    const TempSonicOnnx gait_model(
+        "CAg6cQoXCgNjbWQSBmFjdGlvbiIISWRlbnRpdHkSDWNvbW1hbmRfcHJvYmVaFQoDY21kEg4K"
+        "DAgBEggKAggBCgIICFoWCgNvYnMSDwoNCAESCQoCCAEKAwiWAWIYCgZhY3Rpb24SDgoMCAESCAoCCAEKAggIQgQKABAN");
+    auto policy_config = MakeSonicProbePolicyConfig(8, gait_model.Path());
+    policy_config.model_io.inputs[0].name = "cmd";
+    policy_config.obs_segments[0].terms = {"history"};
+    policy_config.custom_array_dims = {{"history", 150}};
+    Config config;
+    config.type = "history_actor";
+    auto &s = config.history_actor;
+    s.command_type = "gait";
+    s.observation_term = "history";
+    s.command_input = "cmd";
+    s.history_frames = 5;
+    rl_policy::PolicyExecutor policy;
+    policy.Init(policy_config);
+    auto adapter = Create(config, policy_config);
+    auto robot = robot_base::RobotData::Create(8);
+    robot.base_quat = {1, 0, 0, 0};
+    adapter->Reset(robot);
+    adapter->SelectExecutor({}, policy);
+    adapter->PrepareInputs(robot, 0, policy);
+    std::vector<double> action;
+    policy.Infer(Eigen::VectorXf::Zero(150), action);
+    Require(std::abs(action[0] - 1) < 1e-6 && std::abs(action[1] - 1) < 1e-6 &&
+        std::abs(action[4] + 1) < 1e-6, "Standing must zero frequency before centering the gait command");
+    adapter->SelectExecutor({0.5, 0, 0}, policy);
+    adapter->PrepareInputs(robot, 0.02, policy);
+    policy.Infer(Eigen::VectorXf::Zero(150), action);
+    Require(std::abs(action[4]) < 1e-6 && std::abs(action[5] - 0.1) < 1e-6,
+        "Walking gait frequency/velocity command mismatch");
+
+    const TempSonicOnnx root_model(
+        "CAg6bgoXCgNjbWQSBmFjdGlvbiIISWRlbnRpdHkSCnJvb3RfcHJvYmVaFQoDY21kEg4KDAgB"
+        "EggKAggBCgIICloWCgNvYnMSDwoNCAESCQoCCAEKAwi0AWIYCgZhY3Rpb24SDgoMCAESCAoCCAEKAggKQgQKABAN");
+    const TempReference default_latent("default_latent", "0,0,0,0,0,0,0,0,0,0\n");
+    const TempReference root_latent("root_latent", "0,0,0,0.78,1,0,0,0\n");
+    policy_config = MakeSonicProbePolicyConfig(10, root_model.Path());
+    policy_config.model_io.inputs[0].name = "cmd";
+    policy_config.obs_segments[0].terms = {"history"};
+    policy_config.custom_array_dims = {{"history", 180}};
+    policy_config.action_scale[0] = 0.0;
+    policy.Init(policy_config);
+    s.command_type = "latent";
+    s.motions = {{"standby", "", default_latent.Path().string()},
+        {"root", root_model.Path().string(), root_latent.Path().string(), true, root_latent.Path().string()}};
+    adapter = Create(config, policy_config);
+    robot = robot_base::RobotData::Create(10);
+    robot.base_quat = {1, 0, 0, 0};
+    adapter->Reset(robot);
+    robot_base::InteractionRequest request;
+    request.sequence = 1;
+    request.action = "root";
+    request.operation = robot_base::InteractionRequest::Operation::START;
+    adapter->HandleInteractionRequest(request, 0);
+    auto &root_executor = adapter->SelectExecutor({}, policy);
+    adapter->PrepareInputs(robot, 0, root_executor);
+    root_executor.Infer(Eigen::VectorXf::Zero(180), action);
+    Require(action.size() == 10 && std::abs(action[4] - 1) < 1e-6 &&
+        std::abs(action[7] - 1) < 1e-6, "Root command identity rotation/order mismatch");
+    action.assign(10, 1.0);
+    adapter->OnAction(action);
+    Require(action[0] == 0, "Decoder switch must start from the last composed output");
+    robot.base_pos[0] = 2;
+    robot.base_quat = {std::cos(0.1), std::sin(0.1), 0, 0};
+    adapter->PrepareInputs(robot, 0.02, root_executor);
+    root_executor.Infer(Eigen::VectorXf::Zero(180), action);
+    Require(std::abs(action[1] + 1) < 1e-6 && std::abs(action[3]) < 1e-6 &&
+        std::abs(action[9] + std::sin(0.2)) < 1e-6, "Root XY clip/zero Z/orientation error mismatch");
+    action.assign(10, 1.0);
+    adapter->OnAction(action);
+    const auto last_output = action;
+    request.sequence = 2;
+    request.operation = robot_base::InteractionRequest::Operation::CANCEL;
+    adapter->HandleInteractionRequest(request, 0.02);
+    auto &standby_executor = adapter->SelectExecutor({}, policy);
+    adapter->PrepareInputs(robot, 0.04, standby_executor);
+    action.assign(10, 2.0);
+    adapter->OnAction(action);
+    Require(action == last_output, "Cancellation during blending must preserve output continuity");
+
+    s.motions.back().mask_root_position = true;
+    adapter = Create(config, policy_config);
+    robot.base_pos = {0, 0, 0};
+    robot.base_quat = {1, 0, 0, 0};
+    adapter->Reset(robot);
+    request.sequence = 1;
+    request.operation = robot_base::InteractionRequest::Operation::START;
+    adapter->HandleInteractionRequest(request, 0);
+    auto &masked_executor = adapter->SelectExecutor({}, policy);
+    adapter->PrepareInputs(robot, 0, masked_executor);
+    robot.base_pos[0] = 2;
+    robot.base_quat = {std::cos(0.1), std::sin(0.1), 0, 0};
+    adapter->PrepareInputs(robot, 0.02, masked_executor);
+    masked_executor.Infer(Eigen::VectorXf::Zero(180), action);
+    Require(action[1] == 0 && action[2] == 0 && action[3] == 0 &&
+        std::abs(action[9] + std::sin(0.2)) < 1e-6,
+        "Position mask must zero translation but preserve orientation feedback");
+
+    const TempReference clip_latent("clip_latent",
+        "9,0,0,0,0,0,0,0,0,0\n1,0,0,0,0,0,0,0,0,0\n"
+        "2,0,0,0,0,0,0,0,0,0\n8,0,0,0,0,0,0,0,0,0\n");
+    s.transition_duration = s.dt;
+    s.motions = {{"standby", "", default_latent.Path().string()},
+        {"clip", root_model.Path().string(), clip_latent.Path().string()}};
+    s.motions.back().start_time = 0.02;
+    s.motions.back().end_time = 0.06;
+    adapter = Create(config, policy_config);
+    adapter->Reset(robot);
+    request.action = "clip";
+    adapter->HandleInteractionRequest(request, 0);
+    for (int step = 0; step < 3; ++step) {
+        auto &selected = adapter->SelectExecutor({}, policy);
+        adapter->PrepareInputs(robot, step * s.dt, selected);
+        selected.Infer(Eigen::VectorXf::Zero(180), action);
+        Require(std::abs(action[0] - step) < 1e-6,
+            "Playback must blend into the cropped start and exclude frames outside the interval");
+    }
+    for (int step = 3; step < 5; ++step) {
+        auto &selected = adapter->SelectExecutor({}, policy);
+        adapter->PrepareInputs(robot, step * s.dt, selected);
+    }
+    Require(adapter->ReadyForPolicySwitch() && adapter->GetInteractionStatus().phase ==
+        robot_base::InteractionStatus::Phase::FINISHED, "Clipped motion must return to standby");
+    s.motions.back().end_time = 0.1;
+    bool rejected = false;
+    try {
+        adapter = Create(config, policy_config);
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    Require(rejected, "Playback interval outside the CSV must be rejected");
 }
 
 void TestProtomotionsDynamicDimensions() {
@@ -1109,6 +1244,7 @@ int main(int argc, char **argv) {
                 << " [YAML ROBOT_DIR POLICY_NAME]" << std::endl;
             return 2;
         }
+        TestHistoryActorCommands();
         TestProtomotionsDynamicDimensions();
         TestMjlabZip64AndUnicodeMetadata();
         TestMjlabReferenceResidualAction();

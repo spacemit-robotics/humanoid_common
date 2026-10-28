@@ -29,6 +29,10 @@ struct Summary {
     double lateness_p99_ms = 0.0;
     double lateness_max_ms = 0.0;
     uint64_t skipped_cycles = 0;
+    double read_mean_ms = 0.0;
+    double read_max_ms = 0.0;
+    double work_mean_ms = 0.0;
+    double work_max_ms = 0.0;
 };
 
 class Window {
@@ -48,6 +52,16 @@ public:
 
     void AddSkippedCycles(uint64_t count) { skipped_cycles_ += count; }
 
+    void ObserveWork(double read_ms, double work_ms) {
+        if (!std::isfinite(read_ms) || !std::isfinite(work_ms) || read_ms < 0 || work_ms < 0)
+            return;
+        ++work_count_;
+        read_total_ms_ += read_ms;
+        work_total_ms_ += work_ms;
+        read_max_ms_ = std::max(read_max_ms_, read_ms);
+        work_max_ms_ = std::max(work_max_ms_, work_ms);
+    }
+
     bool IsDue(Clock::time_point now, double window_s) const {
         return std::chrono::duration<double>(now - window_start_).count() >= window_s;
     }
@@ -62,6 +76,10 @@ public:
         result.lateness_p99_ms = Quantile(lateness_histogram_, lateness_count_, 0.99);
         result.lateness_max_ms = lateness_max_ms_;
         result.skipped_cycles = skipped_cycles_;
+        result.read_mean_ms = work_count_ ? read_total_ms_ / work_count_ : 0.0;
+        result.work_mean_ms = work_count_ ? work_total_ms_ / work_count_ : 0.0;
+        result.read_max_ms = read_max_ms_;
+        result.work_max_ms = work_max_ms_;
         period_histogram_.fill(0);
         lateness_histogram_.fill(0);
         period_count_ = 0;
@@ -69,6 +87,8 @@ public:
         period_max_ms_ = 0.0;
         lateness_max_ms_ = 0.0;
         skipped_cycles_ = 0;
+        work_count_ = 0;
+        read_total_ms_ = work_total_ms_ = read_max_ms_ = work_max_ms_ = 0.0;
         window_start_ = now;
         return result;
     }
@@ -119,6 +139,11 @@ private:
     double period_max_ms_ = 0.0;
     double lateness_max_ms_ = 0.0;
     uint64_t skipped_cycles_ = 0;
+    uint64_t work_count_ = 0;
+    double read_total_ms_ = 0.0;
+    double read_max_ms_ = 0.0;
+    double work_total_ms_ = 0.0;
+    double work_max_ms_ = 0.0;
     Clock::time_point window_start_;
     Clock::time_point previous_start_{};
     bool has_previous_start_ = false;

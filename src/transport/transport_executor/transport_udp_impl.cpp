@@ -313,6 +313,7 @@ bool TransportUdpImpl::SendCommandV2(const robot_base::Command &cmd,
     p.wz = cmd.wz;
     p.acknowledge_fault_sequence = acknowledge_fault_sequence;
     std::strncpy(p.switch_policy, cmd.switch_policy.c_str(), sizeof(p.switch_policy) - 1);
+    p.policy_request_sequence = cmd.policy_request_sequence;
     p.interaction_sequence = cmd.interaction.sequence;
     p.interaction_operation = static_cast<uint8_t>(cmd.interaction.operation);
     std::strncpy(p.interaction_action, cmd.interaction.action.c_str(),
@@ -345,6 +346,7 @@ bool TransportUdpImpl::RecvCommandV2(robot_base::Command &cmd,
     cmd.wz = p.wz;
     acknowledge_fault_sequence = p.acknowledge_fault_sequence;
     cmd.switch_policy = DecodeText(p.switch_policy);
+    cmd.policy_request_sequence = p.policy_request_sequence;
     cmd.interaction.sequence = p.interaction_sequence;
     cmd.interaction.operation =
         static_cast<robot_base::InteractionRequest::Operation>(
@@ -384,6 +386,7 @@ bool TransportUdpImpl::SendStatusV2(const robot_base::ControlStatus &status,
     std::strncpy(p.interaction_action, status.interaction.action.c_str(),
         sizeof(p.interaction_action) - 1);
     EncodeFault(fault, &p.fault);
+    EncodePolicySwitch(status.policy_switch, &p.policy_switch);
 
     if (!ValidControlStatusPacket(p)) return false;
     if (status_sender_->Send(&p, sizeof(p)) != static_cast<int>(sizeof(p))) return false;
@@ -423,6 +426,7 @@ bool TransportUdpImpl::RecvStatusV2(robot_base::ControlStatus &status,
             p.interaction_phase);
     status.interaction.progress = p.interaction_progress;
     status.interaction.action = DecodeText(p.interaction_action);
+    DecodePolicySwitch(p.policy_switch, &status.policy_switch);
     return DecodeFault(p.fault, &fault);
 }
 

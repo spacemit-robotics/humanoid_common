@@ -30,8 +30,8 @@ endif()
 function(fetch_thirdparty)
   cmake_parse_arguments(ARG
     "GIT_RECURSIVE"
-    "NAME;GIT_REPO;GIT_REF;GIT_COMMIT;ARCHIVE_URL;ARCHIVE_SUBDIR;SUBDIR;OUT_SOURCE_DIR"
-    ""
+    "NAME;GIT_REPO;GIT_REF;GIT_COMMIT;ARCHIVE_URL;ARCHIVE_SHA256;ARCHIVE_SUBDIR;SUBDIR;OUT_SOURCE_DIR"
+    "ARCHIVE_FALLBACK_URLS"
     ${ARGN})
 
   if(NOT ARG_NAME)
@@ -42,6 +42,9 @@ function(fetch_thirdparty)
   endif()
   if(ARG_GIT_REPO AND ARG_ARCHIVE_URL)
     message(FATAL_ERROR "fetch_thirdparty: GIT_REPO and ARCHIVE_URL are mutually exclusive")
+  endif()
+  if(ARG_ARCHIVE_FALLBACK_URLS AND NOT ARG_ARCHIVE_SHA256)
+    message(FATAL_ERROR "fetch_thirdparty: archive mirrors require ARCHIVE_SHA256")
   endif()
 
   set(_dir "${_FETCH_TP_CACHE_ROOT}/${ARG_NAME}")
@@ -70,16 +73,39 @@ function(fetch_thirdparty)
       get_filename_component(_archive_name "${ARG_ARCHIVE_URL}" NAME)
       set(_archive_file "${_FETCH_TP_CACHE_ROOT}/${_archive_name}")
 
-      message(STATUS "Fetching ${ARG_NAME}: downloading ${ARG_ARCHIVE_URL}")
-      file(DOWNLOAD "${ARG_ARCHIVE_URL}" "${_archive_file}"
-           STATUS _dl_status
-           SHOW_PROGRESS
-           TLS_VERIFY ON)
-      list(GET _dl_status 0 _dl_code)
-      if(NOT _dl_code EQUAL 0)
-        list(GET _dl_status 1 _dl_msg)
-        file(REMOVE "${_archive_file}")
-        message(FATAL_ERROR "fetch_thirdparty: download failed (${_dl_code}): ${_dl_msg}\n  url: ${ARG_ARCHIVE_URL}")
+      set(_downloaded OFF)
+      set(_download_errors "")
+      foreach(_url IN ITEMS "${ARG_ARCHIVE_URL}" ${ARG_ARCHIVE_FALLBACK_URLS})
+        foreach(_attempt RANGE 1 2)
+          message(STATUS "Fetching ${ARG_NAME}: downloading ${_url} (attempt ${_attempt}/2)")
+          file(DOWNLOAD "${_url}" "${_archive_file}"
+               STATUS _dl_status
+               TIMEOUT 60 INACTIVITY_TIMEOUT 15
+               TLS_VERIFY ON)
+          list(GET _dl_status 0 _dl_code)
+          list(GET _dl_status 1 _dl_msg)
+          if(_dl_code EQUAL 0)
+            if(ARG_ARCHIVE_SHA256)
+              file(SHA256 "${_archive_file}" _actual_sha256)
+              if(NOT _actual_sha256 STREQUAL ARG_ARCHIVE_SHA256)
+                set(_dl_code 1)
+                set(_dl_msg "SHA256 mismatch: expected ${ARG_ARCHIVE_SHA256}, got ${_actual_sha256}")
+              endif()
+            endif()
+            if(_dl_code EQUAL 0)
+              set(_downloaded ON)
+              break()
+            endif()
+          endif()
+          string(APPEND _download_errors "\n  ${_url} [${_attempt}/2]: ${_dl_code} ${_dl_msg}")
+          file(REMOVE "${_archive_file}")
+        endforeach()
+        if(_downloaded)
+          break()
+        endif()
+      endforeach()
+      if(NOT _downloaded)
+        message(FATAL_ERROR "fetch_thirdparty: download failed for ${ARG_NAME}:${_download_errors}")
       endif()
 
       file(MAKE_DIRECTORY "${_dir}")

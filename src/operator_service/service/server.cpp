@@ -129,7 +129,7 @@ private:
 } // namespace
 
 void PreparePairing(Config *config) {
-    if (config->terminal_only) throw std::runtime_error("simulation has no web, App or QR entry");
+    if (config->terminal_only) throw std::runtime_error("terminal-only mode has no web, App or QR entry");
     if (config->public_url.empty()) {
         const auto host = config->bind_address == "0.0.0.0" ? "127.0.0.1" : config->bind_address;
         config->public_url = "http://" + host + ":" + std::to_string(config->port);
@@ -220,6 +220,7 @@ public:
         for (int i = 0; i < 32 && transport->RecvStatusV2(status, fault); ++i) service.UpdateStatus(status, fault);
         service.Tick();
         const bool sent = transport->SendCommandV2(service.Command(), service.AcknowledgeSequence());
+        if (sent) service.MarkCommandSent();
         if (!sent && !send_failed)
             runtime_logging::Log(runtime_logging::Level::kError, "operator command transport send failed", false);
         send_failed = !sent;
@@ -332,6 +333,10 @@ void Session::ReadHttp() {
         if (target == "/") filename = "index.html";
         if (target == "/app.js") {
             filename = "app.js";
+            response->set(http::field::content_type, "text/javascript");
+        }
+        if (target == "/teleop.js") {
+            filename = "teleop.js";
             response->set(http::field::content_type, "text/javascript");
         }
         if (target == "/style.css") {
@@ -477,7 +482,7 @@ int Run(Config config, const std::string &yaml_path) {
     ConnectionFile file(config, "ws://" + host + ":" + std::to_string(config.port));
     Server server(config, yaml_path);
     if (config.terminal_only) {
-        std::puts("[hmi] simulation: local terminal only; web, App and QR disabled");
+        std::puts("[hmi] local terminal only; web, App and QR disabled");
     } else {
         std::printf("[hmi] operator service: %s\n[hmi] fixed QR: %s\n[hmi] credential file: %s\n",
             config.public_url.c_str(), config.qr_file.c_str(), config.credential_file.c_str());

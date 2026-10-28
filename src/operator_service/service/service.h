@@ -9,12 +9,20 @@
 #include <cstdint>
 #include <future>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "protocol.h"
 #include "robot_base.h"
 namespace operator_service {
+struct TeleopConfig {
+    double deadzone = 0.06;
+    Velocity acceleration{1.0, 1.0, 2.0};
+    Velocity deceleration{2.0, 2.0, 4.0};
+    std::optional<Velocity> slow_limits;
+    std::optional<Velocity> fast_limits;
+};
 struct Config {
     std::string robot;
     bool terminal_only = true;
@@ -34,6 +42,7 @@ struct Config {
     double request_timeout = 15;
     int lease_ms = 1000;
     Velocity velocity_step{0.1, 0.1, 0.1};
+    TeleopConfig teleop;
     std::vector<Policy> policies;
     bool trajectory_enabled = false;
     std::vector<Action> actions;
@@ -55,6 +64,7 @@ public:
     Json StatusMessage(uint64_t session) const;
     Json Catalog() const;
     robot_base::Command Command() const;
+    void MarkCommandSent() { command_sent_ = true; }
     uint64_t AcknowledgeSequence() const { return acknowledge_sequence_; }
     bool Authenticated(uint64_t session) const;
     const Config &Configuration() const { return config_; }
@@ -87,6 +97,10 @@ private:
     robot_base::FaultStatus fault_;
     robot_base::Command command_;
     uint64_t acknowledge_sequence_ = 0;
+    uint64_t policy_sequence_ = 0;
+    bool command_sent_ = false;
+    std::string teleop_preset_;
+    uint64_t teleop_preset_sequence_ = 0;
     RequestResult result_;
     std::string pending_target_;
     robot_base::ControlMode source_mode_ = robot_base::ControlMode::POWER_OFF;

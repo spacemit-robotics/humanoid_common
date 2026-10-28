@@ -114,6 +114,7 @@ endif()
 
 add_library(robot_base SHARED
     src/logging/runtime_logger.cpp
+    src/logging/log_storage.cpp
     src/robot_base/robot_base.cpp
     src/robot_base/thread_utils.cpp
 )
@@ -179,6 +180,8 @@ if(BUILD_RL)
         src/behavior_manager/joint_trajectory.cpp
         src/behavior_manager/policy_adapter/policy_adapter.cpp
         src/behavior_manager/policy_adapter/joint_trajectory_policy_adapter.cpp
+        src/behavior_manager/policy_adapter/stance_motion_policy_adapter.cpp
+        src/behavior_manager/policy_adapter/history_actor_policy_adapter.cpp
         src/behavior_manager/states/state_power_off.cpp
         src/behavior_manager/states/state_damp.cpp
         src/behavior_manager/states/state_home.cpp
@@ -258,17 +261,28 @@ find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 add_library(operator_protocol STATIC src/operator_service/protocol/protocol.cpp)
 target_include_directories(operator_protocol PUBLIC include src/operator_service/protocol)
 target_link_libraries(operator_protocol PUBLIC nlohmann_json::nlohmann_json)
-
 add_library(operator_client SHARED src/operator_service/client_sdk/client.cpp)
 target_link_libraries(operator_client PRIVATE operator_protocol Boost::headers Threads::Threads)
 target_include_directories(operator_client PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 target_compile_definitions(operator_client PRIVATE BOOST_ERROR_CODE_HEADER_ONLY)
+find_package(Qrcodegen REQUIRED)
+find_package(Lucide REQUIRED)
+add_library(operator_qr STATIC "${QRCODEGEN_SOURCE_DIR}/qrcodegen.cpp")
+target_include_directories(operator_qr PUBLIC "${QRCODEGEN_SOURCE_DIR}")
 
-add_library(operator_qr STATIC thirdparty/qrcodegen/qrcodegen.cpp)
-target_include_directories(operator_qr PUBLIC thirdparty/qrcodegen)
-
+# Assemble a complete local web root without writing generated assets into source.
+set(OPERATOR_WEB_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/operator_web")
+file(GLOB_RECURSE _operator_web_files CONFIGURE_DEPENDS
+    RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/clients/web"
+    "${CMAKE_CURRENT_SOURCE_DIR}/clients/web/*")
+foreach(_operator_web_file IN LISTS _operator_web_files)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/clients/web/${_operator_web_file}"
+        "${OPERATOR_WEB_BUILD_DIR}/${_operator_web_file}" COPYONLY)
+endforeach()
+configure_file("${LUCIDE_JS}" "${OPERATOR_WEB_BUILD_DIR}/vendor/lucide.min.js" COPYONLY)
+configure_file("${LUCIDE_LICENSE}" "${OPERATOR_WEB_BUILD_DIR}/vendor/LICENSE.lucide" COPYONLY)
 add_library(operator_service STATIC
     src/operator_service/service/service.cpp
     src/operator_service/service/server.cpp)
@@ -277,8 +291,7 @@ target_include_directories(operator_service PRIVATE src/runtime/common)
 target_link_libraries(operator_service PUBLIC operator_protocol robot_base
     PRIVATE operator_qr Boost::headers transport_executor OpenSSL::Crypto)
 target_compile_definitions(operator_service PRIVATE BOOST_ERROR_CODE_HEADER_ONLY
-    OPERATOR_WEB_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/clients/web")
-
+    OPERATOR_WEB_ROOT="${OPERATOR_WEB_BUILD_DIR}")
 add_executable(hmi_runtime src/runtime/hmi/hmi_runtime.cpp)
 target_link_libraries(hmi_runtime PRIVATE operator_service)
 add_executable(hmi_tui clients/terminal/hmi_tui.cpp clients/terminal/terminal_ui.cpp)
@@ -294,9 +307,19 @@ target_link_libraries(humanoid_operator_mcp PRIVATE
     operator_client nlohmann_json::nlohmann_json Threads::Threads)
 install(TARGETS humanoid_operator_mcp RUNTIME DESTINATION bin)
 
+add_executable(operator_audio src/operator_service/audio/operator_audio.cpp)
+target_link_libraries(operator_audio PRIVATE operator_client yaml-cpp Threads::Threads)
+add_executable(hmi_gamepad clients/gamepad/hmi_gamepad.cpp)
+target_link_libraries(hmi_gamepad PRIVATE operator_client yaml-cpp Threads::Threads)
+install(TARGETS hmi_gamepad operator_audio RUNTIME DESTINATION bin)
 install(TARGETS operator_client LIBRARY DESTINATION lib)
 install(FILES include/operator_client.h include/operator_types.h DESTINATION include)
 install(DIRECTORY clients/web/ DESTINATION share/humanoid_common/operator_web)
+install(FILES "${LUCIDE_JS}" DESTINATION share/humanoid_common/operator_web/vendor)
+install(FILES "${LUCIDE_LICENSE}" DESTINATION share/humanoid_common/operator_web/vendor
+    RENAME LICENSE.lucide)
+install(FILES thirdparty/LICENSE.qrcodegen
+    DESTINATION share/humanoid_common/thirdparty/qrcodegen RENAME LICENSE)
 install(FILES clients/android/app/build/outputs/apk/debug/app-debug.apk
     DESTINATION share/humanoid_common/operator_web/downloads
     RENAME SpacemiT-Operator.apk OPTIONAL)
@@ -361,13 +384,60 @@ target_compile_definitions(test_policy_command_limits PRIVATE
     "POLICY_COMMAND_LIMITS_TEST_CONFIG=\"${CMAKE_CURRENT_SOURCE_DIR}/example/runtime/policy_command_limits.yaml\"")
 target_link_libraries(test_policy_command_limits PRIVATE robot_base)
 enable_testing()
+install(PROGRAMS scripts/humanoid_logs.py DESTINATION bin)
+add_executable(test_runtime_logging example/runtime/test_runtime_logging.cpp)
+target_include_directories(test_runtime_logging PRIVATE src/logging)
+target_link_libraries(test_runtime_logging PRIVATE robot_base)
+add_test(NAME runtime_logging COMMAND test_runtime_logging)
+set_tests_properties(runtime_logging PROPERTIES TIMEOUT 30)
+add_executable(test_gamepad_input example/operator_service/test_gamepad_input.cpp)
+target_include_directories(test_gamepad_input PRIVATE include clients/gamepad)
+target_compile_options(test_gamepad_input PRIVATE -UNDEBUG)
+add_test(NAME gamepad_input COMMAND test_gamepad_input)
+add_executable(test_gamepad_config example/operator_service/test_gamepad_config.cpp)
+target_include_directories(test_gamepad_config PRIVATE include clients/gamepad)
+target_compile_options(test_gamepad_config PRIVATE -UNDEBUG)
+target_link_libraries(test_gamepad_config PRIVATE yaml-cpp)
+add_test(NAME gamepad_config COMMAND test_gamepad_config)
+add_executable(test_gamepad_feedback example/operator_service/test_gamepad_feedback.cpp)
+target_include_directories(test_gamepad_feedback PRIVATE include clients/gamepad)
+target_compile_options(test_gamepad_feedback PRIVATE -UNDEBUG)
+target_link_libraries(test_gamepad_feedback PRIVATE Threads::Threads)
+add_test(NAME gamepad_feedback COMMAND test_gamepad_feedback)
+
+add_executable(test_prompt_events example/operator_service/test_prompt_events.cpp)
+target_include_directories(test_prompt_events PRIVATE include src/operator_service/audio)
+target_compile_options(test_prompt_events PRIVATE -UNDEBUG)
+add_test(NAME prompt_events COMMAND test_prompt_events)
+add_executable(test_audio_player example/operator_service/test_audio_player.cpp)
+target_include_directories(test_audio_player PRIVATE include src/operator_service/audio)
+target_compile_options(test_audio_player PRIVATE -UNDEBUG)
+target_link_libraries(test_audio_player PRIVATE Threads::Threads)
+add_test(NAME audio_player COMMAND test_audio_player)
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME thirdparty_fetch COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/runtime/test_fetch_thirdparty.py)
+    add_test(NAME log_tools COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/runtime/test_log_tools.py)
+    add_test(NAME audio_process COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/test_audio_process.py $<TARGET_FILE:operator_audio>)
+    set_tests_properties(audio_process PROPERTIES TIMEOUT 20)
+endif()
 add_test(NAME policy_command_limits COMMAND test_policy_command_limits)
 
 add_executable(test_runtime_timing example/runtime/test_runtime_timing.cpp)
 target_include_directories(test_runtime_timing PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/common)
+target_link_libraries(test_runtime_timing PRIVATE robot_base)
 add_test(NAME runtime_timing COMMAND test_runtime_timing)
 install(TARGETS test_runtime_timing RUNTIME DESTINATION bin)
+
+add_executable(test_thread_scheduling example/runtime/test_thread_scheduling.cpp)
+target_link_libraries(test_thread_scheduling PRIVATE robot_base)
+add_test(NAME thread_scheduling COMMAND test_thread_scheduling
+    ${CMAKE_CURRENT_SOURCE_DIR}/example/robot_base/config_example.yaml)
+set_tests_properties(thread_scheduling PROPERTIES TIMEOUT 10)
 
 add_executable(test_transport_executor example/transport_executor/test_transport_executor.cpp)
 target_include_directories(test_transport_executor PRIVATE
@@ -409,16 +479,25 @@ install(TARGETS test_driver_runtime RUNTIME DESTINATION bin)
 
 option(BUILD_TESTS "Build humanoid_common offline tests" ON)
 if(BUILD_TESTS)
+    find_program(OPERATOR_NODE_EXECUTABLE node)
+    if(OPERATOR_NODE_EXECUTABLE)
+        add_test(NAME operator_web COMMAND ${OPERATOR_NODE_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/test_web.js)
+        add_test(NAME operator_web_connection COMMAND ${OPERATOR_NODE_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/test_web_connection.js)
+    endif()
     enable_testing()
     add_executable(test_operator_service example/operator_service/test_operator_service.cpp)
     target_link_libraries(test_operator_service PRIVATE operator_service)
-    add_executable(test_operator_network example/operator_service/test_operator_network.cpp)
-    target_link_libraries(test_operator_network PRIVATE operator_service operator_client transport_executor)
     target_compile_options(test_operator_service PRIVATE -UNDEBUG)
+    add_executable(test_operator_network example/operator_service/test_operator_network.cpp)
+    target_link_libraries(test_operator_network PRIVATE
+        operator_service operator_client transport_executor)
     target_compile_options(test_operator_network PRIVATE -UNDEBUG)
-    add_test(NAME operator_service COMMAND test_operator_service)
-    add_test(NAME operator_network COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
+    add_test(NAME operator_service COMMAND test_operator_service
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml)
+    add_test(NAME operator_network COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --real)
     add_test(NAME operator_terminal_only COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --sim)
     add_test(NAME operator_trajectory COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
@@ -456,9 +535,28 @@ if(BUILD_TESTS)
         set_tests_properties(operator_voice_web PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
     endif()
 
+    add_test(NAME operator_real_terminal_only COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --terminal-only)
+    add_test(NAME operator_paired_actions COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --paired)
+    set_tests_properties(operator_terminal_only operator_real_terminal_only operator_network
+        operator_paired_actions
+        PROPERTIES RUN_SERIAL TRUE TIMEOUT 20)
+    add_executable(test_hmi_policy_switch example/runtime/test_hmi_policy_switch.cpp)
+    target_link_libraries(test_hmi_policy_switch PRIVATE transport_executor robot_base util)
+    add_test(NAME hmi_policy_switch
+        COMMAND test_hmi_policy_switch $<TARGET_FILE:hmi_runtime> $<TARGET_FILE:hmi_tui>)
+    set_tests_properties(hmi_policy_switch PROPERTIES RUN_SERIAL TRUE TIMEOUT 25)
     add_test(NAME driver_runtime_backend_selection
         COMMAND test_driver_runtime ${DRIVER_RUNTIME_EXAMPLE_CONFIG})
     if(BUILD_WHOLE_BODY_BACKEND)
+        add_executable(test_bus_telemetry example/runtime/test_bus_telemetry.cpp)
+        target_include_directories(test_bus_telemetry PRIVATE
+            src/runtime/driver src/runtime/common ${WHOLE_BODY_INCLUDE_DIR})
+        target_link_libraries(test_bus_telemetry PRIVATE robot_base)
+        add_test(NAME bus_telemetry COMMAND test_bus_telemetry)
+        set_tests_properties(bus_telemetry PROPERTIES TIMEOUT 10)
+        install(TARGETS test_bus_telemetry RUNTIME DESTINATION bin)
         add_executable(test_hardware_recovery
             example/driver_runtime/test_hardware_recovery.cpp
             src/runtime/driver/backends/whole_body_backend.cpp
@@ -473,6 +571,20 @@ if(BUILD_TESTS)
         add_test(NAME hardware_recovery COMMAND test_hardware_recovery
             ${CMAKE_CURRENT_SOURCE_DIR}/example/behavior_manager/config_example.yaml)
         set_tests_properties(hardware_recovery PROPERTIES TIMEOUT 15)
+    endif()
+    if(TARGET driver_runtime)
+        add_test(NAME driver_cli_help COMMAND driver_runtime --help)
+        add_test(NAME driver_cli_missing_backend
+            COMMAND driver_runtime unused.yaml --backend)
+        add_test(NAME driver_cli_duplicate_backend
+            COMMAND driver_runtime unused.yaml --backend mujoco --backend whole_body)
+        add_test(NAME driver_cli_invalid_backend
+            COMMAND driver_runtime unused.yaml --backend invalid)
+        add_test(NAME driver_cli_unknown_option
+            COMMAND driver_runtime unused.yaml --sim)
+        set_tests_properties(driver_cli_missing_backend driver_cli_duplicate_backend
+            driver_cli_invalid_backend driver_cli_unknown_option
+            PROPERTIES WILL_FAIL TRUE TIMEOUT 5)
     endif()
 endif()
 
@@ -504,10 +616,23 @@ if(BUILD_RL)
         target_link_libraries(test_trajectory PRIVATE behavior_manager cnpy)
         add_test(NAME trajectory COMMAND test_trajectory)
         install(TARGETS test_trajectory RUNTIME DESTINATION bin)
+        add_executable(test_stance_motion example/behavior_manager/test_stance_motion.cpp)
+        target_include_directories(test_stance_motion PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager ${RL_INCLUDE_DIR})
+        target_link_libraries(test_stance_motion PRIVATE
+            behavior_manager robot_base Eigen3::Eigen ${RL_LIB} cnpy)
+        add_test(NAME stance_motion COMMAND test_stance_motion)
+
+        add_executable(test_policy_switch
+            example/behavior_manager/test_policy_switch.cpp)
+        target_link_libraries(test_policy_switch PRIVATE behavior_manager robot_base)
+        add_test(NAME policy_switch COMMAND test_policy_switch)
+        set_tests_properties(policy_switch PROPERTIES TIMEOUT 30)
 
         add_executable(test_rl_target_limits
             example/behavior_manager/test_rl_target_limits.cpp)
         target_include_directories(test_rl_target_limits PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager
             ${RL_INCLUDE_DIR})
         target_link_libraries(test_rl_target_limits PRIVATE
@@ -517,6 +642,7 @@ if(BUILD_RL)
         add_executable(test_rl_inference_logging
             example/behavior_manager/test_rl_inference_logging.cpp)
         target_include_directories(test_rl_inference_logging PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager
             ${RL_INCLUDE_DIR})
         target_link_libraries(test_rl_inference_logging PRIVATE

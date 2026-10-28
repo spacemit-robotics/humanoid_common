@@ -54,8 +54,11 @@ public:
             output_->kd = kd_;
         }
 
-        // 从当前实际关节位置开始插值，确保第一帧目标与实际位置一致
-        if (sensor_) {
+        // 延续已使能的保持目标，避免受载位置误差在切换时被清零。
+        if (output_ && output_->enable &&
+            output_->target_pos.size() == default_pos_.size()) {
+            init_pos_ = output_->target_pos;
+        } else if (sensor_) {
             init_pos_ = sensor_->joint_pos;
         }
     }

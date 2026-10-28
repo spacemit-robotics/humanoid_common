@@ -164,7 +164,8 @@ public:
 
     ~Session() { fsm_.ForceSwitch(StateName::POWER_OFF, "target limit regression complete"); }
 
-    void WaitForAction(bool expect_fault = false) {
+    void WaitForAction(bool expect_fault = false, bool require_target_change = false) {
+        const auto previous_target = output_.target_pos;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
         while (std::chrono::steady_clock::now() < deadline) {
             fsm_.Step(0.002F, 0.02F);
@@ -174,7 +175,8 @@ public:
                     "unexpected StateRL fault: " + fault.detail);
                 return;
             }
-            if (output_.enable) {
+            if (output_.enable &&
+                (!require_target_change || output_.target_pos != previous_target)) {
                 Require(!expect_fault, "invalid target was published");
                 return;
             }
@@ -225,6 +227,20 @@ int main() {
             Session session(transition, {0.0, 0.0, 0.0}, {4.0, 2.0, 1.0, 1.0});
             session.WaitForAction();
             RequirePositions(session.Positions(), {3.04, 1.56, 0.49, 0.49});
+        }
+
+        // Blend from the entry snapshot, not recursively from each prior result.
+        auto fixed_entry = fixture.Load("");
+        fixed_entry.entry_target_transition_duration = 0.5;
+        {
+            Session session(fixed_entry, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 0.0});
+            for (int step = 1; step <= 25; ++step) {
+                session.WaitForAction(false, true);
+                const double progress = step * 0.02 / 0.5;
+                auto expected = fixed_entry.policy.rl_default_pos;
+                for (auto &value : expected) value *= progress * progress;
+                RequirePositions(session.Positions(), expected);
+            }
         }
 
         // Reject arithmetic overflow without publishing a partially clamped target.

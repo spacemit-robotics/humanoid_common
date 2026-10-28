@@ -67,7 +67,11 @@ bool ConvertWholeBodyState(
     if (!destination || source.num_dof == 0 || source.num_dof > WHOLE_BODY_MAX_DOF)
         return false;
 
-    auto result = robot_base::RobotData::Create(source.num_dof);
+    if (destination->num_dof != static_cast<int>(source.num_dof) || !destination->IsValid())
+        *destination = robot_base::RobotData::Create(source.num_dof);
+    auto &result = *destination;
+    result.base_pos = {};
+    result.base_vel = {};
     for (size_t i = 0; i < source.num_dof; ++i) {
         result.joint_pos[i] = source.position[i];
         result.joint_vel[i] = source.velocity[i];
@@ -85,9 +89,13 @@ bool ConvertWholeBodyState(
             result.base_vel[i + 3] = source.gyro[i];
         }
         robot_base::QuatToRpy(result.base_quat, result.rpy);
+    } else {
+        result.base_quat = {1.0, 0.0, 0.0, 0.0};
+        result.rpy = {};
+        result.gyro = {};
+        result.acceleration = {};
     }
     result.time = source.timestamp_s;
-    *destination = std::move(result);
     return true;
 }
 

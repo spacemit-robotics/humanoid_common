@@ -38,7 +38,7 @@ namespace transport {
 // ==================== 协议常量 ====================
 
 static constexpr uint32_t kMagic = 0x484D5253;  ///< "HMRS" 魔数
-static constexpr uint16_t kVersion = 6;         ///< 协议版本
+static constexpr uint16_t kVersion = 7;         ///< 协议版本（策略请求序号及结果回传）
 static constexpr int kMaxDof = 64;              ///< 最大自由度数
 static constexpr std::size_t kPolicyNameLength = 64;
 static constexpr std::size_t kInteractionNameLength = 64;
@@ -90,6 +90,7 @@ struct HmiCmdPacket {
     float wz = 0.0f;
     uint64_t acknowledge_fault_sequence = 0;
     char switch_policy[kPolicyNameLength] = {};  ///< 策略切换请求，空字符串表示无切换
+    uint64_t policy_request_sequence = 0;
     uint64_t interaction_sequence = 0;
     uint8_t interaction_operation = 0;
     char interaction_action[kInteractionNameLength] = {};
@@ -136,6 +137,14 @@ struct ControlCmdPacket {
     double kd[kMaxDof] = {0.0};
 };
 
+/** @brief 策略切换结果的固定布局。 */
+struct PolicySwitchPacket {
+    uint64_t sequence = 0;
+    uint8_t phase = 0;
+    char policy[kPolicyNameLength] = {};
+    char detail[kFaultDetailLength] = {};
+};
+
 /**
  * @brief Control → HMI 运行状态数据包
  */
@@ -155,6 +164,7 @@ struct ControlStatusPacket {
     uint8_t interaction_phase = 0;
     float interaction_progress = 0.0f;
     char interaction_action[kInteractionNameLength] = {};
+    PolicySwitchPacket policy_switch{};
     FaultPacket fault{};
 };
 
@@ -323,7 +333,7 @@ inline bool CanEncodeFault(const robot_base::FaultStatus &fault) {
         fault.code != robot_base::FaultCode::NONE && fault.sequence != 0;
 }
 
-inline std::string FaultDetailForPacket(const std::string &detail) {
+inline std::string DetailForPacket(const std::string &detail) {
     constexpr char kTruncationMarker[] = "...[truncated]";
     constexpr std::size_t kMaximumSize = kFaultDetailLength - 1;
     constexpr std::size_t kMarkerSize = sizeof(kTruncationMarker) - 1;
@@ -336,6 +346,48 @@ inline std::string FaultDetailForPacket(const std::string &detail) {
         --prefix_size;
     }
     return detail.substr(0, prefix_size) + kTruncationMarker;
+}
+
+inline bool CanEncodePolicySwitch(const robot_base::PolicySwitchStatus &status) {
+    using Phase = robot_base::PolicySwitchStatus::Phase;
+    if (status.policy.size() >= kPolicyNameLength ||
+        status.policy.find('\0') != std::string::npos ||
+        status.detail.find('\0') != std::string::npos) return false;
+    switch (status.phase) {
+    case Phase::IDLE:
+        return status.sequence == 0 && status.policy.empty() && status.detail.empty();
+    case Phase::PREPARING:
+    case Phase::READY:
+    case Phase::FAILED:
+    case Phase::REJECTED:
+        return !status.policy.empty();
+    }
+    return false;
+}
+
+inline bool ValidPolicySwitchPacket(const PolicySwitchPacket &packet) {
+    return HasNullTerminator(packet.policy) && HasNullTerminator(packet.detail) &&
+        CanEncodePolicySwitch({packet.sequence,
+            static_cast<robot_base::PolicySwitchStatus::Phase>(packet.phase),
+            DecodeText(packet.policy), DecodeText(packet.detail)});
+}
+
+inline void EncodePolicySwitch(const robot_base::PolicySwitchStatus &status,
+        PolicySwitchPacket *packet) {
+    *packet = {};
+    packet->sequence = status.sequence;
+    packet->phase = static_cast<uint8_t>(status.phase);
+    std::strncpy(packet->policy, status.policy.c_str(), sizeof(packet->policy) - 1);
+    const auto detail = DetailForPacket(status.detail);
+    std::strncpy(packet->detail, detail.c_str(), sizeof(packet->detail) - 1);
+}
+
+inline void DecodePolicySwitch(const PolicySwitchPacket &packet,
+        robot_base::PolicySwitchStatus *status) {
+    status->sequence = packet.sequence;
+    status->phase = static_cast<robot_base::PolicySwitchStatus::Phase>(packet.phase);
+    status->policy = DecodeText(packet.policy);
+    status->detail = DecodeText(packet.detail);
 }
 
 inline bool CanEncodeRobotState(const robot_base::RobotData &state,
@@ -398,6 +450,7 @@ inline bool CanEncodeStatus(const robot_base::ControlStatus &status,
         status.active_policy.size() < kPolicyNameLength &&
         status.active_policy.find('\0') == std::string::npos &&
         CanEncodeInteractionStatus(status.interaction) &&
+        CanEncodePolicySwitch(status.policy_switch) &&
         CanEncodeFault(fault);
 }
 
@@ -472,7 +525,7 @@ inline bool ValidControlStatusPacket(const ControlStatusPacket &packet) {
                 packet.interaction_phase),
             packet.interaction_progress,
             DecodeText(packet.interaction_action)}) &&
-        ValidFaultPacket(packet.fault);
+        ValidPolicySwitchPacket(packet.policy_switch) && ValidFaultPacket(packet.fault);
 }
 
 inline void EncodeFault(
@@ -486,7 +539,7 @@ inline void EncodeFault(
     destination->native_code = source.native_code;
     destination->sequence = source.sequence;
     destination->timestamp_s = source.timestamp_s;
-    const std::string detail = FaultDetailForPacket(source.detail);
+    const std::string detail = DetailForPacket(source.detail);
     std::memcpy(destination->detail, detail.data(), detail.size());
 }
 

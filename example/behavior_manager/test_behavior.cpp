@@ -187,12 +187,20 @@ int main(int argc, char *argv[]) {
 
         // ========== 阶段4: 切换到 ZERO ==========
         std::cout << "\n--- 阶段4: key=2 → ZERO (策略准备位) ---" << std::endl;
+        // 受载时反馈与保持目标存在偏差，切换不能撤掉原有位置误差产生的支撑。
+        const auto home_target = home_output.target_pos;
+        sensor.joint_pos[0] += 0.03;
+        bm.SetSensorData(sensor);
         cmd.key = 2;
         bm.SetCommand(cmd);
         bm.Step(control_dt, rl_dt);
         cmd.key = 0;
         std::cout << "当前状态: " << StateNameStr(bm.CurrentState()) << std::endl;
         assert(bm.CurrentState() == behavior_manager::StateName::ZERO);
+        if (bm.GetOutput().target_pos != home_target) {
+            std::cerr << "[错误] HOME -> ZERO 首帧目标不连续" << std::endl;
+            return 1;
+        }
         if (bm.IsZeroReady()) {
             std::cerr << "[错误] ZERO 刚进入时不应报告 READY" << std::endl;
             return 1;

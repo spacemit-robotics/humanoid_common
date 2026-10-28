@@ -88,6 +88,12 @@ RLConfig LoadRLStateConfig(const std::string &yaml_path,
                 "[BehaviorManager] " + safety_base + " 时限配置无效");
         }
     }
+    config.discard_late_inference = yaml.Read<bool>(
+        safety_base + ".discard_late_inference").value_or(yaml.Read<bool>(
+            "behavior_manager.rl_safety.discard_late_inference").value_or(false));
+    if (config.discard_late_inference && (config.inference_deadline_s <= 0.0 ||
+        config.first_action_timeout_s <= 0.0 || config.max_action_age_s <= 0.0))
+        throw std::runtime_error("discard_late_inference requires bounded action and inference deadlines");
     config.policy_adapter =
         policy_adapter::LoadConfig(yaml_path, policy_name, robot_dir);
     config.zero_target_pos =

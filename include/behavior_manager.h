@@ -124,6 +124,9 @@ public:
      */
     std::string CurrentPolicyName() const;
 
+    /** @brief 获取最近一次策略切换请求的处理结果，供 HMI 确认或显示失败。 */
+    robot_base::PolicySwitchStatus CurrentPolicySwitchStatus() const;
+
     /**
      * @brief 获取 RL 实时推理频率（Hz）
      */

@@ -16,7 +16,7 @@ int main(int argc, char *argv[]) {
         std::printf(
             "Usage: %s config.yaml [--sim|--real] [--listen ADDRESS] [--public-url "
             "http://HOST:PORT]\n"
-            "       [--export-pairing | --show-credential]\n",
+            "       [--terminal-only] [--export-pairing | --show-credential]\n",
             argv[0]);
         return argc < 2 ? 1 : 0;
     }
@@ -24,8 +24,13 @@ int main(int argc, char *argv[]) {
         auto config = operator_service::LoadConfig(argv[1]);
         bool export_pairing = false, show_credential = false;
         bool selected_mode = false, network_options = false;
+        bool terminal_only = false;
         for (int i = 2; i < argc; ++i) {
             const std::string option = argv[i];
+            if (option == "--terminal-only") {
+                terminal_only = true;
+                continue;
+            }
             if (option == "--sim" || option == "--real") {
                 if (selected_mode) throw std::runtime_error("specify only one of --sim or --real");
                 config.terminal_only = option == "--sim";
@@ -50,8 +55,9 @@ int main(int argc, char *argv[]) {
             } else
                 throw std::runtime_error("unknown option: " + option);
         }
+        config.terminal_only = config.terminal_only || terminal_only;
         if (config.terminal_only && (network_options || export_pairing || show_credential))
-            throw std::runtime_error("simulation supports only the local TUI; network and QR options are unavailable");
+            throw std::runtime_error("terminal-only mode has no network or QR options");
         if (export_pairing || show_credential) {
             operator_service::PreparePairing(&config);
             if (show_credential)

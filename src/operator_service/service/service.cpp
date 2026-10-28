@@ -114,6 +114,17 @@ std::string StateRoot() {
     if (home && *home) return std::string(home) + "/.local/state";
     throw std::runtime_error("operator service requires HOME or XDG_STATE_HOME");
 }
+std::optional<Velocity> ReadTeleopVector(const robot_base::YamlFile &yaml, const std::string &name, bool positive) {
+    const auto key = "operator_service.teleop." + name;
+    const auto values = yaml.Read<std::vector<double>>(key);
+    if (!values) return std::nullopt;
+    if (values->size() != 3 || std::any_of(values->begin(), values->end(), [positive](double value) {
+            return !std::isfinite(value) || (positive ? value <= 0 : value < 0);
+        }))
+        throw std::runtime_error(key + " must contain three finite " + (positive ? "positive" : "nonnegative") +
+            " values [vx, vy, wz]");
+    return Velocity{(*values)[0], (*values)[1], (*values)[2]};
+}
 } // namespace
 
 std::string DefaultConnectionFile(const std::string &robot) {
@@ -137,7 +148,8 @@ std::string PairingSvg(const std::string &url) {
 Config LoadConfig(const std::string &path) {
     const auto yaml = robot_base::YamlFile::Load(path);
     Config c;
-    c.terminal_only = yaml.Read<std::string>("driver.backend").value_or("mujoco") != "whole_body";
+    c.terminal_only = yaml.Read<bool>("operator_service.terminal_only").value_or(
+        yaml.Read<std::string>("driver.backend").value_or("mujoco") != "whole_body");
     c.robot = yaml.Read<std::string>("robot_base.name").value_or("robot");
     if (c.robot.empty() || c.robot.size() > 64 ||
         c.robot.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") !=
@@ -178,6 +190,19 @@ Config LoadConfig(const std::string &path) {
         std::abs(yaml.Read<double>("hmi.velocity.step_wz").value_or(0.1))};
     if (!std::isfinite(c.velocity_step.vx) || !std::isfinite(c.velocity_step.vy) ||
         !std::isfinite(c.velocity_step.wz)) throw std::runtime_error("hmi velocity steps must be finite");
+    c.teleop.deadzone = yaml.Read<double>("operator_service.teleop.deadzone").value_or(c.teleop.deadzone);
+    if (!std::isfinite(c.teleop.deadzone) || c.teleop.deadzone < 0 || c.teleop.deadzone >= 0.5)
+        throw std::runtime_error("operator_service.teleop.deadzone must be in [0, 0.5)");
+    c.teleop.acceleration = ReadTeleopVector(yaml, "acceleration", true).value_or(c.teleop.acceleration);
+    c.teleop.deceleration = ReadTeleopVector(yaml, "deceleration", true).value_or(c.teleop.deceleration);
+    c.teleop.slow_limits = ReadTeleopVector(yaml, "slow_limits", false);
+    c.teleop.fast_limits = ReadTeleopVector(yaml, "fast_limits", false);
+    if (c.teleop.slow_limits && c.teleop.fast_limits) {
+        const auto &slow = *c.teleop.slow_limits;
+        const auto &fast = *c.teleop.fast_limits;
+        if (slow.vx > fast.vx || slow.vy > fast.vy || slow.wz > fast.wz)
+            throw std::runtime_error("teleop slow_limits must not exceed fast_limits");
+    }
     if (!std::isfinite(c.heartbeat_hz) || c.heartbeat_hz < 10 || c.heartbeat_hz > 100 ||
         !std::isfinite(c.status_timeout) || c.status_timeout < 0.1 || !std::isfinite(c.request_timeout) ||
         c.request_timeout < 0.5 || c.lease_ms < 300 || c.lease_ms > 5000)
@@ -196,6 +221,9 @@ Config LoadConfig(const std::string &path) {
         Policy p;
         p.name = name;
         const std::string base = "rl_policy.onnx_infer.policies." + name;
+        p.display_name = yaml.Read<std::string>(base + ".display_name").value_or(name);
+        p.client_smoothing = yaml.Read<bool>(base + ".command.client_smoothing").value_or(true);
+        p.switch_group = yaml.Read<std::string>(base + ".switch_group").value_or("");
         p.manual_reference =
             yaml.Read<std::string>(base + ".policy_adapter.start_mode")
                 .value_or(yaml.Read<std::string>(base + ".tracker.start_mode").value_or("")) == "manual";
@@ -204,8 +232,11 @@ Config LoadConfig(const std::string &path) {
         p.maximum = {limits.max_vx, limits.max_vy, limits.max_wz};
         const std::string adapter = base + ".policy_adapter";
         const auto type = yaml.Read<std::string>(adapter + ".type").value_or("");
-        const auto configured = yaml.Read<std::string>(adapter + ".catalog");
-        if (type == "joint_trajectory" || (type == "sonic" && configured && !configured->empty())) {
+        const auto configured = yaml.Read<std::string>(adapter +
+            (type == "stance_motion" ? ".joint_trajectory.catalog" : ".catalog"));
+        if (type == "joint_trajectory" ||
+            ((type == "sonic" || type == "stance_motion" || type == "history_actor") &&
+                configured && !configured->empty())) {
             const std::string catalog = configured.value_or(adapter);
             p.actions = LoadActions(yaml, catalog);
         }
@@ -251,6 +282,7 @@ void Service::Finish(const std::string &phase, const std::string &message) {
     result_.message = message;
     command_.key = 0;
     command_.switch_policy.clear();
+    command_.policy_request_sequence = 0;
     acknowledge_sequence_ = 0;
     pending_target_.clear();
     runtime_logging::Log(runtime_logging::Level::kInfo,
@@ -266,6 +298,7 @@ void Service::ClearInput(const std::string &reason) {
     reference_until_ = 0;
     command_.key = 0;
     command_.switch_policy.clear();
+    command_.policy_request_sequence = 0;
     command_.vx = command_.vy = command_.wz = 0;
     acknowledge_sequence_ = 0;
     command_.interaction.sequence = std::max(command_.interaction.sequence, status_.interaction.sequence) + 1;
@@ -312,10 +345,19 @@ void Service::UpdateStatus(const robot_base::ControlStatus &status, const robot_
     }
     if (result_.phase != "accepted") return;
     if (result_.operation == "state") {
-        if (pending_target_ == StateName(status.mode)) Finish("completed", "control entered requested state");
+        if (pending_target_ == StateName(status.mode) && (status.mode != source_mode_ || command_sent_))
+            Finish("completed", "control entered requested state");
         else if (status.mode != source_mode_) Finish("rejected", "control entered a different state");
-    } else if (result_.operation == "policy" && pending_target_ == status.active_policy) {
-        Finish("completed", "control selected requested policy");
+    } else if (result_.operation == "policy" &&
+        status.policy_switch.sequence == command_.policy_request_sequence &&
+        status.policy_switch.policy == pending_target_) {
+        using Phase = robot_base::PolicySwitchStatus::Phase;
+        if (status.policy_switch.phase == Phase::READY)
+            Finish("completed", "control prepared requested policy");
+        else if (status.policy_switch.phase == Phase::FAILED)
+            Finish("failed", status.policy_switch.detail);
+        else if (status.policy_switch.phase == Phase::REJECTED)
+            Finish("rejected", status.policy_switch.detail);
     } else if ((result_.operation == "interaction" || result_.operation == "cancel") &&
         command_.interaction.sequence == status.interaction.sequence) {
         Finish(status.interaction.request_accepted ? "completed" : "rejected", "control handled action request");
@@ -349,6 +391,10 @@ Status Service::Snapshot(uint64_t session) const {
     s.interaction_phase = PhaseName(status_.interaction.phase);
     s.interaction_action = status_.interaction.action;
     s.interaction_progress = status_.interaction.progress;
+    s.interaction_sequence = status_.interaction.sequence;
+    s.interaction_accepted = status_.interaction.request_accepted;
+    s.teleop_preset = teleop_preset_;
+    s.teleop_preset_sequence = teleop_preset_sequence_;
     s.request = result_;
     return s;
 }
@@ -365,9 +411,14 @@ Json Service::Catalog() const {
     for (const auto &p : config_.policies) policies.push_back(Encode(p));
     Json actions = Json::array();
     for (const auto &a : config_.actions) actions.push_back({{"key", a.key}, {"display_name", a.display_name}});
+    Json teleop = {{"deadzone", config_.teleop.deadzone},
+        {"acceleration", Encode(config_.teleop.acceleration)},
+        {"deceleration", Encode(config_.teleop.deceleration)}};
+    if (config_.teleop.slow_limits) teleop["slow_limits"] = Encode(*config_.teleop.slow_limits);
+    if (config_.teleop.fast_limits) teleop["fast_limits"] = Encode(*config_.teleop.fast_limits);
     return {{"robot", config_.robot}, {"policies", policies}, {"lease_ms", config_.lease_ms},
         {"velocity_step", Encode(config_.velocity_step)}, {"trajectory_enabled", config_.trajectory_enabled},
-        {"actions", actions}, {"voice_chat_port", config_.voice_chat_port},
+        {"actions", actions}, {"teleop", teleop}, {"voice_chat_port", config_.voice_chat_port},
         {"admin_required", !config_.admin_password_hash.empty()}};
 }
 Json Service::ReplyTo(
@@ -409,10 +460,31 @@ Json Service::Handle(uint64_t session, const Json &request) {
                 id, true, "ok", "authenticated", {{"catalog", Catalog()}, {"status", StatusMessage(session)}});
         }
         if (!it->second.authenticated) return fail("unauthorized", "authenticate first");
+        if (op == "client_event") {
+            const auto event = args.value("event", "");
+            auto detail = args.value("detail", "");
+            const std::vector<std::string> allowed = {"direction_down", "manual_disconnect",
+                "page_hidden", "pagehide", "protocol_error", "ui_error", "script_error",
+                "promise_error", "velocity_rejected", "teleop_preset"};
+            if (std::find(allowed.begin(), allowed.end(), event) == allowed.end() || detail.size() > 1024)
+                return fail("bad_request", "invalid client event");
+            if (event == "teleop_preset") {
+                if (detail != "slow" && detail != "fast") return fail("bad_request", "unknown speed preset");
+                if (owner_ != session || !Online()) return fail("not_owner", "acquire control first");
+                teleop_preset_ = detail;
+                ++teleop_preset_sequence_;
+            }
+            for (char &c : detail)
+                if (static_cast<unsigned char>(c) < 32 || c == 127) c = ' ';
+            runtime_logging::Log(runtime_logging::Level::kInfo,
+                "operator client event: session=" + std::to_string(session) + " event=" + event +
+                " detail=" + detail);
+            return ReplyTo(id, true, "ok", "client event recorded");
+        }
         if (op == "status") return ReplyTo(id, true, "ok", "", {{"status", StatusMessage(session)}});
         if (op == "catalog") return ReplyTo(id, true, "ok", "", {{"catalog", Catalog()}});
         if (op == "pairing") {
-            if (config_.terminal_only) return fail("unsupported", "simulation supports the local terminal only");
+            if (config_.terminal_only) return fail("unsupported", "terminal-only mode has no pairing entry");
             const std::string url = PairingUrl(config_);
             return ReplyTo(id, true, "ok", "", {{"url", url}, {"qr_svg", PairingSvg(url)}});
         }
@@ -463,9 +535,10 @@ Json Service::Handle(uint64_t session, const Json &request) {
             lease_until_ = Now() + config_.lease_ms / 1000.0;
             return ReplyTo(id, true, "ok", "control renewed");
         }
-        if (!Online()) return fail("not_ready", "control feedback is unavailable");
         const auto target = args.value("state", "");
         const bool safety_request = op == "state" && (target == "DAMP" || target == "POWER_OFF");
+        if (!Online() && !(op == "state" && target == "POWER_OFF"))
+            return fail("not_ready", "control feedback is unavailable");
         if (owner_ != session && !safety_request) return fail("not_owner", "acquire control first");
         if (safety_request) {
             const bool was_owner = owner_ == session;
@@ -503,20 +576,31 @@ Json Service::Handle(uint64_t session, const Json &request) {
             if (target == "ZERO" && mode == M::HOME) key = 2;
             const auto active_mode = config_.trajectory_enabled ? "TRAJECTORY" : "RL";
             if (target == active_mode && mode == M::ZERO && status_.zero_ready) key = 3;
-            if (target == StateName(mode)) return ReplyTo(id, true, "ok", "already in requested state");
+            if (target == StateName(mode) && target != "POWER_OFF")
+                return ReplyTo(id, true, "ok", "already in requested state");
             if (!key) return fail("not_ready", "state prerequisite is not satisfied");
             command_.key = key;
             source_mode_ = mode;
             pending_target_ = target;
         } else if (op == "policy") {
             if (config_.trajectory_enabled) return fail("not_ready", "trajectory mode has no RL policy");
-            if (status_.mode != M::POWER_OFF && status_.mode != M::DAMP)
-                return fail("not_ready", "select policy in POWER_OFF or DAMP");
             const auto name = args.at("policy").get<std::string>();
-            if (std::none_of(
-                    config_.policies.begin(), config_.policies.end(), [&](const Policy &p) { return p.name == name; }))
+            const auto selected = std::find_if(config_.policies.begin(), config_.policies.end(),
+                [&](const Policy &p) { return p.name == name; });
+            if (selected == config_.policies.end())
                 return fail("bad_request", "unknown policy");
+            const auto *active = ActivePolicy();
+            const bool hot = status_.mode == M::RL && active && !active->switch_group.empty() &&
+                active->switch_group == selected->switch_group;
+            if (status_.mode != M::POWER_OFF && status_.mode != M::DAMP && !hot)
+                return fail("not_ready", "select policy in POWER_OFF/DAMP or a compatible running group");
+            if (hot && Busy(status_.interaction.phase))
+                return fail("not_ready", "finish or cancel the current action before switching policy");
+            command_.vx = command_.vy = command_.wz = 0.0;
             command_.switch_policy = name;
+            policy_sequence_ = std::max(policy_sequence_, status_.policy_switch.sequence) + 1;
+            if (policy_sequence_ == 0) ++policy_sequence_;
+            command_.policy_request_sequence = policy_sequence_;
             pending_target_ = name;
         } else if (op == "interaction" || op == "cancel") {
             const auto active_mode = config_.trajectory_enabled ? M::TRAJECTORY : M::RL;
@@ -548,6 +632,7 @@ Json Service::Handle(uint64_t session, const Json &request) {
             return fail("bad_request", "unknown operation");
         }
         result_ = {result_.sequence + 1, op, op == "reference_start" ? "sent" : "accepted", "request sent to control"};
+        command_sent_ = false;
         request_until_ = Now() + config_.request_timeout;
         runtime_logging::Log(runtime_logging::Level::kInfo,
             "operator request #" + std::to_string(result_.sequence) + " " + op + " session=" + std::to_string(session) +

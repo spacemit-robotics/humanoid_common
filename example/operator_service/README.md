@@ -130,6 +130,17 @@ ctest --test-dir output/build/cmake/pkgs/application_native_humanoid_common --ou
 
 `prepare_simulation.py` 只供自动化测试隔离 SHM/日志，日常启动不需要它。
 
+网页浏览器回归使用编译安装后的完整静态资源目录，需本机已安装 Playwright/Chromium：
+
+```bash
+source build/envsetup.sh
+cd application/native/humanoid_common
+OPERATOR_WEB_TEST_ROOT="$PREFIX/share/humanoid_common/operator_web" \
+  node example/operator_service/test_web_browser.js
+```
+
+该测试验证网页及 WebView 布局和操作交互，不连接机器人。
+
 ## 实机
 
 完成板端同步编译后，依次运行 driver `--real`、control、HMI；使用任意客户端操作。

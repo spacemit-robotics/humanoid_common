@@ -7,8 +7,11 @@
  */
 
 #include <chrono>
+#include <future>
 #include <iostream>
+#include <vector>
 
+#include "latest_sample_worker.h"
 #include "runtime_timing.h"
 
 namespace {
@@ -51,6 +54,39 @@ bool TestProgressWatchdog() {
     watchdog.Observe(1.0, start + std::chrono::milliseconds(130));
     ok = Expect(!watchdog.Expired(start + std::chrono::milliseconds(131), 0.05),
         "watchdog did not accept a restarted source after reset") && ok;
+    return ok;
+}
+
+bool TestSnapshotWorker() {
+    std::promise<void> entered, release;
+    auto ready = entered.get_future();
+    auto wait = release.get_future();
+    std::vector<int> recorded;
+    runtime_logging::LatestSampleWorker<int> worker([&](const int &value) {
+        if (value == 1) {
+            entered.set_value();
+            wait.wait();
+        }
+        recorded.push_back(value);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool accepted = false;
+    while (!accepted && std::chrono::steady_clock::now() < deadline) {
+        accepted = worker.Publish(1);
+        if (!accepted) std::this_thread::yield();
+    }
+    const bool started = accepted && ready.wait_until(deadline) == std::future_status::ready;
+    if (!started) {
+        release.set_value();
+        return Expect(false, "snapshot worker did not start");
+    }
+    const auto before = worker.Dropped();
+    bool ok = Expect(worker.Publish(2) && worker.Publish(3), "snapshot handoff failed");
+    release.set_value();
+    worker.Stop();
+    ok = Expect(recorded == std::vector<int>({1, 3}), "worker must retain only latest pending sample") && ok;
+    ok = Expect(worker.Dropped() == before + 1 && !worker.Failed(), "dropped snapshot not reported") && ok;
+    ok = Expect(!worker.Publish(4), "stopped worker accepted a sample") && ok;
     return ok;
 }
 
@@ -121,7 +157,19 @@ bool TestStateStartupGate() {
 }  // namespace
 
 int main() {
+    runtime_timing::Window timing(runtime_timing::Clock::time_point{});
+    timing.ObserveWork(1.0, 1.5);
+    timing.ObserveWork(2.0, 2.5);
+    timing.ObserveWork(-1.0, 4.0);
+    const auto summary = timing.Consume(runtime_timing::Clock::now());
+    if (!Expect(summary.read_mean_ms == 1.5 && summary.read_max_ms == 2.0 &&
+        summary.work_mean_ms == 2.0 && summary.work_max_ms == 2.5,
+        "work timing must separate read cost and reject invalid samples")) return 1;
+    const auto empty = timing.Consume(runtime_timing::Clock::now());
+    if (!Expect(empty.read_max_ms == 0 && empty.work_mean_ms == 0,
+        "work timing must reset each window")) return 1;
     if (!TestProgressWatchdog()) return 1;
+    if (!TestSnapshotWorker()) return 1;
     if (!TestStateStartupGate()) return 1;
     std::cout << "[test] runtime timing helpers: PASS\n";
     return 0;

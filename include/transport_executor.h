@@ -105,8 +105,8 @@ public:
 /**
  * @brief 带运行时故障信息的扩展传输接口
  *
- * 旧 TransportBase 和 robot_base 数据结构保持原有 ABI；新 runtime 通过该接口
- * 在同一协议包中传递故障状态和确认序列。
+ * runtime 通过该接口在同一协议包中传递故障状态和确认序列。
+ * 各进程必须使用同版 robot_base 数据结构和线协议，不能混用旧二进制。
  */
 class TransportBaseV2 : public TransportBase {
 public:

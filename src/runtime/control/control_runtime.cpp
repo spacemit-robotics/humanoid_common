@@ -15,16 +15,23 @@
  * - robot_base: 机器人状态数据结构
  */
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cctype>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -34,6 +41,8 @@
 #include "robot_base.h"
 #include "runtime_logger.h"
 #include "runtime_timing.h"
+#include "latest_sample_worker.h"
+#include "snapshot_worker.h"
 using behavior_manager::BehaviorManagerClass;
 using behavior_manager::StateNameStr;
 
@@ -41,6 +50,81 @@ namespace {
 volatile std::sig_atomic_t g_running = 1;
 void OnSignal(int) {
     g_running = 0;
+}
+
+int StartupReadyFd() {
+    const char *value = std::getenv("HUMANOID_STARTUP_READY_FD");
+    if (!value) return -1;
+    std::size_t consumed = 0;
+    const int fd = std::stoi(value, &consumed);
+    struct stat status {};
+    if (fd < 3 || value[consumed] != '\0' || fstat(fd, &status) != 0 ||
+        !S_ISFIFO(status.st_mode)) {
+        throw std::runtime_error("HUMANOID_STARTUP_READY_FD must be an inherited writable pipe");
+    }
+    const int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || (flags & O_ACCMODE) == O_RDONLY ||
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        throw std::runtime_error("failed to configure nonblocking startup readiness pipe");
+    }
+    return fd;
+}
+
+struct MonitorSnapshot {
+    behavior_manager::StateName mode{};
+    std::array<char, 64> policy{};
+    bool hmi_connected = false;
+    double vx = 0.0, vy = 0.0, wz = 0.0;
+    bool fault_latched = false, fault_active = false;
+    robot_base::FaultSource fault_source{};
+    robot_base::FaultCode fault_code{};
+    double control_dt = 0.0, rl_dt = 0.0;
+    double control_hz = 0.0, rl_hz = 0.0;
+    runtime_timing::Summary timing;
+};
+
+struct ControlTelemetrySnapshot {
+    static constexpr size_t kJoints = 128;
+    size_t count = 0;
+    std::array<std::array<double, 8>, kJoints> joints{};
+    std::array<char, 128> policy{};
+    double wall_time = 0.0, device_time = 0.0;
+    double control_hz = 0.0, rl_hz = 0.0, age = 0.0, progress_age = 0.0;
+    float vx = 0.0f, vy = 0.0f, wz = 0.0f;
+    behavior_manager::StateName mode{};
+    bool hmi_connected = false, enable = false, active = false, latched = false;
+    robot_base::FaultSource source{};
+    robot_base::FaultCode code{};
+    int32_t native_code = 0;
+    uint64_t sequence = 0;
+    bool timing_record = false;
+    runtime_timing::Summary timing;
+};
+
+void RenderMonitor(const MonitorSnapshot &sample) {
+    std::ostringstream line0, line1, line2;
+    line0 << "[control] state=" << StateNameStr(sample.mode)
+        << " policy=" << sample.policy.data()
+        << " hmi=" << (sample.hmi_connected ? "online" : "timeout")
+        << std::fixed << std::setprecision(2)
+        << " cmd=(" << sample.vx << "," << sample.vy << "," << sample.wz << ")";
+    if (sample.fault_latched) {
+        line0 << " fault=" << robot_base::FaultSourceName(sample.fault_source)
+            << "/" << robot_base::FaultCodeName(sample.fault_code)
+            << (sample.fault_active ? ":active" : ":latched");
+    }
+    line1 << std::fixed << std::setprecision(4) << "control_dt=" << sample.control_dt
+        << "s target=" << std::setprecision(1) << 1.0 / sample.control_dt
+        << "Hz actual=" << std::setprecision(2) << sample.control_hz << "Hz"
+        << " p99=" << sample.timing.period_p99_ms << "ms"
+        << " skip=" << sample.timing.skipped_cycles;
+    line2 << std::fixed << std::setprecision(4) << "rl_dt=" << sample.rl_dt
+        << "s target=" << std::setprecision(1) << 1.0 / sample.rl_dt
+        << "Hz actual=" << std::setprecision(2) << sample.rl_hz << "Hz";
+    std::cout << "\033[3A"
+        << "\r\033[2K" << line0.str() << "\n"
+        << "\r\033[2K" << line1.str() << "\n"
+        << "\r\033[2K" << line2.str() << "\n" << std::flush;
 }
 
 double WallTimeSeconds() {
@@ -63,8 +147,7 @@ void RecordControlTelemetry(const robot_base::RobotData &state,
     double control_hz, double rl_hz, double state_age_s,
     double state_progress_age_s,
     const robot_base::FaultStatus &fault,
-    const std::vector<std::string> &joint_names) {
-    const double wall_time = WallTimeSeconds();
+    const std::vector<std::string> &joint_names, double wall_time) {
     std::ostringstream summary;
     summary << std::fixed << std::setprecision(9)
             << wall_time << "," << state.time << "," << StateNameStr(mode) << ","
@@ -112,9 +195,39 @@ void RecordControlTelemetry(const robot_base::RobotData &state,
     runtime_logging::RecordCsv("control_joint", joint_header, joints.str());
 }
 
-void RecordTiming(const char *stream, const runtime_timing::Summary &timing) {
+void RecordTiming(const char *stream, const runtime_timing::Summary &timing, double wall_time);
+
+void FormatControlTelemetry(const ControlTelemetrySnapshot &sample,
+        const std::vector<std::string> &joint_names) {
+    if (sample.timing_record) {
+        RecordTiming("control_timing", sample.timing, sample.wall_time);
+        return;
+    }
+    robot_base::RobotData state;
+    robot_base::ControlCmd control;
+    state.time = sample.device_time;
+    control.enable = sample.enable;
+    for (size_t i = 0; i < sample.count; ++i) {
+        const auto &q = sample.joints[i];
+        state.joint_pos.push_back(q[0]); state.joint_vel.push_back(q[1]);
+        state.joint_torque.push_back(q[2]); control.target_pos.push_back(q[3]);
+        control.target_vel.push_back(q[4]); control.target_torque.push_back(q[5]);
+        control.kp.push_back(q[6]); control.kd.push_back(q[7]);
+    }
+    robot_base::Command command;
+    command.vx = sample.vx; command.vy = sample.vy; command.wz = sample.wz;
+    robot_base::FaultStatus fault;
+    fault.active = sample.active; fault.latched = sample.latched;
+    fault.source = sample.source; fault.code = sample.code;
+    fault.native_code = sample.native_code; fault.sequence = sample.sequence;
+    RecordControlTelemetry(state, control, sample.mode, sample.policy.data(),
+        sample.hmi_connected, command, sample.control_hz, sample.rl_hz,
+        sample.age, sample.progress_age, fault, joint_names, sample.wall_time);
+}
+
+void RecordTiming(const char *stream, const runtime_timing::Summary &timing, double wall_time) {
     std::ostringstream row;
-    row << std::fixed << std::setprecision(6) << WallTimeSeconds() << ","
+    row << std::fixed << std::setprecision(6) << wall_time << ","
         << timing.samples << "," << timing.period_p95_ms << ","
         << timing.period_p99_ms << "," << timing.period_max_ms << ","
         << timing.lateness_p95_ms << "," << timing.lateness_p99_ms << ","
@@ -193,7 +306,9 @@ int main(int argc, char *argv[]) {
     bool trajectory_enabled = false;
     runtime_config::PolicyCommandLimitMap policy_command_limits;
     std::unique_ptr<runtime_logging::Session> logging_session;
+    int startup_ready_fd = -1;
     try {
+        startup_ready_fd = StartupReadyFd();
         yaml_file = robot_base::YamlFile::Load(yaml_path);
         trajectory_enabled = yaml_file.Read<bool>("behavior_manager.trajectory.enabled").value_or(false);
         if (!trajectory_enabled) policy_command_limits = runtime_config::LoadPolicyCommandLimits(yaml_file);
@@ -204,9 +319,6 @@ int main(int argc, char *argv[]) {
             << "用法: " << argv[0] << " <config.yaml>\n";
         return 1;
     }
-
-    // 配置主控制循环线程调度（robot_base.threads.control_main）
-    robot_base::ThreadLoop::FromYaml(yaml_file, "control_main").Apply();
 
     // behavior_manager.control_dt: 控制循环周期（未来异步推理时可独立配置为高频）
     float control_dt =
@@ -268,6 +380,7 @@ int main(int argc, char *argv[]) {
     robot_base::FaultStatus latest_state_fault;
     robot_base::FaultStatus startup_fault;
     robot_base::ControlCmd latest_control;
+    robot_base::ControlCmd ctrl;
     bool has_state = false;
     bool has_control = false;
     bool has_hmi = false;
@@ -278,6 +391,10 @@ int main(int argc, char *argv[]) {
         yaml_file.Read<std::vector<std::string>>("robot_base.joint_names").value_or(
             std::vector<std::string>{});
     const auto logging_config = runtime_logging::GetConfig();
+    runtime_logging::SnapshotWorker<ControlTelemetrySnapshot> telemetry_worker(
+        [&joint_names](const ControlTelemetrySnapshot &sample) {
+            FormatControlTelemetry(sample, joint_names);
+        });
     const auto telemetry_period =
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(
@@ -296,8 +413,11 @@ int main(int argc, char *argv[]) {
             std::chrono::duration<double>(1.0 / status_hz));
     int step_count = 0;
     auto last_print_time = std::chrono::steady_clock::now();
-    const double target_control_hz = (control_dt > 1e-6f) ? (1.0 / control_dt) : 0.0;
-    const double target_rl_hz = (rl_dt > 1e-6f) ? (1.0 / rl_dt) : 0.0;
+    std::unique_ptr<runtime_logging::LatestSampleWorker<MonitorSnapshot>> monitor;
+    if (isatty(STDOUT_FILENO)) {
+        monitor = std::make_unique<runtime_logging::LatestSampleWorker<MonitorSnapshot>>(
+            RenderMonitor);
+    }
     double latest_control_hz = 0.0;
     double latest_state_age_s = 0.0;
     double latest_state_progress_age_s = 0.0;
@@ -307,6 +427,11 @@ int main(int argc, char *argv[]) {
     bool state_ready = false;
     runtime_timing::Window timing_window(next_control_time);
     runtime_timing::Summary latest_timing;
+
+    // Initialize models and their workers before pinning the real-time loop.
+    // A worker inheriting this thread's single-core SCHED_FIFO configuration
+    // cannot run while model initialization busy-waits on the same core.
+    robot_base::ThreadLoop::FromYaml(yaml_file, "control_main").Apply();
 
     runtime_logging::Log(
         runtime_logging::Level::kInfo, "control runtime started", false);
@@ -358,6 +483,14 @@ int main(int argc, char *argv[]) {
                         state_progress_watchdog.Reset();
                         runtime_logging::Log(runtime_logging::Level::kInfo,
                             "driver state stream ready", false);
+                        if (startup_ready_fd >= 0) {
+                            if (write(startup_ready_fd, "ready\n", 6) != 6) {
+                                runtime_logging::Log(runtime_logging::Level::kWarning,
+                                    "failed to notify launcher of driver readiness");
+                            }
+                            close(startup_ready_fd);
+                            startup_ready_fd = -1;
+                        }
                     }
                 }
                 if (state_ready) {
@@ -409,6 +542,7 @@ int main(int argc, char *argv[]) {
             cmd.vy = 0.0f;
             cmd.wz = 0.0f;
             cmd.switch_policy.clear();
+            cmd.policy_request_sequence = 0;
             if (hmi_just_disconnected) {
                 ++cmd.interaction.sequence;
                 if (cmd.interaction.sequence == 0) {
@@ -493,7 +627,6 @@ int main(int argc, char *argv[]) {
             bm.Step(actual_control_dt, rl_dt);
             startup_fault = {};
             const auto &out = bm.GetOutput();
-            robot_base::ControlCmd ctrl;
             ctrl.enable = out.enable;
             ctrl.actuation_mode = out.actuation_mode;
             ctrl.target_pos = out.target_pos;
@@ -531,19 +664,47 @@ int main(int argc, char *argv[]) {
         }
 
         const auto reported_fault = has_control ? bm.CurrentFault() : startup_fault;
+        const bool idle_telemetry = bm.CurrentState() == behavior_manager::StateName::POWER_OFF &&
+            logging_config.idle_rate_hz > 0.0 && !runtime_logging::HighRateRequested();
+        const double sample_period = idle_telemetry ? 1.0 / logging_config.idle_rate_hz :
+            std::chrono::duration<double>(telemetry_period).count();
         if (logging_config.telemetry_enabled && has_state && has_control &&
-            now - last_telemetry_time >= telemetry_period) {
-            RecordControlTelemetry(latest_state, latest_control, bm.CurrentState(),
-                bm.CurrentPolicyName(), hmi_connected, cmd, latest_control_hz,
-                bm.GetRlFreq(), latest_state_age_s, latest_state_progress_age_s,
-                reported_fault, joint_names);
+            std::chrono::duration<double>(now - last_telemetry_time).count() >= sample_period) {
+            ControlTelemetrySnapshot sample;
+            sample.count = std::min({joint_names.size(), latest_state.joint_pos.size(),
+                latest_state.joint_vel.size(), latest_state.joint_torque.size(),
+                latest_control.target_pos.size(), latest_control.target_vel.size(),
+                latest_control.target_torque.size(), latest_control.kp.size(),
+                latest_control.kd.size(), ControlTelemetrySnapshot::kJoints});
+            for (size_t i = 0; i < sample.count; ++i) {
+                sample.joints[i] = {latest_state.joint_pos[i], latest_state.joint_vel[i],
+                    latest_state.joint_torque[i], latest_control.target_pos[i],
+                    latest_control.target_vel[i], latest_control.target_torque[i],
+                    latest_control.kp[i], latest_control.kd[i]};
+            }
+            const auto policy = bm.CurrentPolicyName();
+            std::copy_n(policy.data(), std::min(policy.size(), sample.policy.size() - 1), sample.policy.data());
+            sample.wall_time = WallTimeSeconds(); sample.device_time = latest_state.time;
+            sample.mode = bm.CurrentState(); sample.hmi_connected = hmi_connected;
+            sample.vx = cmd.vx; sample.vy = cmd.vy; sample.wz = cmd.wz;
+            sample.control_hz = latest_control_hz; sample.rl_hz = bm.GetRlFreq();
+            sample.age = latest_state_age_s; sample.progress_age = latest_state_progress_age_s;
+            sample.enable = latest_control.enable; sample.active = reported_fault.active;
+            sample.latched = reported_fault.latched; sample.source = reported_fault.source;
+            sample.code = reported_fault.code; sample.native_code = reported_fault.native_code;
+            sample.sequence = reported_fault.sequence;
+            telemetry_worker.Publish(sample);
             last_telemetry_time = now;
         }
 
         if (timing_window.IsDue(now, logging_config.timing_window_s)) {
             latest_timing = timing_window.Consume(now);
             if (logging_config.telemetry_enabled) {
-                RecordTiming("control_timing", latest_timing);
+                ControlTelemetrySnapshot sample;
+                sample.timing_record = true;
+                sample.timing = latest_timing;
+                sample.wall_time = WallTimeSeconds();
+                telemetry_worker.Publish(sample);
             }
         }
 
@@ -559,6 +720,7 @@ int main(int argc, char *argv[]) {
             status.wz = cmd.wz;
             status.rl_frequency_hz = static_cast<float>(bm.GetRlFreq());
             status.active_policy = bm.CurrentPolicyName();
+            status.policy_switch = bm.CurrentPolicySwitchStatus();
             status.interaction = bm.CurrentInteractionStatus();
             const bool sent = transport->SendStatusV2(status, reported_fault);
             if (!sent && !status_send_failed) {
@@ -572,45 +734,30 @@ int main(int argc, char *argv[]) {
             last_status_time = now;
         }
 
-        // 固定 3 行动态刷新，避免增量日志刷屏
+        // Terminal formatting and writes run outside the control thread.
         double elapsed_print = std::chrono::duration<double>(now - last_print_time).count();
         if (elapsed_print >= 0.1) {
-            const double control_freq = step_count / elapsed_print;
-            const double rl_freq = bm.GetRlFreq();
-            const std::string policy =
-                bm.CurrentPolicyName().empty() ? "-" : bm.CurrentPolicyName();
-
-            std::ostringstream line0, line1, line2;
-            line0 << "[control] state=" << StateNameStr(bm.CurrentState())
-                << " hmi=" << (hmi_connected ? "online" : "timeout");
-            if (!trajectory_enabled) {
-                line0 << " policy=" << policy << std::fixed << std::setprecision(2)
-                    << " cmd=(" << cmd.vx << "," << cmd.vy << "," << cmd.wz << ")";
+            if (monitor) {
+                MonitorSnapshot sample;
+                sample.mode = bm.CurrentState();
+                const auto policy = bm.CurrentPolicyName();
+                std::copy_n(policy.c_str(), std::min(policy.size(), sample.policy.size() - 1),
+                    sample.policy.begin());
+                sample.hmi_connected = hmi_connected;
+                sample.vx = cmd.vx;
+                sample.vy = cmd.vy;
+                sample.wz = cmd.wz;
+                sample.fault_latched = reported_fault.latched;
+                sample.fault_active = reported_fault.active;
+                sample.fault_source = reported_fault.source;
+                sample.fault_code = reported_fault.code;
+                sample.control_dt = control_dt;
+                sample.rl_dt = rl_dt;
+                sample.control_hz = step_count / elapsed_print;
+                sample.rl_hz = bm.GetRlFreq();
+                sample.timing = latest_timing;
+                monitor->Publish(sample);
             }
-            const auto &fault = reported_fault;
-            if (fault.latched) {
-                line0 << " fault=" << robot_base::FaultSourceName(fault.source)
-                    << "/" << robot_base::FaultCodeName(fault.code)
-                    << (fault.active ? ":active" : ":latched");
-            }
-            line1 << std::fixed << std::setprecision(4) << "control_dt=" << control_dt
-                << "s target=" << std::setprecision(1) << target_control_hz
-                << "Hz actual=" << std::setprecision(2) << control_freq << "Hz"
-                << " p99=" << latest_timing.period_p99_ms << "ms"
-                << " skip=" << latest_timing.skipped_cycles;
-            if (trajectory_enabled) {
-                line2 << "trajectory action=" << bm.CurrentInteractionStatus().action;
-            } else {
-                line2 << std::fixed << std::setprecision(4) << "rl_dt=" << rl_dt
-                    << "s target=" << std::setprecision(1) << target_rl_hz
-                    << "Hz actual=" << std::setprecision(2) << rl_freq << "Hz";
-            }
-
-            std::cout << "\033[3A"
-                    << "\r\033[2K" << line0.str() << "\n"
-                    << "\r\033[2K" << line1.str() << "\n"
-                    << "\r\033[2K" << line2.str() << "\n"
-                    << std::flush;
             step_count = 0;
             last_print_time = now;
         }

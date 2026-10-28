@@ -28,6 +28,17 @@ struct Config {
     bool file_enabled = false;
     bool telemetry_enabled = false;
     bool driver_monitor_enabled = false;
+    bool blackbox_enabled = false;
+    bool policy_trace_enabled = false;
+    double idle_rate_hz = 0.0;
+    double continuous_rate_hz = 2.0;
+    double pre_trigger_s = 30.0;
+    double post_trigger_s = 10.0;
+    double trigger_cooldown_s = 60.0;
+    int blackbox_memory_mb = 64;
+    int queue_memory_mb = 16;
+    int max_total_size_mb = 0;
+    int min_free_space_mb = 0;
     double telemetry_rate_hz = 20.0;
     double control_telemetry_rate_hz = 20.0;
     double hardware_telemetry_rate_hz = 20.0;
@@ -53,12 +64,17 @@ private:
 };
 
 void Log(Level level, const std::string &message, bool emit_console = true);
+// Background-only formatting path; realtime callers must use SnapshotWorker.
 void RecordCsv(
     const std::string &stream, const std::string &header, const std::string &row);
 void RecordArtifact(
     const std::string &kind, const std::string &name, const std::string &path);
 Config GetConfig();
 std::string GetSessionDirectory();
+void TriggerSnapshot(const std::string &reason);
+bool HighRateRequested();
+// Nonblocking counter used by fixed-size telemetry producer queues.
+void ReportTelemetryDrop();
 
 }  // namespace runtime_logging
 

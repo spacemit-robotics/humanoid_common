@@ -13,7 +13,7 @@
 namespace driver_runtime {
 
 #ifdef HAS_MUJOCO_BACKEND
-std::unique_ptr<DriverBackend> CreateMujocoBackend(const std::string &yaml_path);
+std::unique_ptr<DriverBackend> CreateMujocoBackend(const std::string &yaml_path, const std::string &scene);
 #endif
 #ifdef HAS_WHOLE_BODY_BACKEND
 std::unique_ptr<DriverBackend> CreateWholeBodyBackend(const std::string &yaml_path);
@@ -48,11 +48,14 @@ bool BackendIsCompiled(BackendKind kind) {
     return false;
 }
 
-std::unique_ptr<DriverBackend> CreateBackend(BackendKind kind, const std::string &yaml_path) {
+std::unique_ptr<DriverBackend> CreateBackend(BackendKind kind, const std::string &yaml_path,
+    const std::string &scene_override) {
+    if (!scene_override.empty() && kind != BackendKind::MUJOCO)
+        throw std::runtime_error("--scene is only supported by the MuJoCo backend");
     switch (kind) {
         case BackendKind::MUJOCO:
 #ifdef HAS_MUJOCO_BACKEND
-            return CreateMujocoBackend(yaml_path);
+            return CreateMujocoBackend(yaml_path, scene_override);
 #else
             throw std::runtime_error("driver.backend=mujoco was not compiled");
 #endif

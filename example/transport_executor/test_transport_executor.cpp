@@ -205,7 +205,27 @@ bool TestPacketValidation() {
     long_fault.detail = std::string("invalid\0detail", 14);
     if (transport::CanEncodeFault(long_fault)) return false;
 
-    std::cout << "[test] V6 packet validation: PASS\n";
+    robot_base::PolicySwitchStatus policy_status{
+        41, robot_base::PolicySwitchStatus::Phase::FAILED, "missing",
+        std::string(320, 'x')};
+    transport::EncodePolicySwitch(policy_status, &status.policy_switch);
+    status.interaction_request_accepted = 0;
+    if (!transport::ValidControlStatusPacket(status)) return false;
+    robot_base::PolicySwitchStatus decoded_policy;
+    transport::DecodePolicySwitch(status.policy_switch, &decoded_policy);
+    if (decoded_policy.sequence != 41 || decoded_policy.policy != "missing" ||
+        decoded_policy.phase != robot_base::PolicySwitchStatus::Phase::FAILED ||
+        decoded_policy.detail.find("...[truncated]") == std::string::npos) return false;
+    status.policy_switch.phase = 255;
+    if (transport::ValidControlStatusPacket(status)) return false;
+    status.policy_switch = {};
+    status.policy_switch.sequence = 41;
+    if (transport::ValidControlStatusPacket(status)) return false;
+    status.policy_switch = {};
+    status.header.version = 6;
+    if (transport::ValidControlStatusPacket(status)) return false;
+
+    std::cout << "[test] V7 packet validation: PASS\n";
     return true;
 }
 
@@ -426,6 +446,8 @@ int main(int argc, char *argv[]) {
     hmi_cmd.vx = 0.5f;
     hmi_cmd.vy = 0.1f;
     hmi_cmd.wz = 0.2f;
+    hmi_cmd.switch_policy = "missing";
+    hmi_cmd.policy_request_sequence = 41;
     hmi_cmd.interaction.sequence = 7;
     hmi_cmd.interaction.operation =
         robot_base::InteractionRequest::Operation::START;
@@ -444,6 +466,8 @@ int main(int argc, char *argv[]) {
                 << ", vy=" << recv_hmi.vy << ", wz=" << recv_hmi.wz << "\n";
         bool ok = (recv_hmi.key == 3) &&
             (std::abs(recv_hmi.vx - 0.5f) < 1e-4f) &&
+            recv_hmi.switch_policy == "missing" &&
+            recv_hmi.policy_request_sequence == 41 &&
             recv_hmi.interaction.sequence == 7 &&
             recv_hmi.interaction.operation ==
                 robot_base::InteractionRequest::Operation::START &&
@@ -503,6 +527,8 @@ int main(int argc, char *argv[]) {
     status.wz = 0.2f;
     status.rl_frequency_hz = 49.8f;
     status.active_policy = "test_policy";
+    status.policy_switch = {41, robot_base::PolicySwitchStatus::Phase::FAILED,
+        "missing", "model file not found"};
     status.interaction.sequence = 7;
     status.interaction.request_accepted = true;
     status.interaction.phase =
@@ -532,6 +558,10 @@ int main(int argc, char *argv[]) {
         recv_status.hmi_connected &&
         std::abs(recv_status.vx - status.vx) < 1e-4f &&
         recv_status.active_policy == status.active_policy &&
+        recv_status.policy_switch.sequence == status.policy_switch.sequence &&
+        recv_status.policy_switch.phase == status.policy_switch.phase &&
+        recv_status.policy_switch.policy == status.policy_switch.policy &&
+        recv_status.policy_switch.detail == status.policy_switch.detail &&
         recv_status.interaction.sequence == status.interaction.sequence &&
         recv_status.interaction.request_accepted ==
             status.interaction.request_accepted &&

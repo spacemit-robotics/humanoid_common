@@ -585,6 +585,8 @@ private:
             RecordProgress(ProgressStage::PREPARE_DONE, release_sequence, stage_finish);
 
             // 组装观测 + 推理
+            // Timed motion frame zero is observed at t=0, before advancing its clock.
+            const float observation_dt = HasMotionPhase() && infer_elapsed_ == 0.0 ? 0.0f : rl_dt;
             executor.AssembleObs(gyro,
                                 rpy,
                                 cmd_vx,
@@ -594,7 +596,7 @@ private:
                                 joint_vel,
                                 base_quat,
                                 base_vel,
-                                rl_dt,
+                                observation_dt,
                                 obs);
             infer_elapsed_ += rl_dt;
             stage_finish = RLRuntimeClock::now();

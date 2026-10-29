@@ -226,6 +226,27 @@ void Run() {
     Require(probe.manager.CurrentPolicyName() == "other", "hidden policy request changed active policy");
 }
 
+void TestTimedMotionStartsAtZero() {
+    Fixture fixture("finite");
+    Probe probe(fixture.Path());
+    probe.Key(1, State::DAMP);
+    probe.Key(4, State::HOME);
+    probe.command = {};
+    probe.Tick(30);
+    probe.Key(2, State::ZERO);
+    probe.command = {};
+    probe.Tick(30);
+    probe.Key(3, State::RL);
+    probe.command = {};
+    for (int i = 0; i < 200 && probe.manager.GetOutput().target_pos[1] == 0.0; ++i)
+        probe.Tick(1);
+    const auto output = probe.manager.GetOutput();
+    Require(std::abs(output.target_pos[0]) < 1e-7 &&
+        std::abs(output.target_pos[1] - 1.0) < 1e-7 &&
+        std::abs(output.target_pos[2]) < 1e-7, "timed motion skipped frame zero");
+    probe.Key(-1, State::POWER_OFF);
+}
+
 void TestLiveSwitch() {
     Fixture fixture;
     Probe probe(fixture.Path());
@@ -356,6 +377,7 @@ void TestPolicyActions() {
 int main() {
     try {
         Run();
+        TestTimedMotionStartsAtZero();
         TestLiveSwitch();
         TestPolicyActions();
         std::cout << "policy switch regression: PASS\n";

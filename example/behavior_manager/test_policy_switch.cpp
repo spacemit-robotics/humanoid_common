@@ -18,6 +18,7 @@
 
 #include "behavior_manager.h"
 #include "rl_test_model.h"
+#include "transport_packet.h"
 
 namespace {
 namespace fs = std::filesystem;
@@ -30,7 +31,7 @@ void Require(bool condition, const std::string &message) {
 
 class Fixture {
 public:
-    Fixture() {
+    explicit Fixture(const std::string &initial = "good") {
         const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
         directory_ = fs::temp_directory_path() / ("policy_switch_" + std::to_string(nonce));
         Require(fs::create_directory(directory_), "cannot create test directory");
@@ -54,12 +55,20 @@ public:
             "  type: onnx_infer\n"
             "  rl_dt: 0.02\n"
             "  onnx_infer:\n"
-            "    default_policy: good\n"
-            "    policy_names: [good, missing, other, chain, finite]\n"
-            "    policies:\n";
-        for (const std::string name : {"good", "missing", "other", "chain", "finite"}) {
+            << "    default_policy: " << initial << "\n"
+            "    policy_names: [good, missing, other, chain, finite, catalog]\n"
+            "    policies:\n"
+            "      catalog:\n"
+            "        switch_group: locomotion\n"
+            "        policy_actions:\n"
+            "          idle_policy: good\n"
+            "          action_names: [motion, broken]\n"
+            "          actions:\n"
+            "            motion: {policy: clip}\n"
+            "            broken: {policy: clip_missing}\n";
+        for (const std::string name : {"good", "missing", "other", "chain", "finite", "clip", "clip_missing"}) {
             yaml << "      " << name << ":\n"
-                << "        model_path: " << (name == "missing"
+                << "        model_path: " << (name == "missing" || name == "clip_missing"
                     ? "missing.onnx" : "identity.onnx") << "\n"
                 << "        runtime: {provider: cpu}\n"
                 "        model_io:\n"
@@ -72,7 +81,7 @@ public:
                 << "        kp: " << (name == "other" ? "[10, 10, 10]" : "[1, 1, 1]") << "\n"
                 << "        kd: " << (name == "other" ? "[2, 2, 2]" : "[0.1, 0.1, 0.1]") << "\n"
                 "        observation:\n"
-                << "          segment_0_terms: " << (name == "finite"
+                << "          segment_0_terms: " << (name == "finite" || name == "clip"
                     ? "[phase, ref_motion_phase]" : "[ang_vel]") << "\n";
             if (name == "chain") {
                 yaml << "        prerequisite: {policy: good, duration: 0.1}\n";
@@ -80,6 +89,7 @@ public:
             if (name == "finite") {
                 yaml << "        motion_length: 0.1\n        return_policy: good\n";
             }
+            if (name == "clip") yaml << "        motion_length: 0.4\n";
         }
         Require(yaml.good(), "cannot write test config");
     }
@@ -108,6 +118,12 @@ public:
         manager.SetCommand(command);
         manager.Step(0.001F, 0.02F);
         Require(!manager.CurrentFault().latched, "unexpected robot fault");
+        Require(transport::CanEncodeInteractionStatus(manager.CurrentInteractionStatus()),
+            "action status cannot be transmitted");
+        const auto result = manager.CurrentPolicySwitchStatus();
+        if (result.phase == Phase::IDLE)
+            Require(result.sequence == 0 && result.policy.empty() && result.detail.empty(),
+                "internal action handoff corrupted the idle policy-switch status");
     }
 
     void Request(const std::string &policy, uint64_t sequence) {
@@ -260,12 +276,88 @@ void TestLiveSwitch() {
         "finite motion did not return to the configured policy without leaving RL");
     probe.Key(-1, State::POWER_OFF);
 }
+
+void TestPolicyActions() {
+    using ActionPhase = robot_base::InteractionStatus::Phase;
+    using Operation = robot_base::InteractionRequest::Operation;
+    Fixture fixture("catalog");
+    Probe probe(fixture.Path());
+    probe.EnterRl();
+    probe.Tick(600);
+    Require(probe.manager.CurrentPolicyName() == "catalog" &&
+        probe.manager.CurrentInteractionStatus().phase == ActionPhase::IDLE,
+        "selecting an action catalog started a motion automatically");
+    probe.command.interaction = {100, Operation::CANCEL, ""};
+    probe.Step();
+    Require(probe.manager.CurrentInteractionStatus().phase == ActionPhase::IDLE,
+        "cancelling idle mode created a phantom finished action");
+    const auto action = [&](const std::string &key, uint64_t sequence) {
+        probe.command = {};
+        probe.command.interaction = {sequence, Operation::START, key};
+        probe.Step();
+    };
+    const auto wait_policy = [&](const std::string &name) {
+        for (int i = 0; i < 5000 && probe.manager.CurrentPolicyName() != name; ++i) probe.Tick(1);
+        Require(probe.manager.CurrentPolicyName() == name, "action policy did not become active: " + name);
+        Require(probe.manager.CurrentPolicySelectionName() == "catalog", "action changed selected mode");
+    };
+    action("unknown", 1);
+    Require(!probe.manager.CurrentInteractionStatus().request_accepted, "unknown action accepted");
+    action("motion", 2);
+    wait_policy("clip");
+    action("unknown", 20);
+    Require(!probe.manager.CurrentInteractionStatus().request_accepted &&
+        probe.manager.CurrentInteractionStatus().action == "motion", "rejected request replaced active action");
+    wait_policy("catalog");
+    Require(probe.manager.CurrentInteractionStatus().phase == ActionPhase::FINISHED,
+        "finite action did not return to idle");
+    probe.Tick(600);  // Same request is repeated by the heartbeat, never replayed.
+    Require(probe.manager.CurrentPolicyName() == "catalog", "finished action restarted from a stale request");
+
+    action("broken", 3);
+    for (int i = 0; i < 5000 && probe.manager.CurrentInteractionStatus().phase != ActionPhase::REJECTED; ++i)
+        probe.Tick(1);
+    Require(probe.manager.CurrentInteractionStatus().phase == ActionPhase::REJECTED &&
+        probe.manager.CurrentPolicyName() == "catalog" && probe.manager.GetOutput().enable,
+        "failed action load interrupted standby");
+
+    action("motion", 4);
+    probe.command.interaction = {5, Operation::CANCEL, ""};
+    probe.Tick(600);
+    Require(probe.manager.CurrentPolicyName() == "catalog", "cancel during preparation started the action");
+    action("motion", 6);
+    wait_policy("clip");
+    probe.command.interaction = {7, Operation::CANCEL, ""};
+    wait_policy("catalog");
+    Require(probe.manager.CurrentState() == State::RL, "action cancellation left RL");
+
+    action("motion", 8);
+    wait_policy("clip");
+    probe.Key(-1, State::POWER_OFF);
+    probe.command = {};
+    wait_policy("catalog");
+    Require(!probe.manager.GetOutput().enable, "standby reload enabled power-off motors");
+    probe.Tick(50);
+    probe.EnterRl();
+    probe.Tick(600);
+    Require(probe.manager.CurrentPolicyName() == "catalog", "re-entering RL replayed the previous action");
+    probe.Request("clip", 2);
+    probe.Wait(Phase::REJECTED);
+    Require(probe.manager.CurrentPolicyName() == "catalog", "hidden child appeared as a selectable mode");
+    action("motion", 9);
+    wait_policy("clip");
+    probe.Request("other", 3);
+    probe.Wait(Phase::READY);
+    Require(probe.manager.CurrentPolicySelectionName() == "other", "mode switch kept stale action ownership");
+    probe.Key(-1, State::POWER_OFF);
+}
 }  // namespace
 
 int main() {
     try {
         Run();
         TestLiveSwitch();
+        TestPolicyActions();
         std::cout << "policy switch regression: PASS\n";
         return 0;
     } catch (const std::exception &error) {

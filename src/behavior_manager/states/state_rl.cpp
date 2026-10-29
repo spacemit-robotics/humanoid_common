@@ -381,7 +381,8 @@ public:
             switch_ready_.load(std::memory_order_acquire);
     }
 
-    void RequestPolicySwitch(bool requested) override {
+    void RequestPolicySwitch(bool requested, bool cancel_playback) override {
+        cancel_playback_.store(requested && cancel_playback, std::memory_order_release);
         if (switch_requested_.exchange(requested, std::memory_order_acq_rel) != requested)
             switch_ready_.store(false, std::memory_order_release);
     }
@@ -409,6 +410,7 @@ private:
     bool runtime_prepared_ = false;
     std::atomic<bool> switch_ready_{false};
     std::atomic<bool> switch_requested_{false};
+    std::atomic<bool> cancel_playback_{false};
     std::atomic<bool> motion_finished_{false};
     bool live_handoff_ = false;
     double infer_elapsed_ = 0.0;
@@ -667,7 +669,8 @@ private:
             adapter_ready = finished;
         }
         motion_finished_.store(finished, std::memory_order_release);
-        switch_ready_.store(switching && adapter_ready &&
+        switch_ready_.store(switching && (adapter_ready ||
+            cancel_playback_.load(std::memory_order_acquire)) &&
             std::abs(cmd_vx) < 1.0e-6 && std::abs(cmd_vy) < 1.0e-6 && std::abs(cmd_wz) < 1.0e-6,
             std::memory_order_release);
 

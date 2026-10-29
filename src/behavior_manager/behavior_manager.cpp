@@ -26,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -196,6 +197,14 @@ public:
     std::string active_policy;                // 当前已加载的策略名
     std::unordered_map<std::string, std::string> switch_groups;
     std::unordered_map<std::string, std::string> return_policies;
+    std::unordered_set<std::string> selectable_policies;
+    using ActionCatalog = std::unordered_map<std::string, std::string>;
+    std::unordered_map<std::string, ActionCatalog> policy_actions;
+    std::string action_owner;
+    std::string action_target;
+    bool action_returning = false;
+    uint64_t previous_action_sequence = 0;
+    robot_base::InteractionStatus policy_action_status;
     bool hot_switch_requested = false;
     double switch_timeout_s = 30.0;
     double switch_started_s = 0.0;
@@ -258,6 +267,76 @@ public:
             !from->second.empty() && from->second == to->second;
     }
 
+    void StartActionHandoff(const std::string &target) {
+        pending_policy = target;
+        hot_switch_requested = fsm.CurrentState() == StateName::RL && target != active_policy;
+        switch_started_s = MonotonicTimeSeconds();
+        waiting_prerequisite = false;
+        final_target_policy.clear();
+        policy_prepare_failed = false;
+        policy_prepare_block_reported = false;
+        command.vx = command.vy = command.wz = 0.0;
+    }
+
+    void FinishPolicyAction(bool accepted) {
+        policy_action_status.request_accepted = accepted;
+        policy_action_status.phase = accepted ? robot_base::InteractionStatus::Phase::FINISHED :
+            robot_base::InteractionStatus::Phase::REJECTED;
+        policy_action_status.progress = accepted ? 1.0f : 0.0f;
+        if (policy_action_status.action.empty()) {
+            policy_action_status.phase = robot_base::InteractionStatus::Phase::IDLE;
+            policy_action_status.progress = 0.0f;
+        }
+        action_target.clear();
+        action_returning = false;
+    }
+
+    void HandlePolicyAction(const robot_base::InteractionRequest &request) {
+        if (action_owner.empty()) return;
+        // The catalog owns these requests. Child adapters must not consume the
+        // same sequence as an unrelated internal action request.
+        command.interaction = {};
+        using Operation = robot_base::InteractionRequest::Operation;
+        using Phase = robot_base::InteractionStatus::Phase;
+        if (request.operation == Operation::NONE || request.sequence == 0 ||
+            request.sequence == previous_action_sequence) return;
+        previous_action_sequence = request.sequence;
+        const bool can_run = fsm.CurrentState() == StateName::RL && !fault.latched && command.key == 0;
+        if (request.operation == Operation::CANCEL && can_run &&
+            (pending_policy == active_policy || pending_policy == action_target || pending_policy == action_owner)) {
+            policy_action_status.sequence = request.sequence;
+            policy_action_status.request_accepted = true;
+            if (active_policy == action_owner) {
+                StartActionHandoff(action_owner);
+                FinishPolicyAction(true);
+            } else {
+                action_returning = true;
+                policy_action_status.phase = Phase::BLEND_OUT;
+                StartActionHandoff(action_owner);
+            }
+            return;
+        }
+        const auto &catalog = policy_actions.at(action_owner);
+        const auto action = catalog.find(request.action);
+        if (!can_run || request.operation != Operation::START || action == catalog.end() ||
+            !action_target.empty() || active_policy != action_owner || pending_policy != active_policy ||
+            !RequestedPolicyReady()) {
+            policy_action_status.sequence = request.sequence;
+            policy_action_status.request_accepted = false;
+            // A rejected second request must not hide a still-running action.
+            if (action_target.empty()) {
+                policy_action_status.action = request.action;
+                policy_action_status.phase = request.action.empty() ? Phase::IDLE : Phase::REJECTED;
+                policy_action_status.progress = 0.0f;
+            }
+            return;
+        }
+        policy_action_status = {request.sequence, true, Phase::BLEND_IN, 0.0f, request.action};
+        action_target = action->second;
+        action_returning = false;
+        StartActionHandoff(action_target);
+    }
+
     void StartPolicyPreparation(const std::string &policy_name) {
         if (policy_prepare_active || prepared_policy || policy_name.empty()) return;
 
@@ -301,6 +380,18 @@ public:
         fsm.ReplaceState(StateName::ZERO, std::move(states.zero));
         RetirePolicy(fsm.ReplaceStateDeferred(StateName::RL, std::move(states.rl)));
         active_policy = states.policy_name;
+        if (active_policy == action_owner) {
+            if (!action_target.empty() || action_returning) FinishPolicyAction(true);
+        } else if (!action_target.empty() && active_policy == action_target && !action_returning) {
+            policy_action_status.phase = robot_base::InteractionStatus::Phase::PLAYING;
+            // Also supports child policies configured for manual reference playback.
+            command.key = robot_base::kCommandStartReference;
+        } else {
+            action_owner = policy_actions.count(active_policy) ? active_policy : "";
+            action_target.clear();
+            action_returning = false;
+            policy_action_status = {};
+        }
         return_attempted = false;
         hot_switch_requested = hot_switch_requested && waiting_prerequisite;
         policy_runtime_ready = true;
@@ -326,7 +417,8 @@ public:
             }
             if (hot_switch_requested && fsm.CurrentState() == StateName::RL &&
                 !fault.latched && !fsm.ReadyForPolicySwitch()) {
-                policy_switch_status.detail = "waiting for current policy to finish its handoff";
+                if (policy_switch_status.phase == robot_base::PolicySwitchStatus::Phase::PREPARING)
+                    policy_switch_status.detail = "waiting for current policy to finish its handoff";
                 return;
             }
             InstallPreparedPolicy(std::move(*prepared_policy));
@@ -348,8 +440,10 @@ public:
                     fsm.CurrentState() != StateName::RL)) {
                 pending_policy = active_policy;
                 hot_switch_requested = false;
-                policy_switch_status.phase = robot_base::PolicySwitchStatus::Phase::REJECTED;
-                policy_switch_status.detail = "running policy switch cancelled by state/fault change";
+                if (policy_switch_status.phase == robot_base::PolicySwitchStatus::Phase::PREPARING) {
+                    policy_switch_status.phase = robot_base::PolicySwitchStatus::Phase::REJECTED;
+                    policy_switch_status.detail = "running policy switch cancelled by state/fault change";
+                }
                 RetirePolicy(std::move(states.rl));
                 return;
             }
@@ -374,6 +468,8 @@ public:
                 policy_switch_status.detail = error.what();
             }
             if (completed_policy != active_policy) {
+                if (completed_policy == action_target || completed_policy == action_owner)
+                    FinishPolicyAction(false);
                 pending_policy = active_policy;
                 hot_switch_requested = false;
                 final_target_policy.clear();
@@ -764,7 +860,10 @@ public:
             // 解析所有策略的可选 prerequisite 子节点，构建策略链 map
             auto policy_names = yaml_file.Read<std::vector<std::string>>(
                 "rl_policy.onnx_infer.policy_names").value_or(std::vector<std::string>{});
-            for (const auto &pname : policy_names) {
+            selectable_policies.insert(policy_names.begin(), policy_names.end());
+            const auto policy_nodes = YAML::LoadFile(path)["rl_policy"]["onnx_infer"]["policies"];
+            for (const auto &node : policy_nodes) {
+                const auto pname = node.first.as<std::string>();
                 switch_groups[pname] = yaml_file.Read<std::string>(
                     "rl_policy.onnx_infer.policies." + pname + ".switch_group").value_or("");
                 return_policies[pname] = yaml_file.Read<std::string>(
@@ -777,7 +876,38 @@ public:
                     std::cout << "[BehaviorManager] 策略链: " << pname << " ← " << *pre_pol
                             << " (" << *pre_dur << "s)" << std::endl;
                 }
+                const auto catalog = node.second["policy_actions"];
+                if (catalog) {
+                    if (!selectable_policies.count(pname) || !catalog["action_names"] ||
+                        !catalog["actions"] || switch_groups[pname].empty())
+                        throw std::runtime_error("policy_actions requires a selectable entry and switch_group");
+                    auto &actions = policy_actions[pname];
+                    for (const auto &name : catalog["action_names"].as<std::vector<std::string>>()) {
+                        const auto target = catalog["actions"][name]["policy"].as<std::string>();
+                        if (name.empty() || target.empty() || !actions.emplace(name, target).second)
+                            throw std::runtime_error("policy_actions contains an empty or duplicate action");
+                    }
+                    if (actions.empty()) throw std::runtime_error("policy_actions must not be empty");
+                }
             }
+            for (const auto &[owner, actions] : policy_actions) {
+                const auto idle = policy_nodes[owner]["policy_actions"]["idle_policy"].as<std::string>();
+                if (idle == owner || !switch_groups.count(idle) || policy_actions.count(idle) ||
+                    switch_groups[idle] != switch_groups[owner] || prerequisite_map.count(idle) ||
+                    !return_policies[idle].empty())
+                    throw std::runtime_error("policy_actions.idle_policy requires an unchained standby policy "
+                        "in the same switch_group");
+                if (prerequisite_map.count(owner) || !return_policies[owner].empty())
+                    throw std::runtime_error("policy_actions entry must remain active while idle");
+                for (const auto &[name, target] : actions) {
+                    if (!switch_groups.count(target) || switch_groups[target] != switch_groups[owner] ||
+                        selectable_policies.count(target) || policy_actions.count(target) ||
+                        prerequisite_map.count(target) || !return_policies[target].empty())
+                        throw std::runtime_error("policy_actions child must be a non-selectable, unchained policy "
+                            "in the same switch_group: " + owner + "/" + name);
+                }
+            }
+            action_owner = policy_actions.count(active_policy) ? active_policy : "";
             const auto switch_config = YAML::LoadFile(path)["behavior_manager"]["policy_switch"];
             if (switch_config && switch_config["timeout_s"])
                 switch_timeout_s = switch_config["timeout_s"].as<double>();
@@ -855,15 +985,19 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
     if (running_switch && (impl_->fault.latched || impl_->command.key == -1 ||
         impl_->command.key == 1 || MonotonicTimeSeconds() - impl_->switch_started_s >
             impl_->switch_timeout_s)) {
+        if (impl_->pending_policy == impl_->action_target ||
+            impl_->pending_policy == impl_->action_owner) impl_->FinishPolicyAction(false);
         impl_->pending_policy = impl_->active_policy;
         impl_->hot_switch_requested = false;
         impl_->waiting_prerequisite = false;
         impl_->final_target_policy.clear();
-        impl_->policy_switch_status.phase = robot_base::PolicySwitchStatus::Phase::REJECTED;
-        impl_->policy_switch_status.detail = "policy handoff cancelled or timed out; current policy retained";
+        if (impl_->policy_switch_status.phase == robot_base::PolicySwitchStatus::Phase::PREPARING) {
+            impl_->policy_switch_status.phase = robot_base::PolicySwitchStatus::Phase::REJECTED;
+            impl_->policy_switch_status.detail = "policy handoff cancelled or timed out; current policy retained";
+        }
     }
     impl_->fsm.RequestPolicySwitch(impl_->hot_switch_requested && impl_->prepared_policy &&
-        impl_->pending_policy != impl_->active_policy);
+        impl_->pending_policy != impl_->active_policy, impl_->action_returning);
     if (impl_->hot_switch_requested) {
         impl_->command.vx = impl_->command.vy = impl_->command.wz = 0.0;
     }
@@ -904,6 +1038,8 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
                 impl_->policy_switch_status.detail = error.what();
             }
             if (impl_->pending_policy != impl_->active_policy) {
+                if (impl_->pending_policy == impl_->action_target ||
+                    impl_->pending_policy == impl_->action_owner) impl_->FinishPolicyAction(false);
                 impl_->pending_policy = impl_->active_policy;
                 impl_->hot_switch_requested = false;
                 impl_->final_target_policy.clear();
@@ -980,6 +1116,11 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
         impl_->policy_runtime_ready = false;
         impl_->policy_prepare_failed = false;
         impl_->policy_prepare_block_reported = false;
+        if (!impl_->action_owner.empty()) {
+            impl_->pending_policy = impl_->action_owner;
+            impl_->hot_switch_requested = false;
+            impl_->FinishPolicyAction(true);
+        }
     }
     if (impl_->waiting_prerequisite && cur == StateName::RL &&
         impl_->RequestedPolicyReady()) {
@@ -1006,7 +1147,12 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
         impl_->RequestedPolicyReady() && !impl_->hot_switch_requested &&
         !impl_->return_attempted && impl_->fsm.PolicyFinished()) {
         const auto target = impl_->return_policies.find(impl_->active_policy);
-        if (target != impl_->return_policies.end() && !target->second.empty()) {
+        if (!impl_->action_owner.empty() && impl_->active_policy != impl_->action_owner) {
+            impl_->return_attempted = true;
+            impl_->action_returning = true;
+            impl_->policy_action_status.phase = robot_base::InteractionStatus::Phase::BLEND_OUT;
+            impl_->StartActionHandoff(impl_->action_owner);
+        } else if (target != impl_->return_policies.end() && !target->second.empty()) {
             impl_->return_attempted = true;
             impl_->pending_policy = target->second;
             impl_->hot_switch_requested = true;
@@ -1037,6 +1183,7 @@ void BehaviorManagerClass::SetSensorFault(const robot_base::FaultStatus &fault) 
 
 void BehaviorManagerClass::SetCommand(const robot_base::Command &cmd) {
     impl_->command = cmd;
+    impl_->HandlePolicyAction(cmd.interaction);
     // switch_policy 边沿检测：control_runtime 每帧把缓存 cmd 重复喂入，必须只在变化时响应
     const bool edge = cmd.switch_policy != impl_->prev_switch_policy ||
         cmd.policy_request_sequence != impl_->prev_policy_request_sequence;
@@ -1051,7 +1198,7 @@ void BehaviorManagerClass::SetCommand(const robot_base::Command &cmd) {
         cmd.policy_request_sequence, Phase::PREPARING, cmd.switch_policy, {}};
     StateName cur = impl_->fsm.CurrentState();
     const bool hot = cur == StateName::RL && impl_->SameSwitchGroup(cmd.switch_policy);
-    if (impl_->switch_groups.find(cmd.switch_policy) == impl_->switch_groups.end() ||
+    if (!impl_->selectable_policies.count(cmd.switch_policy) ||
         cmd.key != 0 || !impl_->has_rl || impl_->fault.latched ||
         (cur != StateName::POWER_OFF && cur != StateName::DAMP && !hot)) {
         impl_->policy_switch_status.phase = Phase::REJECTED;
@@ -1067,6 +1214,7 @@ void BehaviorManagerClass::SetCommand(const robot_base::Command &cmd) {
         impl_->final_target_policy.clear();
         impl_->waiting_prerequisite = false;
         impl_->policy_switch_status.phase = Phase::READY;
+        if (impl_->active_policy == impl_->action_owner) impl_->FinishPolicyAction(true);
         return;
     }
     const std::string &target = cmd.switch_policy;
@@ -1129,6 +1277,10 @@ std::string BehaviorManagerClass::CurrentPolicyName() const {
     return impl_->active_policy;
 }
 
+std::string BehaviorManagerClass::CurrentPolicySelectionName() const {
+    return impl_->action_owner.empty() ? impl_->active_policy : impl_->action_owner;
+}
+
 robot_base::PolicySwitchStatus BehaviorManagerClass::CurrentPolicySwitchStatus() const {
     return impl_->policy_switch_status;
 }
@@ -1143,7 +1295,7 @@ robot_base::FaultStatus BehaviorManagerClass::CurrentFault() const {
 
 robot_base::InteractionStatus
 BehaviorManagerClass::CurrentInteractionStatus() const {
-    return impl_->fsm.CurrentInteractionStatus();
+    return impl_->action_owner.empty() ? impl_->fsm.CurrentInteractionStatus() : impl_->policy_action_status;
 }
 
 bool BehaviorManagerClass::IsRunning() const {

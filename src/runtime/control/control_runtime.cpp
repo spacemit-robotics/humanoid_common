@@ -722,7 +722,7 @@ int main(int argc, char *argv[]) {
             status.vy = cmd.vy;
             status.wz = cmd.wz;
             status.rl_frequency_hz = static_cast<float>(bm.GetRlFreq());
-            status.active_policy = bm.CurrentPolicyName();
+            status.active_policy = bm.CurrentPolicySelectionName();
             status.policy_switch = bm.CurrentPolicySwitchStatus();
             status.interaction = bm.CurrentInteractionStatus();
             const bool interaction_valid = interaction_report.Update(&status);

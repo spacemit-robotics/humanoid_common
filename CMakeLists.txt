@@ -637,6 +637,7 @@ if(BUILD_RL)
 
         add_executable(test_policy_switch
             example/behavior_manager/test_policy_switch.cpp)
+        target_include_directories(test_policy_switch PRIVATE src/transport/transport_executor)
         target_link_libraries(test_policy_switch PRIVATE behavior_manager robot_base)
         add_test(NAME policy_switch COMMAND test_policy_switch)
         set_tests_properties(policy_switch PROPERTIES TIMEOUT 30)

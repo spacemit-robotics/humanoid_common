@@ -176,6 +176,19 @@ void TestTrajectory() {
     rejected = false;
     try { (void)LoadConfig(path.string()); } catch (const std::exception &) { rejected = true; }
     assert(rejected);
+    std::ofstream(path) << "rl_policy:\n  onnx_infer:\n"
+        "    policy_names: [motions]\n    policies:\n"
+        "      motions:\n        display_name: Motion mode\n        switch_group: whole_body\n"
+        "        policy_actions:\n          idle_policy: idle\n          action_names: [wave, bow]\n"
+        "          actions:\n            wave: {policy: wave_model, display_name: Wave}\n"
+        "            bow: {policy: bow_model, display_name: Bow}\n"
+        "      idle: {}\n      wave_model: {}\n      bow_model: {}\n";
+    const auto modes = LoadConfig(path.string());
+    assert(modes.policies.size() == 1 && modes.policies.front().name == "motions");
+    assert(modes.policies.front().display_name == "Motion mode");
+    assert(!modes.policies.front().manual_reference && modes.policies.front().actions.size() == 2);
+    assert(modes.policies.front().actions[0].key == "wave" && modes.policies.front().actions[0].display_name == "Wave");
+    assert(Service(modes).Catalog().at("policies").size() == 1);
     std::filesystem::remove_all(root);
 }
 } // namespace

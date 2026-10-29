@@ -141,6 +141,40 @@ cd ~/spacemit_robot
 
 **路径解析：** `robot_base.robot_dir` 相对于 YAML 文件；`model_path` 相对于 `robot_dir`。
 
+### 模式内动作目录
+
+若一个模式需要待命策略和多套独立动作模型，可在策略入口配置 `policy_actions`。
+`policy_names` 只列用户可选入口，动作模型仍放在 `policies` 中，但不列为入口：
+
+```yaml
+rl_policy:
+  onnx_infer:
+    policy_names: [locomotion, motions]
+    default_policy: locomotion
+    policies:
+      motions:
+        display_name: 动作运控
+        switch_group: full_body
+        policy_actions:
+          idle_policy: locomotion
+          action_names: [wave, bow]
+          actions:
+            wave: {display_name: 挥手, policy: wave_model}
+            bow: {display_name: 鞠躬, policy: bow_model}
+      # locomotion、wave_model、bow_model 各自配置模型、观测、增益等。
+      # 三者使用同一 switch_group，动作模型不再配置 prerequisite/return_policy。
+```
+
+选择 `motions` 后使用待命模型，只有 START 动作请求才加载对应动作策略。
+完成后自动回到本模式待命；CANCEL 准备待命策略并从当前有效输出交接，
+不等待长参考动作的末帧。交接使用待命策略的 `policy_switch.transition_duration`。
+掉电、DAMP 或故障退出 RL 时取消动作，下次进入 RL 从待命开始，不自动续播。
+模型加载失败继续当前控制，动作回报 REJECTED；同一请求序号不会重复执行。
+
+`CurrentPolicyName()` 返回实际执行策略，`CurrentPolicySelectionName()` 返回用户选择的入口。
+HMI 用入口名保持模式选择，并通过 interaction 显示动作；模型参数和推理日志仍对应实际执行策略。
+已有单模型动作目录和未配置 `policy_actions` 的策略保持原行为。
+
 ### 状态机流程
 
 ```

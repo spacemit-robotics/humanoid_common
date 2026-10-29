@@ -64,8 +64,8 @@ bool FSM::ReadyForPolicySwitch() const {
     return current_ && current_->ReadyForPolicySwitch();
 }
 
-void FSM::RequestPolicySwitch(bool requested) {
-    if (current_) current_->RequestPolicySwitch(requested);
+void FSM::RequestPolicySwitch(bool requested, bool cancel_playback) {
+    if (current_) current_->RequestPolicySwitch(requested, cancel_playback);
 }
 
 bool FSM::PolicyFinished() const {

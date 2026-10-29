@@ -125,6 +125,7 @@ cd ~/spacemit_robot
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.start_mode`（MJLab 可选）：`auto`（默认）或 `manual`；手动模式进入 RL 后保持参考首帧，按 `G` 开始
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.reference_action`（MJLab 可选）：指定采用参考动作与残差合成的关节
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.catalog`（SONIC 可选）：为同一全身策略注册多个参考动作；HMI 选择动作后仅切换 `reference_obs`，不覆盖模型 action
+- `rl_policy.onnx_infer.policies.<name>.policy_adapter.planner`（SONIC 可选）：独立线程运行 kinematic planner，将速度命令转换为 tracker 参考；与 `catalog` 互斥，启用后不要求静态 `reference_file`。`model_path`、`runtime`、规划周期 `replan_interval`、提前量 `lookahead` 和输出帧率 `output_fps` 均由 YAML 配置。规划周期包含推理耗时，不在推理结束后再次等待完整周期。
 - `rl_policy.onnx_infer.policies.<name>.command.limits`（可选）：应用层声明该策略接受的 `min_vx/max_vx/min_vy/max_vy/min_wz/max_wz`；未配置 `min_*` 时默认为对应的 `-max_*`，整个 limits 未配置时 HMI 和 Control 均拒绝速度命令
 - `behavior_manager.damp_kd`：阻尼状态 kd（≈ policy kd / 5）
 - `behavior_manager.home.gain_ramp_duration / move_duration`：HOME 建立增益和移动时长，`move_duration` 默认 3 秒
@@ -238,6 +239,7 @@ motion:
 | `joint_trajectory` | 当前轨迹收回完成 |
 | `mjlab` / `protomotions` 参考动作 | 待播放首帧，或当前动作末帧；循环动作等到本轮末帧 |
 | 带动作目录的 `sonic` | 当前动作收回到待命参考 |
+| 带 `planner` 的 `sonic` | 速度归零后生成的停步参考播放完成 |
 | `stance_motion` / `history_actor` | 退出交互、返回站立或待命分支 |
 
 有限动作可通过 `return_policy` 自动返回另一策略；返回模型准备失败时保留当前控制，

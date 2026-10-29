@@ -179,6 +179,7 @@ if(BUILD_RL)
         src/behavior_manager/rl_state_config.cpp
         src/behavior_manager/joint_trajectory.cpp
         src/behavior_manager/policy_adapter/policy_adapter.cpp
+        src/behavior_manager/policy_adapter/sonic_planner.cpp
         src/behavior_manager/policy_adapter/joint_trajectory_policy_adapter.cpp
         src/behavior_manager/policy_adapter/stance_motion_policy_adapter.cpp
         src/behavior_manager/policy_adapter/history_actor_policy_adapter.cpp

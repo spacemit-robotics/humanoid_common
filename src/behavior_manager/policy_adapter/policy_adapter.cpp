@@ -7,6 +7,7 @@
  */
 
 #include "policy_adapter.h"
+#include "sonic_planner.h"
 
 #include "joint_trajectory_policy_adapter.h"
 #include "stance_motion_policy_adapter.h"
@@ -841,21 +842,48 @@ public:
             ? static_cast<int>(policy_config.rl_default_pos.size())
             : static_cast<int>(policy_config.action_joint_index.size());
         ValidateConfig();
-        LoadReferences();
+        if (config_.sonic_planner.Enabled()) {
+            if (config_.reference_motion_catalog.Enabled())
+                throw std::runtime_error("[policy_adapter] planner and motion catalog are exclusive");
+            planner_ = std::make_unique<SonicPlanner>(config_.sonic_planner, policy_config);
+            SonicClip clip;
+            clip.config.motion_fps = config_.sonic_planner.output_fps;
+            clips_.push_back(std::move(clip));
+        } else {
+            LoadReferences();
+        }
     }
 
     const char *Type() const override { return "sonic"; }
 
+    rl_policy::PolicyExecutor &SelectExecutor(const std::array<double, 3> &command,
+        rl_policy::PolicyExecutor &primary) override {
+        latest_command_.vx = command[0];
+        latest_command_.vy = command[1];
+        latest_command_.wz = command[2];
+        return primary;
+    }
+
+    void RequestInferenceTermination() override {
+        if (planner_) planner_->RequestStop();
+    }
+
     bool ReadyForPolicySwitch() const override {
+        if (planner_) return planner_->Idle();
         return interactive_ ? !transition_active_ &&
             (!playback_active_ || status_.phase == robot_base::InteractionStatus::Phase::FINISHED)
             : handoff_.Ready();
     }
     bool PlaybackFinished() const override {
+        if (planner_) return false;
         return interactive_ ? status_.phase == robot_base::InteractionStatus::Phase::FINISHED &&
             playback_active_ : handoff_.Finished();
     }
     void PreparePolicySwitch(bool requested, double elapsed_s) override {
+        if (planner_) {
+            planner_switch_requested_ = requested;
+            return;
+        }
         if (interactive_) {
             if (requested && !canceling_ && (playback_active_ || transition_active_))
                 BeginTransition(default_clip_index_, elapsed_s, false, true);
@@ -877,6 +905,15 @@ public:
         playback_active_ = !interactive_;
         status_ = {};
         last_robot_quat_ = RobotQuaternion(robot);
+        if (planner_) {
+            latest_command_ = {};
+            planner_switch_requested_ = false;
+            playback_active_ = true;
+            heading_offset_ = Eigen::Quaternionf::Identity();
+            planner_->Reset(robot);
+            UpdatePlannerMotion(0.0, robot);
+            return;
+        }
         UpdateHeadingOffset();
     }
 
@@ -888,8 +925,9 @@ public:
                 "[policy_adapter] SONIC elapsed_s 非法");
         }
         last_robot_quat_ = RobotQuaternion(robot);
+        if (planner_) UpdatePlannerMotion(elapsed_s, robot);
         UpdateInteractionStatus(elapsed_s);
-        if (!interactive_) handoff_.Sample(PlaybackElapsed(elapsed_s),
+        if (!interactive_ && !planner_) handoff_.Sample(PlaybackElapsed(elapsed_s),
             static_cast<int>(ActiveClip().frames.size()), config_);
 
         const PlaybackSample sample = ActiveSample(elapsed_s);
@@ -995,6 +1033,21 @@ private:
     static constexpr int kVrOrientationDim = 12;
     static constexpr int kSmplJointCount = 24;
     static constexpr int kWristPositionDim = 6;
+
+    void UpdatePlannerMotion(double elapsed_s, const robot_base::RobotData &robot) {
+        planner_->Update(robot, planner_switch_requested_
+            ? robot_base::Command{} : latest_command_, elapsed_s);
+        const auto motion = planner_->Motion();
+        auto &frames = clips_.front().frames;
+        frames.resize(motion.frames.size());
+        for (std::size_t i = 0; i < frames.size(); ++i) {
+            frames[i].dof_pos = motion.frames[i].dof_pos;
+            frames[i].dof_vel = motion.frames[i].dof_vel;
+            const auto &q = motion.frames[i].root_quat;
+            frames[i].root_quat = Eigen::Quaternionf(q[0], q[1], q[2], q[3]).normalized();
+        }
+        playback_start_elapsed_ = motion.start_time_s;
+    }
 
     void ValidateConfig() const {
         if (model_dof_count_ <= 0) {
@@ -1197,7 +1250,7 @@ private:
 
     PlaybackSample ActiveSample(double elapsed_s) const {
         const auto &clip = ActiveClip();
-        if (!interactive_ && handoff_.Ready()) {
+        if (!interactive_ && !planner_ && handoff_.Ready()) {
             return SamplePlayback(static_cast<double>(clip.frames.size()) /
                 (clip.config.motion_fps * clip.config.playback_speed),
                 static_cast<int>(clip.frames.size()), clip.config.motion_fps,
@@ -1421,6 +1474,9 @@ private:
     uint64_t last_request_sequence_ = 0;
     robot_base::InteractionStatus status_;
     SonicFrame transition_source_;
+    std::unique_ptr<SonicPlanner> planner_;
+    robot_base::Command latest_command_;
+    bool planner_switch_requested_ = false;
     Eigen::Quaternionf last_robot_quat_ = Eigen::Quaternionf::Identity();
     Eigen::Quaternionf heading_offset_ = Eigen::Quaternionf::Identity();
 };
@@ -1536,6 +1592,62 @@ Config LoadConfig(const std::string &yaml_path,
             yaml.Read<bool>(adapter_base + ".loop").value_or(false);
         config.loop_pause = yaml.Read<double>(
             adapter_base + ".loop_pause").value_or(0.0);
+        const std::string planner_base = adapter_base + ".planner";
+        const auto planner_model =
+            yaml.Read<std::string>(planner_base + ".model_path");
+        config.sonic_planner.enabled = yaml.Read<bool>(
+            planner_base + ".enabled").value_or(
+                planner_model && !planner_model->empty());
+        if (config.sonic_planner.enabled) {
+            if (config.type != "sonic") {
+                throw std::runtime_error(
+                    "[policy_adapter] planner 仅适用于 SONIC adapter");
+            }
+            if (!planner_model || planner_model->empty()) {
+                throw std::runtime_error(
+                    "[policy_adapter] SONIC planner 缺少 model_path");
+            }
+            config.sonic_planner.model_path =
+                ResolvePath(robot_dir, *planner_model).string();
+            config.sonic_planner.runtime.provider = yaml.Read<std::string>(
+                planner_base + ".runtime.provider").value_or("cpu");
+            config.sonic_planner.runtime.threads = yaml.Read<int>(
+                planner_base + ".runtime.threads").value_or(2);
+            config.sonic_planner.runtime.affinity = yaml.Read<std::string>(
+                planner_base + ".runtime.affinity").value_or("");
+            config.sonic_planner.runtime.ort_spinning = yaml.Read<bool>(
+                planner_base + ".runtime.ort_spinning").value_or(false);
+            config.sonic_planner.runtime.ep_dump_subgraphs = yaml.Read<bool>(
+                planner_base + ".runtime.ep_dump_subgraphs").value_or(false);
+            config.sonic_planner.runtime.ep_profile_prefix =
+                yaml.Read<std::string>(
+                    planner_base + ".runtime.ep_profile_prefix").value_or("");
+            config.sonic_planner.output_fps = yaml.Read<double>(
+                planner_base + ".output_fps").value_or(config.motion_fps);
+            config.sonic_planner.replan_interval = yaml.Read<double>(
+                planner_base + ".replan_interval").value_or(1.0);
+            config.sonic_planner.lookahead = yaml.Read<double>(
+                planner_base + ".lookahead").value_or(0.04);
+            config.sonic_planner.default_height = yaml.Read<double>(
+                planner_base + ".default_height").value_or(0.788740);
+            config.sonic_planner.facing_horizon = yaml.Read<double>(
+                planner_base + ".facing_horizon").value_or(1.0);
+            config.sonic_planner.command_epsilon = yaml.Read<double>(
+                planner_base + ".command_epsilon").value_or(1.0e-3);
+            config.sonic_planner.slow_walk_max_speed = yaml.Read<double>(
+                planner_base + ".slow_walk_max_speed").value_or(0.8);
+            config.sonic_planner.walk_max_speed = yaml.Read<double>(
+                planner_base + ".walk_max_speed").value_or(2.5);
+            config.sonic_planner.mode = yaml.Read<int>(
+                planner_base + ".mode").value_or(-1);
+            config.sonic_planner.random_seed = yaml.Read<int>(
+                planner_base + ".random_seed").value_or(1234);
+            config.sonic_planner.allowed_pred_num_tokens =
+                yaml.Read<std::vector<int>>(
+                    planner_base + ".allowed_pred_num_tokens")
+                    .value_or(std::vector<int>{
+                        0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0});
+        }
         const auto catalog = yaml.Read<std::string>(
             adapter_base + ".catalog");
         if (config.type == "sonic" && catalog && !catalog->empty()) {
@@ -1599,7 +1711,7 @@ Config LoadConfig(const std::string &yaml_path,
                     "[policy_adapter] SONIC default_action 不在动作目录中: " +
                     motion_catalog.default_action);
             }
-        } else {
+        } else if (!config.sonic_planner.Enabled()) {
             config.reference_file =
                 ReadReferenceField(yaml, adapter_base, robot_dir);
         }

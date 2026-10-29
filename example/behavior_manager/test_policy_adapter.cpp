@@ -845,6 +845,45 @@ void TestSonicReferenceAndConfig() {
         "未正确加载 SONIC 多动作目录");
 }
 
+void TestSonicPlannerConfig() {
+    const TempReference yaml("sonic_planner_yaml",
+        "rl_policy:\n"
+        "  onnx_infer:\n"
+        "    policies:\n"
+        "      planner:\n"
+        "        policy_adapter:\n"
+        "          type: sonic\n"
+        "          future_frames: 10\n"
+        "          future_step: 5\n"
+        "          planner:\n"
+        "            enabled: true\n"
+        "            model_path: planner.onnx\n"
+        "            lookahead: 0.8\n"
+        "            replan_interval: 0.5\n"
+        "            runtime: {provider: cpu, threads: 4, ort_spinning: false}\n");
+    auto config = LoadConfig(yaml.Path().string(), "planner",
+        fs::temp_directory_path().string());
+    Require(config.reference_file.empty() && config.sonic_planner.Enabled(),
+        "planner should not require a recorded reference");
+    Require(config.sonic_planner.runtime.threads == 4 &&
+        !config.sonic_planner.runtime.ort_spinning &&
+        config.sonic_planner.lookahead == 0.8 &&
+        config.sonic_planner.replan_interval == 0.5,
+        "planner runtime and timing must come from YAML");
+    auto policy = MakeSonicPolicyConfig(29);
+    auto adapter = Create(config, policy);
+    Require(adapter && !adapter->ReadyForPolicySwitch(),
+        "planner handoff must wait for a published idle trajectory");
+    policy.action_joint_index[1] = policy.action_joint_index[0];
+    bool rejected = false;
+    try {
+        static_cast<void>(Create(config, policy));
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    Require(rejected, "planner must reject a non-permutation joint mapping");
+}
+
 void TestSonicPrepareInputs() {
     constexpr int kG1JointCount = 29;
     const TempSonicReference reference(kG1JointCount);
@@ -1384,6 +1423,7 @@ int main(int argc, char **argv) {
         TestMjlabReferenceActionYaml();
         TestManualReferencePlayback();
         TestSonicReferenceAndConfig();
+        TestSonicPlannerConfig();
         TestSonicPrepareInputs();
         TestSonicMotionCatalogPlayback();
         TestJointTrajectoryTakeover();

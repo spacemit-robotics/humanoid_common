@@ -85,11 +85,32 @@ struct ReferenceMotionCatalogConfig {
 };
 
 /**
- * @brief 单个策略的适配器配置
+ * @brief Asynchronous kinematic planner settings for a SONIC tracker
  *
  * 该结构仅在 behavior_manager 内部使用。机型仓库通过 YAML 提供参数，
  * robot_base 和 model_zoo/rl 不感知具体 tracker 协议。
  */
+struct SonicPlannerConfig {
+    bool enabled = false;
+    std::string model_path;
+    rl_policy::InferenceRuntimeConfig runtime;
+    double output_fps = 50.0;
+    double replan_interval = 1.0;
+    double lookahead = 0.04;
+    double default_height = 0.788740;
+    double facing_horizon = 1.0;
+    double command_epsilon = 1.0e-3;
+    double slow_walk_max_speed = 0.8;
+    double walk_max_speed = 2.5;
+    int mode = -1;
+    int random_seed = 1234;
+    std::vector<int> allowed_pred_num_tokens = {
+        0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0};
+
+    bool Enabled() const { return enabled && !model_path.empty(); }
+};
+
+/** @brief 单个策略的适配器配置，由机型 YAML 提供参数。 */
 struct Config {
     std::string type;
     std::string reference_file;
@@ -111,6 +132,7 @@ struct Config {
     ReferenceActionConfig reference_action;
     JointTrajectoryConfig joint_trajectory;
     ReferenceMotionCatalogConfig reference_motion_catalog;
+    SonicPlannerConfig sonic_planner;
 
     struct HistoryActorConfig {
         struct Motion {

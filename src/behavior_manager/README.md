@@ -114,6 +114,10 @@ cd ~/spacemit_robot
 **关键参数：**
 - `rl_policy.onnx_infer.policies.<name>.kp/kd`：各策略的 PD 增益
 - `rl_policy.onnx_infer.policies.<name>.entry_target_transition_duration`（可选）：进入 RL 后的目标位置过渡时间，默认 `0`
+- `rl_policy.onnx_infer.policies.<name>.switch_group`（可选）：允许 RL 内交接的兼容组；来源与目标须属于同一非空组
+- `rl_policy.onnx_infer.policies.<name>.policy_switch.transition_duration`（可选）：RL 内交接时，目标位置与 KP/KD 同步过渡的时长，默认 `0`；不改变普通 ZERO→RL 的配置
+- `rl_policy.onnx_infer.policies.<name>.return_policy`（可选）：有限动作完成后的返回策略，须在同一兼容组中；省略时保持当前策略
+- `behavior_manager.policy_switch.timeout_s`（可选）：后台准备与交接等待上限，默认 30 秒；超时取消本次请求，当前策略继续运行
 - `rl_policy.onnx_infer.policies.<name>.target_position_lower / target_position_upper`（可选）：按机器人关节顺序给出目标位置上下限（rad），须同时配置且长度与 `rl_default_pos` 一致；同时省略时禁用
 - `rl_policy.onnx_infer.policies.<name>.target_limit_margin`（可选）：目标位置限位的内缩余量（rad），默认 `0`；`[lower + margin, upper - margin]` 必须为有效区间
 - `rl_policy.onnx_infer.policies.<name>.prerequisite.policy / .duration`（可选）：进入目标策略前运行的策略及持续时间
@@ -121,10 +125,12 @@ cd ~/spacemit_robot
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.start_mode`（MJLab 可选）：`auto`（默认）或 `manual`；手动模式进入 RL 后保持参考首帧，按 `G` 开始
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.reference_action`（MJLab 可选）：指定采用参考动作与残差合成的关节
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.catalog`（SONIC 可选）：为同一全身策略注册多个参考动作；HMI 选择动作后仅切换 `reference_obs`，不覆盖模型 action
+- `rl_policy.onnx_infer.policies.<name>.policy_adapter.planner`（SONIC 可选）：独立线程运行 kinematic planner，将速度命令转换为 tracker 参考；与 `catalog` 互斥，启用后不要求静态 `reference_file`。`model_path`、`runtime`、规划周期 `replan_interval`、提前量 `lookahead` 和输出帧率 `output_fps` 均由 YAML 配置。规划周期包含推理耗时，不在推理结束后再次等待完整周期。
 - `rl_policy.onnx_infer.policies.<name>.command.limits`（可选）：应用层声明该策略接受的 `min_vx/max_vx/min_vy/max_vy/min_wz/max_wz`；未配置 `min_*` 时默认为对应的 `-max_*`，整个 limits 未配置时 HMI 和 Control 均拒绝速度命令
 - `behavior_manager.damp_kd`：阻尼状态 kd（≈ policy kd / 5）
 - `behavior_manager.home.gain_ramp_duration / move_duration`：HOME 建立增益和移动时长，`move_duration` 默认 3 秒
 - `behavior_manager.home.kp/kd`（可选）：HOME 增益；未配置时使用 `robot_base.kp/kd`
+- `behavior_manager.home.target_position_lower / target_position_upper`（可选）：HOME 目标位置范围，按关节顺序、单位 rad，须成对配置。初始反馈越界时，增益渐入阶段从最近的有效目标开始，再平滑移向默认姿态；反馈不修改。默认姿态本身越界则拒绝配置。未配置时保持原行为。
 - `behavior_manager.zero_pos`：未配置 RL 策略时的 ZERO 目标位置；配置策略后使用 `rl_policy.onnx_infer.policies.<name>.zero_target_pos` 或 `rl_default_pos`
 - `behavior_manager.zero.move_duration / kp / kd`：ZERO 移动时长和独立安全增益，`move_duration` 默认 3 秒；kp/kd 必须同时配置
 - `behavior_manager.zero.position_tolerance / velocity_tolerance / settle_duration`：ZERO 到位条件，默认分别为 0.15 rad、0.10 rad/s、0.20 秒
@@ -135,6 +141,40 @@ cd ~/spacemit_robot
 - `discard_late_inference: true` 丢弃超过推理期限的输出并等待最新观测，不立即锁故障；首帧及 action 年龄仍限制恢复总时长，默认关闭。
 
 **路径解析：** `robot_base.robot_dir` 相对于 YAML 文件；`model_path` 相对于 `robot_dir`。
+
+### 模式内动作目录
+
+若一个模式需要待命策略和多套独立动作模型，可在策略入口配置 `policy_actions`。
+`policy_names` 只列用户可选入口，动作模型仍放在 `policies` 中，但不列为入口：
+
+```yaml
+rl_policy:
+  onnx_infer:
+    policy_names: [locomotion, motions]
+    default_policy: locomotion
+    policies:
+      motions:
+        display_name: 动作运控
+        switch_group: full_body
+        policy_actions:
+          idle_policy: locomotion
+          action_names: [wave, bow]
+          actions:
+            wave: {display_name: 挥手, policy: wave_model}
+            bow: {display_name: 鞠躬, policy: bow_model}
+      # locomotion、wave_model、bow_model 各自配置模型、观测、增益等。
+      # 三者使用同一 switch_group，动作模型不再配置 prerequisite/return_policy。
+```
+
+选择 `motions` 后使用待命模型，只有 START 动作请求才加载对应动作策略。
+完成后自动回到本模式待命；CANCEL 准备待命策略并从当前有效输出交接，
+不等待长参考动作的末帧。交接使用待命策略的 `policy_switch.transition_duration`。
+掉电、DAMP 或故障退出 RL 时取消动作，下次进入 RL 从待命开始，不自动续播。
+模型加载失败继续当前控制，动作回报 REJECTED；同一请求序号不会重复执行。
+
+`CurrentPolicyName()` 返回实际执行策略，`CurrentPolicySelectionName()` 返回用户选择的入口。
+HMI 用入口名保持模式选择，并通过 interaction 显示动作；模型参数和推理日志仍对应实际执行策略。
+已有单模型动作目录和未配置 `policy_actions` 的策略保持原行为。
 
 ### 状态机流程
 
@@ -154,17 +194,67 @@ HMI 的 `x` 才能清除锁存。重复收到同一条已确认的恢复状态�
 ### 关键设计
 
 - **策略准备与异步推理：** 默认策略在 BehaviorManager 初始化时创建 ONNX runtime；退出 RL 后或在 POWER_OFF/DAMP 选择策略时，后台准备全新的策略状态，准备完成前不进入 HOME。进入 RL 后只重置时序状态并启动独立推理线程，不在控制循环内加载模型
-- **策略入场过渡：** 可按策略配置目标位置过渡；RL 增益立即生效，推理与 recurrent state 正常更新，仅在新推理结果到达时平滑目标位置
+- **策略入场过渡：** 普通进入 RL 使用 `entry_target_transition_duration`，增益立即生效；RL 内交接使用 `policy_switch.transition_duration`，位置及增益同步过渡。推理和历史状态正常更新，不暂停动作时间；定时动作应按模型要求选择过渡时长
 - **目标位置限位：** `StateRL` 在关节映射和入场插值后按可选的逐关节上下限裁剪最终目标，配置错误会阻止策略加载。此限位不修改模型的 `last_action` 或动作平滑历史；`clip_actions` 另用于模型输出裁剪
 - **通用模型 I/O：** `PolicyExecutorConfig` 整体透传给 RL 组件；多输入输出、feedback、external 等拓扑由策略 YAML `model_io` 声明，common 无需复制底层字段
 - **策略协议适配：** `policy_adapter` 是 behavior_manager 的私有子模块；机器人自由度、关节映射和自定义观测维度由机型 YAML 透传，common 不固定具体机型维度
 - **交互动作接管：** `joint_trajectory` adapter 在 RL 状态内部合并选择性关节轨迹，最终 applied action 回写策略观测；不会创建与 RL 并列的 FSM 状态
 - **SONIC 多动作：** 多个参考目录在进入 RL 前统一校验并加载；进入 RL 后保持默认参考首帧，HMI 选择动作时平滑切换参考输入，全身 action 始终由同一个 SONIC 模型输出
-- **动态策略切换：** 仅在 `POWER_OFF` / `DAMP` 状态接受 `Command.switch_policy`；进入 `ZERO` 后策略锁定（ZERO 目标位置取自当前策略，增益使用独立安全配置）
-- **前置策略链调度：** 目标策略可在 yaml 配置 `prerequisite: { policy, duration }`，behavior_manager 收到切换请求后自动先切前置策略，在 RL 状态运行 `duration` 秒后再切目标策略；用户感知层面只发一次切换命令。典型场景：`dance` / `kungfu` 配 `prerequisite: stand`，先用 LocoMode 站稳并预热 LSTM，再进 dance/kungfu，避免直接从 PD 锁位的 ZERO 切动态动作时摔倒
+- **动态策略切换：** POWER_OFF / DAMP 允许选择策略；HOME / ZERO 锁定当前策略。RL 内同组切换时先清零速度、后台准备目标，旧策略持续控制；准备成功后由当前适配器完成退出并交接。加载失败保留旧策略，状态切换或故障取消待处理交接
+- **前置策略链调度：** 目标可配置 `prerequisite: { policy, duration }`。前置策略实际生效、进入 RL 后才计时，模型加载和旧策略运行时间不计入。前置和目标须同组，不支持嵌套前置链；用户只发一次选择请求
 - **安全保护：** driver 故障、状态超时、无效数据、姿态超限和 RL 推理/action 超时统一触发安全状态并跨进程锁存
 - **状态回传：** `CurrentState()`、`IsZeroReady()`、当前策略和 RL 频率由 control_runtime 组装为 `ControlStatus` 发给 HMI
+- **交互取消：** `history_actor` 在待命时确认取消并保持 IDLE；重复取消不重置动作退出进度，尚未执行的动作也可取消。
+- **交互状态校验：** 交互元数据无效时保留同一策略最近一次有效交互信息，继续发送当前 FSM、故障和控制状态；切换策略时清除缓存。其他状态字段仍按原规则校验。
 - **参数隔离：** damp_kd ≈ policy kd / 5（不同阶段刚度需求不同）
+
+### 机型接入动态策略
+
+已有模型输入协议无需改写。机型保留自己的 `model_io`、观测、关节映射、增益、
+`policy_adapter`，只在兼容策略上声明组名、过渡时间和可选前置/返回策略。
+组名由机型定义，common 不注册固定模式数，也不识别机型或策略名称。
+
+在各策略既有配置中增加以下字段即可；示例策略名由机型自行替换：
+
+```yaml
+stand:
+  switch_group: whole_body
+  policy_switch: {transition_duration: 0.5}
+walk:
+  switch_group: whole_body
+  policy_switch: {transition_duration: 0.5}
+motion:
+  switch_group: whole_body
+  policy_switch: {transition_duration: 0.0}
+  prerequisite: {policy: stand, duration: 2.0}
+  return_policy: stand
+```
+
+示例省略模型和观测字段；具体时长须匹配各策略的入场要求。
+
+| 当前策略类型 | 收到切换请求后的交接点 |
+| --- | --- |
+| 普通速度策略，无适配器 | 收到零速度后的有效推理帧 |
+| 内置 `ref_motion_phase` 的有限动作 | `motion_length` 结束 |
+| `joint_trajectory` | 当前轨迹收回完成 |
+| `mjlab` / `protomotions` 参考动作 | 待播放首帧，或当前动作末帧；循环动作等到本轮末帧 |
+| 带动作目录的 `sonic` | 当前动作收回到待命参考 |
+| 带 `planner` 的 `sonic` | 速度归零后生成的停步参考播放完成 |
+| `stance_motion` / `history_actor` | 退出交互、返回站立或待命分支 |
+
+有限动作可通过 `return_policy` 自动返回另一策略；返回模型准备失败时保留当前控制，
+不无限重试加载。手动启动的参考动作在尚未播放时不会触发自动返回。
+需要等待较长动作结束时，同时设置 `behavior_manager.policy_switch.timeout_s` 和
+`hmi.request_timeout`，后者应更长。超时会报告失败，不强制从动作中途切走。
+
+组名只表示机型允许尝试交接，不转换不同策略的训练观测协议。对于全新输入协议，
+仍需实现对应适配器；对于已有协议，不需要在 common 增加机型分支。
+
+MJLab 参考使用世界坐标时，可设置 `policy_adapter.anchor_xy_align: true`：
+每次进入策略，把参考首帧的水平位置对齐到机器人当前位置，随后保持该参考原点。
+它与 `anchor_yaw_align` 分别控制平移、朝向对齐，不改变参考高度；默认关闭，
+继续支持固定场地原点的任务。
+
 ## Fixed-Base Trajectory Behavior
 
 `behavior_manager.trajectory.enabled: true` registers `TRAJECTORY` after ZERO.

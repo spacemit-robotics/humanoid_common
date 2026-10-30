@@ -244,6 +244,18 @@ public:
         status_.sequence = request.sequence;
         status_.request_accepted = true;
         if (request.operation == Op::CANCEL) {
+            if (current_motion_ == 0) {
+                // Repeated cancellation must not restart a return already in
+                // progress. Cancelling standby (or a not-yet-selected start)
+                // is an acknowledged no-op, never an unnamed BLEND_OUT.
+                if (status_.phase == Phase::BLEND_OUT) return;
+                pending_motion_ = 0;
+                switch_pending_ = false;
+                status_ = {};
+                status_.sequence = request.sequence;
+                status_.request_accepted = true;
+                return;
+            }
             pending_motion_ = 0;
             switch_pending_ = true;
             return;
@@ -264,6 +276,13 @@ public:
     bool ReadyForPolicySwitch() const override {
         return settings_.command_type == "gait" ? stationary_ : current_motion_ == 0 &&
             !switch_pending_ && status_.phase != Phase::BLEND_OUT;
+    }
+    void PreparePolicySwitch(bool requested, double elapsed_s) override {
+        (void)elapsed_s;
+        if (requested && settings_.command_type != "gait" && current_motion_ != 0) {
+            pending_motion_ = 0;
+            switch_pending_ = true;
+        }
     }
     std::string ActiveModelName() const override {
         return settings_.command_type == "gait" ? (stationary_ ? "stand" : "gait")

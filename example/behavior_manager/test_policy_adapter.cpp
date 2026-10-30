@@ -7,6 +7,8 @@
  */
 
 #include "policy_adapter/policy_adapter.h"
+#include "rl_test_model.h"
+#include "transport_packet.h"
 
 #include <algorithm>
 #include <array>
@@ -391,6 +393,32 @@ void TestHistoryActorCommands() {
     robot = robot_base::RobotData::Create(10);
     robot.base_quat = {1, 0, 0, 0};
     adapter->Reset(robot);
+    const auto require_status = [&]() {
+        robot_base::ControlStatus status;
+        status.mode = robot_base::ControlMode::RL;
+        status.active_policy = "dance";
+        status.interaction = adapter->GetInteractionStatus();
+        Require(transport::CanEncodeStatus(status, {}), "Dance metadata must never block the status heartbeat");
+    };
+    // Exhibition failure: RT alone cancelled standby before any dance started.
+    for (uint64_t sequence = 1; sequence < 4; ++sequence) {
+        adapter->HandleInteractionRequest({sequence, robot_base::InteractionRequest::Operation::CANCEL, ""}, 0);
+        for (int frame = 0; frame < 40; ++frame) {
+            auto &selected = adapter->SelectExecutor({}, policy);
+            adapter->PrepareInputs(robot, frame * s.dt, selected);
+            require_status();
+            Require(adapter->GetInteractionStatus().phase == robot_base::InteractionStatus::Phase::IDLE &&
+                adapter->GetInteractionStatus().request_accepted && adapter->ReadyForPolicySwitch(),
+                "Idle cancellation must stay ready and acknowledge the request");
+        }
+    }
+    // A start cancelled before decoder selection must not leave a phantom dance.
+    adapter->HandleInteractionRequest({4, robot_base::InteractionRequest::Operation::START, "root"}, 0);
+    adapter->HandleInteractionRequest({5, robot_base::InteractionRequest::Operation::CANCEL, ""}, 0);
+    adapter->SelectExecutor({}, policy);
+    require_status();
+    Require(adapter->ReadyForPolicySwitch(), "Pending start cancellation must stay in standby");
+    adapter->Reset(robot);
     robot_base::InteractionRequest request;
     request.sequence = 1;
     request.action = "root";
@@ -421,6 +449,14 @@ void TestHistoryActorCommands() {
     action.assign(10, 2.0);
     adapter->OnAction(action);
     Require(action == last_output, "Cancellation during blending must preserve output continuity");
+    // Repeated lease-clear cancellations must not perpetually restart BLEND_OUT.
+    for (uint64_t sequence = 3; sequence < 43; ++sequence) {
+        adapter->HandleInteractionRequest({sequence, robot_base::InteractionRequest::Operation::CANCEL, ""}, 0);
+        auto &selected = adapter->SelectExecutor({}, policy);
+        adapter->PrepareInputs(robot, sequence * s.dt, selected);
+        require_status();
+    }
+    Require(adapter->ReadyForPolicySwitch(), "Repeated cancellation must finish returning to standby");
 
     s.motions.back().mask_root_position = true;
     adapter = Create(config, policy_config);
@@ -559,6 +595,61 @@ void TestMjlabReferenceResidualAction() {
         "未配置 reference_action 时不应改写 action");
 }
 
+void TestMjlabOriginAlignment() {
+    const TempNpzReference reference;
+    const auto &bytes = behavior_manager::testing::kIdentityModel;
+    const TempReference model("position_probe", std::string(
+        reinterpret_cast<const char *>(bytes), sizeof(bytes)));
+    rl_policy::PolicyExecutorConfig policy_config;
+    policy_config.model_path = model.Path().string();
+    policy_config.rl_default_pos = {0, 0, 0};
+    policy_config.action_scale = {1};
+    rl_policy::ModelInputBindingConfig input;
+    input.name = "obs";
+    input.source = rl_policy::ModelInputSource::OBSERVATION;
+    policy_config.model_io.inputs.push_back(input);
+    rl_policy::ModelOutputBindingConfig output;
+    output.name = "action";
+    output.target = rl_policy::ModelOutputTarget::ACTION;
+    policy_config.model_io.outputs.push_back(output);
+    policy_config.custom_array_dims = {{"motion_anchor_pos_b", 3}};
+    policy_config.obs_segments.emplace_back();
+    policy_config.obs_segments.back().terms = {"motion_anchor_pos_b"};
+    rl_policy::PolicyExecutor policy;
+    policy.Init(policy_config);
+    Config config;
+    config.type = "mjlab";
+    config.reference_file = reference.Path().string();
+    config.anchor_body_index = 0;
+    config.anchor_xy_align = true;
+    auto adapter = Create(config, MakeTwoDofPolicyConfig());
+    auto robot = MakeTwoDofRobot();
+    robot.base_pos = {2.0, -3.0, 0.8};
+    robot.base_quat = {std::cos(0.3), 0, 0, std::sin(0.3)};
+    adapter->Reset(robot);
+    Eigen::VectorXf observation;
+    auto sample = [&]() {
+        adapter->PrepareInputs(robot, 0, policy);
+        policy.AssembleObs({}, {}, 0, 0, 0, {0, 0, 0}, {0, 0, 0},
+            robot.base_quat, {}, 0.02, observation);
+    };
+    sample();
+    Require(std::abs(observation[0]) < 1e-6 && std::abs(observation[1]) < 1e-6 &&
+        std::abs(observation[2] + 0.8) < 1e-6,
+        "entry alignment must remove XY translation while preserving reference height");
+    robot.base_pos[0] += std::cos(0.6) * 0.1;
+    robot.base_pos[1] += std::sin(0.6) * 0.1;
+    sample();
+    Require(std::abs(observation[0] + 0.1) < 1e-6 && std::abs(observation[1]) < 1e-6,
+        "reference origin must remain fixed after entry, with errors in the current body frame");
+    config.anchor_xy_align = false;
+    adapter = Create(config, MakeTwoDofPolicyConfig());
+    adapter->Reset(robot);
+    sample();
+    Require(observation.head<2>().norm() > 3,
+        "disabled alignment must preserve the absolute-reference behavior");
+}
+
 void TestMjlabReferenceActionYaml() {
     const TempReference yaml("mjlab_reference_action_yaml",
         "rl_policy:\n"
@@ -568,6 +659,7 @@ void TestMjlabReferenceActionYaml() {
         "        policy_adapter:\n"
         "          type: mjlab\n"
         "          reference_file: motion.npz\n"
+        "          anchor_xy_align: true\n"
         "          reference_action:\n"
         "            joint_indices: [0, 1]\n"
         "            residual_scale: 0.0\n"
@@ -575,6 +667,7 @@ void TestMjlabReferenceActionYaml() {
     const auto config = LoadConfig(
         yaml.Path().string(), "reference_action_policy",
         fs::temp_directory_path().string());
+    Require(config.anchor_xy_align, "MJLab anchor_xy_align was not loaded");
     Require(config.reference_action.joint_indices ==
             std::vector<int>({0, 1}),
         "未加载 reference_action.joint_indices");
@@ -609,11 +702,16 @@ void TestManualReferencePlayback() {
     adapter->Reset(robot);
     check_position(0.0, 0.1);
     check_position(100.0, 0.1);
+    Require(adapter->ReadyForPolicySwitch() && !adapter->PlaybackFinished(),
+        "manual standby must permit handoff without reporting motion completion");
     Require(!adapter->StartPlayback(-1.0), "接受了负开始时间");
     Require(adapter->StartPlayback(100.0), "首次开始失败");
     Require(!adapter->StartPlayback(101.0), "重复开始重置了参考时钟");
     check_position(100.01, 0.15);
+    Require(!adapter->ReadyForPolicySwitch(), "active reference handed off before completion");
     check_position(101.0, 0.2);
+    Require(adapter->ReadyForPolicySwitch() && adapter->PlaybackFinished(),
+        "finished manual reference did not permit handoff");
     adapter->Reset(robot);
     check_position(200.0, 0.1);
 
@@ -622,6 +720,20 @@ void TestManualReferencePlayback() {
     adapter->Reset(robot);
     Require(!adapter->StartPlayback(10.0), "自动策略接受了手动开始");
     check_position(0.01, 0.15);
+
+    config.loop = true;
+    adapter = Create(config, policy_config);
+    adapter->Reset(robot);
+    adapter->PreparePolicySwitch(true, 0.01);
+    check_position(0.01, 0.15);
+    Require(!adapter->ReadyForPolicySwitch(), "loop handoff interrupted the current cycle");
+    adapter->PreparePolicySwitch(true, 0.05);
+    check_position(0.05, 0.2);
+    Require(adapter->ReadyForPolicySwitch() && !adapter->PlaybackFinished(),
+        "loop did not hold its end frame for the requested handoff");
+    adapter->PreparePolicySwitch(false, 0.05);
+    check_position(0.05, 0.2);
+    Require(adapter->ReadyForPolicySwitch(), "cancelled handoff jumped away from the held end frame");
 
     for (const std::string mode : {"auto", "manual", "invalid"}) {
         const TempReference yaml("manual_start_config",
@@ -731,6 +843,45 @@ void TestSonicReferenceAndConfig() {
                 .playback_speed - 0.5) < 1.0e-12 &&
             catalog.reference_file == reference.Path().string(),
         "未正确加载 SONIC 多动作目录");
+}
+
+void TestSonicPlannerConfig() {
+    const TempReference yaml("sonic_planner_yaml",
+        "rl_policy:\n"
+        "  onnx_infer:\n"
+        "    policies:\n"
+        "      planner:\n"
+        "        policy_adapter:\n"
+        "          type: sonic\n"
+        "          future_frames: 10\n"
+        "          future_step: 5\n"
+        "          planner:\n"
+        "            enabled: true\n"
+        "            model_path: planner.onnx\n"
+        "            lookahead: 0.8\n"
+        "            replan_interval: 0.5\n"
+        "            runtime: {provider: cpu, threads: 4, ort_spinning: false}\n");
+    auto config = LoadConfig(yaml.Path().string(), "planner",
+        fs::temp_directory_path().string());
+    Require(config.reference_file.empty() && config.sonic_planner.Enabled(),
+        "planner should not require a recorded reference");
+    Require(config.sonic_planner.runtime.threads == 4 &&
+        !config.sonic_planner.runtime.ort_spinning &&
+        config.sonic_planner.lookahead == 0.8 &&
+        config.sonic_planner.replan_interval == 0.5,
+        "planner runtime and timing must come from YAML");
+    auto policy = MakeSonicPolicyConfig(29);
+    auto adapter = Create(config, policy);
+    Require(adapter && !adapter->ReadyForPolicySwitch(),
+        "planner handoff must wait for a published idle trajectory");
+    policy.action_joint_index[1] = policy.action_joint_index[0];
+    bool rejected = false;
+    try {
+        static_cast<void>(Create(config, policy));
+    } catch (const std::runtime_error &) {
+        rejected = true;
+    }
+    Require(rejected, "planner must reject a non-permutation joint mapping");
 }
 
 void TestSonicPrepareInputs() {
@@ -873,6 +1024,15 @@ void TestSonicMotionCatalogPlayback() {
             adapter->GetInteractionStatus().phase ==
                 robot_base::InteractionStatus::Phase::FINISHED,
         "SONIC 取消动作后未回到默认参考");
+    request.sequence = 5;
+    request.operation = robot_base::InteractionRequest::Operation::START;
+    request.action = "gesture";
+    adapter->HandleInteractionRequest(request, 2.0);
+    adapter->PrepareInputs(robot, 2.01, policy);
+    Require(!adapter->ReadyForPolicySwitch(), "SONIC switched during reference transition");
+    adapter->PreparePolicySwitch(true, 2.01);
+    adapter->PrepareInputs(robot, 2.22, policy);
+    Require(adapter->ReadyForPolicySwitch(), "SONIC handoff did not return to its idle reference");
 }
 
 void TestJointTrajectoryTakeover(bool column_major = false) {
@@ -1066,6 +1226,17 @@ void TestJointTrajectoryBlendAndCancel() {
             adapter->GetInteractionStatus().phase ==
                 robot_base::InteractionStatus::Phase::FINISHED,
         "joint_trajectory blend-out 未平滑交还策略控制权");
+    request.sequence = 3;
+    request.operation = robot_base::InteractionRequest::Operation::START;
+    request.action = "wave";
+    adapter->HandleInteractionRequest(request, 2.0);
+    adapter->PrepareInputs(robot, 2.01, policy);
+    Require(!adapter->ReadyForPolicySwitch(), "trajectory handed off with an active clip");
+    adapter->PreparePolicySwitch(true, 2.01);
+    adapter->PrepareInputs(robot, 2.22, policy);
+    action = policy_action;
+    adapter->OnAction(action);
+    Require(adapter->ReadyForPolicySwitch(), "trajectory handoff did not finish blend-out");
 }
 
 void TestConfiguredPolicy(const std::string &yaml_path,
@@ -1248,9 +1419,11 @@ int main(int argc, char **argv) {
         TestProtomotionsDynamicDimensions();
         TestMjlabZip64AndUnicodeMetadata();
         TestMjlabReferenceResidualAction();
+        TestMjlabOriginAlignment();
         TestMjlabReferenceActionYaml();
         TestManualReferencePlayback();
         TestSonicReferenceAndConfig();
+        TestSonicPlannerConfig();
         TestSonicPrepareInputs();
         TestSonicMotionCatalogPlayback();
         TestJointTrajectoryTakeover();

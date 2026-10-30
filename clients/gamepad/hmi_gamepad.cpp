@@ -133,6 +133,16 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
                 continue;
             }
             status = client.LatestStatus();
+            // Explicit operator power-off does not require a fresh status or
+            // ownership. Match the service's existing safety-request contract.
+            if (client.Connected() && operator_gamepad::IsPowerOffRequest(command)) {
+                armed = false;
+                output = {};
+                const auto reply = client.RequestState("POWER_OFF");
+                Report(label, reply);
+                feedback.Track(command.operation, command.value, status, reply);
+                continue;
+            }
             if (!client.Connected() || !status.online) {
                 std::printf("[gamepad] %s ignored: operator service not ready\n", label.c_str());
                 continue;
@@ -175,6 +185,7 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
             } else if (command.operation == "policy") reply = client.SelectPolicy(command.value);
             else if (command.operation == "action") reply = client.StartInteraction(command.value);
             else if (command.operation == "cancel") reply = client.CancelInteraction();
+            else if (command.operation == "reference") reply = client.StartReference();
             else if (command.operation == "ack") reply = client.AcknowledgeFault();
             Report(label, reply);
             feedback.Track(command.operation, command.value, status, reply);

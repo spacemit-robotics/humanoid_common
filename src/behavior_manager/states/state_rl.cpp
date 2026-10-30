@@ -60,6 +60,11 @@ public:
     }
 
     void OnEnter() override {
+        entry_kp_ = output_ ? output_->kp : std::vector<double>{};
+        entry_kd_ = output_ ? output_->kd : std::vector<double>{};
+        infer_elapsed_ = 0.0;
+        motion_finished_.store(false, std::memory_order_relaxed);
+        switch_requested_.store(false, std::memory_order_relaxed);
         trace_worker_.reset();
         progress_worker_.reset();
         progress_sequence_.store(0, std::memory_order_relaxed);
@@ -68,8 +73,10 @@ public:
         if (output_) {
             output_->actuation_mode = robot_base::ActuationMode::HYBRID;
             output_->target_torque.assign(output_->target_pos.size(), 0.0);
-            output_->kp = config_.kp;
-            output_->kd = config_.kd;
+            if (!live_handoff_) {
+                output_->kp = config_.kp;
+                output_->kd = config_.kd;
+            }
         }
 
         safety_triggered_ = false;
@@ -308,6 +315,7 @@ public:
                 output_->target_pos = target_pos;
                 output_->kp = cached_kp_;
                 output_->kd = cached_kd_;
+                ApplyHandoffGains();
                 applied_action_sequence_ = action_sequence_;
                 int ndof = static_cast<int>(output_->target_pos.size());
                 output_->target_vel.assign(ndof, 0.0);
@@ -350,6 +358,7 @@ public:
 
     void OnExit() override {
         StopInference();
+        live_handoff_ = false;
         // 历史观测、last_action 和模型反馈状态已被本轮推理修改。下次进入必须
         // 使用 BehaviorManager 在安全状态重新准备的新实例，兼容路径则重新 Init。
         runtime_prepared_ = false;
@@ -368,7 +377,23 @@ public:
     }
 
     bool ReadyForPolicySwitch() const override {
-        return switch_ready_.load(std::memory_order_acquire);
+        return switch_requested_.load(std::memory_order_acquire) &&
+            switch_ready_.load(std::memory_order_acquire);
+    }
+
+    void RequestPolicySwitch(bool requested, bool cancel_playback) override {
+        cancel_playback_.store(requested && cancel_playback, std::memory_order_release);
+        if (switch_requested_.exchange(requested, std::memory_order_acq_rel) != requested)
+            switch_ready_.store(false, std::memory_order_release);
+    }
+
+    bool PolicyFinished() const override {
+        return motion_finished_.load(std::memory_order_acquire);
+    }
+
+    void OnPolicyHandoff() override {
+        live_handoff_ = true;
+        OnEnter();
     }
 
     robot_base::FaultStatus CurrentFault() const override {
@@ -384,6 +409,19 @@ public:
 private:
     bool runtime_prepared_ = false;
     std::atomic<bool> switch_ready_{false};
+    std::atomic<bool> switch_requested_{false};
+    std::atomic<bool> cancel_playback_{false};
+    std::atomic<bool> motion_finished_{false};
+    bool live_handoff_ = false;
+    double infer_elapsed_ = 0.0;
+    std::vector<double> entry_kp_, entry_kd_;
+
+    bool HasMotionPhase() const {
+        for (const auto &segment : config_.policy.obs_segments)
+            if (std::find(segment.terms.begin(), segment.terms.end(), "ref_motion_phase") !=
+                segment.terms.end()) return true;
+        return false;
+    }
 
     void StopInference() noexcept {
         running_.store(false, std::memory_order_release);
@@ -403,7 +441,8 @@ private:
     void ApplyEntryTargetTransition(std::vector<double> &target,
                                     float rl_dt,
                                     std::uint64_t inference_steps) {
-        const double duration = config_.entry_target_transition_duration;
+        const double duration = live_handoff_ ? config_.switch_transition_duration :
+            config_.entry_target_transition_duration;
         if (duration <= 0.0 || entry_target_pos_.size() != target.size()) return;
 
         entry_target_transition_elapsed_ = std::min(duration,
@@ -413,6 +452,18 @@ private:
         const double alpha = progress * progress;
         for (std::size_t i = 0; i < target.size(); ++i) {
             target[i] = (1.0 - alpha) * entry_target_pos_[i] + alpha * target[i];
+        }
+    }
+
+    void ApplyHandoffGains() {
+        const double duration = config_.switch_transition_duration;
+        if (!live_handoff_ || duration <= 0.0 || entry_kp_.size() != output_->kp.size() ||
+            entry_kd_.size() != output_->kd.size()) return;
+        const double progress = std::clamp(entry_target_transition_elapsed_ / duration, 0.0, 1.0);
+        const double alpha = progress * progress;
+        for (std::size_t i = 0; i < output_->kp.size(); ++i) {
+            output_->kp[i] = (1.0 - alpha) * entry_kp_[i] + alpha * output_->kp[i];
+            output_->kd[i] = (1.0 - alpha) * entry_kd_[i] + alpha * output_->kd[i];
         }
     }
 
@@ -497,6 +548,9 @@ private:
         auto &joint_kd = infer_kd_;
         joint_kp = config_.kp;
         joint_kd = config_.kd;
+        const bool switching = switch_requested_.load(std::memory_order_acquire);
+        bool adapter_ready = !policy_adapter_;
+        bool finished = false;
         try {
             auto &executor = policy_adapter_
                 ? policy_adapter_->SelectExecutor({cmd_vx, cmd_vy, cmd_wz}, policy_) : policy_;
@@ -505,13 +559,13 @@ private:
                 const auto elapsed = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - t_enter_).count();
                 if (start_reference_requested_.exchange(
-                        false, std::memory_order_acq_rel) &&
+                        false, std::memory_order_acq_rel) && !switching &&
                     policy_adapter_->StartPlayback(elapsed)) {
                     runtime_logging::Log(runtime_logging::Level::kInfo,
                         "manual reference playback started", false);
                 }
-                policy_adapter_->HandleInteractionRequest(
-                    diagnostics.request, elapsed);
+                if (!switching) policy_adapter_->HandleInteractionRequest(diagnostics.request, elapsed);
+                policy_adapter_->PreparePolicySwitch(switching, elapsed);
                 auto &snapshot = infer_snapshot_;
                 snapshot.num_dof = static_cast<int>(joint_pos.size());
                 snapshot.base_pos = base_pos;
@@ -531,6 +585,8 @@ private:
             RecordProgress(ProgressStage::PREPARE_DONE, release_sequence, stage_finish);
 
             // 组装观测 + 推理
+            // Timed motion frame zero is observed at t=0, before advancing its clock.
+            const float observation_dt = HasMotionPhase() && infer_elapsed_ == 0.0 ? 0.0f : rl_dt;
             executor.AssembleObs(gyro,
                                 rpy,
                                 cmd_vx,
@@ -540,8 +596,9 @@ private:
                                 joint_vel,
                                 base_quat,
                                 base_vel,
-                                rl_dt,
+                                observation_dt,
                                 obs);
+            infer_elapsed_ += rl_dt;
             stage_finish = RLRuntimeClock::now();
             diagnostics.assemble_obs_ms = DurationMilliseconds(stage_finish, stage_start);
             stage_start = stage_finish;
@@ -560,9 +617,9 @@ private:
                 std::chrono::duration<double>(stage_finish - release_time).count() >
                     config_.inference_deadline_s;
             if (policy_adapter_ && !already_late) policy_adapter_->OnAction(action);
-            switch_ready_.store(policy_adapter_ && policy_adapter_->ReadyForPolicySwitch(),
-                std::memory_order_release);
             if (policy_adapter_) {
+                adapter_ready = policy_adapter_->ReadyForPolicySwitch();
+                finished = policy_adapter_->PlaybackFinished();
                 policy_adapter_->ApplyJointGains(joint_kp, joint_kd);
                 diagnostics.model_variant = policy_adapter_->ActiveModelName();
                 diagnostics.interaction = policy_adapter_->GetInteractionStatus();
@@ -607,6 +664,17 @@ private:
                 "RL inference returned an invalid action");
             return false;
         }
+
+        if (!policy_adapter_ && HasMotionPhase()) {
+            finished = config_.policy.motion_length > 0.0 &&
+                infer_elapsed_ >= config_.policy.motion_length;
+            adapter_ready = finished;
+        }
+        motion_finished_.store(finished, std::memory_order_release);
+        switch_ready_.store(switching && (adapter_ready ||
+            cancel_playback_.load(std::memory_order_acquire)) &&
+            std::abs(cmd_vx) < 1.0e-6 && std::abs(cmd_vy) < 1.0e-6 && std::abs(cmd_wz) < 1.0e-6,
+            std::memory_order_release);
 
         // 写入动作缓存
         RLRuntimeClock::time_point action_published;

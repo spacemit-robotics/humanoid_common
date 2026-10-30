@@ -240,6 +240,10 @@ Config LoadConfig(const std::string &path) {
             const std::string catalog = configured.value_or(adapter);
             p.actions = LoadActions(yaml, catalog);
         }
+        if (yaml.Read<std::vector<std::string>>(base + ".policy_actions.action_names")) {
+            p.actions = LoadActions(yaml, base + ".policy_actions");
+            p.manual_reference = false;
+        }
         c.policies.push_back(p);
     }
     return c;
@@ -594,8 +598,6 @@ Json Service::Handle(uint64_t session, const Json &request) {
                 active->switch_group == selected->switch_group;
             if (status_.mode != M::POWER_OFF && status_.mode != M::DAMP && !hot)
                 return fail("not_ready", "select policy in POWER_OFF/DAMP or a compatible running group");
-            if (hot && Busy(status_.interaction.phase))
-                return fail("not_ready", "finish or cancel the current action before switching policy");
             command_.vx = command_.vy = command_.wz = 0.0;
             command_.switch_policy = name;
             policy_sequence_ = std::max(policy_sequence_, status_.policy_switch.sequence) + 1;

@@ -41,6 +41,7 @@
 #include "robot_base.h"
 #include "runtime_logger.h"
 #include "runtime_timing.h"
+#include "status_reporting.h"
 #include "latest_sample_worker.h"
 #include "snapshot_worker.h"
 using behavior_manager::BehaviorManagerClass;
@@ -387,6 +388,8 @@ int main(int argc, char *argv[]) {
     bool reported_state = false;
     bool previous_hmi_connected = false;
     bool status_send_failed = false;
+    bool interaction_report_invalid = false;
+    control_runtime::InteractionReportCache interaction_report;
     const auto joint_names =
         yaml_file.Read<std::vector<std::string>>("robot_base.joint_names").value_or(
             std::vector<std::string>{});
@@ -719,9 +722,19 @@ int main(int argc, char *argv[]) {
             status.vy = cmd.vy;
             status.wz = cmd.wz;
             status.rl_frequency_hz = static_cast<float>(bm.GetRlFreq());
-            status.active_policy = bm.CurrentPolicyName();
+            status.active_policy = bm.CurrentPolicySelectionName();
             status.policy_switch = bm.CurrentPolicySwitchStatus();
             status.interaction = bm.CurrentInteractionStatus();
+            const bool interaction_valid = interaction_report.Update(&status);
+            if (!interaction_valid && !interaction_report_invalid) {
+                runtime_logging::Log(runtime_logging::Level::kWarning,
+                    "invalid interaction metadata; retaining last valid interaction report, "
+                    "core control status continues", false);
+            } else if (interaction_valid && interaction_report_invalid) {
+                runtime_logging::Log(runtime_logging::Level::kInfo,
+                    "interaction status reporting recovered", false);
+            }
+            interaction_report_invalid = !interaction_valid;
             const bool sent = transport->SendStatusV2(status, reported_fault);
             if (!sent && !status_send_failed) {
                 runtime_logging::Log(runtime_logging::Level::kWarning,

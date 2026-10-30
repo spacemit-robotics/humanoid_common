@@ -124,6 +124,9 @@ public:
      */
     std::string CurrentPolicyName() const;
 
+    /** @brief 当前用户选择的策略入口；执行目录内动作时保持入口名称。 */
+    std::string CurrentPolicySelectionName() const;
+
     /** @brief 获取最近一次策略切换请求的处理结果，供 HMI 确认或显示失败。 */
     robot_base::PolicySwitchStatus CurrentPolicySwitchStatus() const;
 

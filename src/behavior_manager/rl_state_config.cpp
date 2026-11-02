@@ -48,6 +48,16 @@ void ValidateRLTargetPositionLimits(const RLConfig &config) {
 RLConfig LoadRLStateConfig(const std::string &yaml_path,
     const std::string &policy_name,
     const std::string &robot_dir) {
+    const auto yaml = robot_base::YamlFile::Load(yaml_path);
+    const std::string base = "rl_policy.onnx_infer.policies." + policy_name;
+    if (const auto idle = yaml.Read<std::string>(base + ".policy_actions.idle_policy")) {
+        if (idle->empty() || *idle == policy_name ||
+            yaml.Read<std::string>("rl_policy.onnx_infer.policies." + *idle + ".policy_actions.idle_policy"))
+            throw std::runtime_error("policy_actions.idle_policy must reference a non-catalog policy");
+        auto config = LoadRLStateConfig(yaml_path, *idle, robot_dir);
+        config.policy_name = policy_name;
+        return config;
+    }
     const rl_policy::LoadedPolicyConfig loaded =
         rl_policy::LoadPolicyConfigFromYaml(yaml_path, policy_name, robot_dir);
 
@@ -63,9 +73,6 @@ RLConfig LoadRLStateConfig(const std::string &yaml_path,
     config.kp = loaded.kp;
     config.kd = loaded.kd;
 
-    const auto yaml = robot_base::YamlFile::Load(yaml_path);
-    const std::string base =
-        "rl_policy.onnx_infer.policies." + policy_name;
     const std::string safety_base = base + ".runtime_safety";
     config.first_action_timeout_s = yaml.Read<double>(
         safety_base + ".first_action_timeout_s").value_or(
@@ -102,6 +109,15 @@ RLConfig LoadRLStateConfig(const std::string &yaml_path,
     config.entry_target_transition_duration =
         yaml.Read<double>(base + ".entry_target_transition_duration")
             .value_or(0.0);
+    const auto switch_node = YAML::LoadFile(yaml_path)["rl_policy"]
+        ["onnx_infer"]["policies"][policy_name]["policy_switch"];
+    if (switch_node && switch_node["transition_duration"]) {
+        config.switch_transition_duration = switch_node["transition_duration"].as<double>();
+    }
+    if (!std::isfinite(config.switch_transition_duration) ||
+        config.switch_transition_duration < 0.0) {
+        throw std::runtime_error("[BehaviorManager] invalid policy_switch.transition_duration");
+    }
     if (!std::isfinite(config.entry_target_transition_duration) ||
         config.entry_target_transition_duration < 0.0) {
         throw std::runtime_error(

@@ -327,7 +327,7 @@ struct ControlStatus {
     float vy = 0.0f;                            ///< Control 实际采用的横向速度 (m/s)
     float wz = 0.0f;                            ///< Control 实际采用的转向角速度 (rad/s)
     float rl_frequency_hz = 0.0f;               ///< RL 当前推理频率 (Hz)
-    std::string active_policy;                  ///< 当前实际生效策略
+    std::string active_policy;                  ///< 当前策略入口；目录内动作由 interaction 标识
     InteractionStatus interaction;              ///< RL 或 TRAJECTORY 交互动作状态
     PolicySwitchStatus policy_switch;           ///< 最近一次策略切换的处理结果
 };

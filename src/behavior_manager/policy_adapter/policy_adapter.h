@@ -85,11 +85,32 @@ struct ReferenceMotionCatalogConfig {
 };
 
 /**
- * @brief 单个策略的适配器配置
+ * @brief Asynchronous kinematic planner settings for a SONIC tracker
  *
  * 该结构仅在 behavior_manager 内部使用。机型仓库通过 YAML 提供参数，
  * robot_base 和 model_zoo/rl 不感知具体 tracker 协议。
  */
+struct SonicPlannerConfig {
+    bool enabled = false;
+    std::string model_path;
+    rl_policy::InferenceRuntimeConfig runtime;
+    double output_fps = 50.0;
+    double replan_interval = 1.0;
+    double lookahead = 0.04;
+    double default_height = 0.788740;
+    double facing_horizon = 1.0;
+    double command_epsilon = 1.0e-3;
+    double slow_walk_max_speed = 0.8;
+    double walk_max_speed = 2.5;
+    int mode = -1;
+    int random_seed = 1234;
+    std::vector<int> allowed_pred_num_tokens = {
+        0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0};
+
+    bool Enabled() const { return enabled && !model_path.empty(); }
+};
+
+/** @brief 单个策略的适配器配置，由机型 YAML 提供参数。 */
 struct Config {
     std::string type;
     std::string reference_file;
@@ -102,6 +123,7 @@ struct Config {
     int anchor_body_index = -1;
     std::vector<int> anchor_waist_joint_indices;
     bool anchor_yaw_align = true;
+    bool anchor_xy_align = false;
 
     int future_frames = 0;
     int future_step = 1;
@@ -110,6 +132,7 @@ struct Config {
     ReferenceActionConfig reference_action;
     JointTrajectoryConfig joint_trajectory;
     ReferenceMotionCatalogConfig reference_motion_catalog;
+    SonicPlannerConfig sonic_planner;
 
     struct HistoryActorConfig {
         struct Motion {
@@ -200,6 +223,15 @@ public:
     /** @brief Ready for a running handoff once stationary and without an active action. */
     virtual bool ReadyForPolicySwitch() const { return false; }
 
+    /** @brief Finish the current reference cycle instead of starting another one. */
+    virtual void PreparePolicySwitch(bool requested, double elapsed_s) {
+        (void)requested;
+        (void)elapsed_s;
+    }
+
+    /** @brief A finite reference has reached its end; continuous policies return false. */
+    virtual bool PlaybackFinished() const { return false; }
+
     /** @brief 推理前根据机器人状态和参考数据注入自定义模型输入 */
     virtual void PrepareInputs(const robot_base::RobotData &robot,
         double elapsed_s,
@@ -211,7 +243,7 @@ public:
      * 适配器可以保存模型输出供下一帧使用，也可以改写送往通用关节目标映射的
      * action。PolicyExecutor 内部状态不受改写影响。
      */
-    virtual void OnAction(std::vector<double> &action) {}
+    virtual void OnAction(std::vector<double> &) {}
 
     /** @brief Current external takeover weight, evaluated before building observations. */
     virtual double InteractionWeight() const { return 0.0; }
@@ -223,7 +255,7 @@ public:
     }
 
     /** @brief 开始手动参考时间轴；重复请求不会重新计时。 */
-    virtual bool StartPlayback(double elapsed_s) { return false; }
+    virtual bool StartPlayback(double) { return false; }
 
     /** @brief 接收一次带序号的交互动作请求 */
     virtual void HandleInteractionRequest(

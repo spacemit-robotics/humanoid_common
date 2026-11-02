@@ -176,6 +176,19 @@ void TestTrajectory() {
     rejected = false;
     try { (void)LoadConfig(path.string()); } catch (const std::exception &) { rejected = true; }
     assert(rejected);
+    std::ofstream(path) << "rl_policy:\n  onnx_infer:\n"
+        "    policy_names: [motions]\n    policies:\n"
+        "      motions:\n        display_name: Motion mode\n        switch_group: whole_body\n"
+        "        policy_actions:\n          idle_policy: idle\n          action_names: [wave, bow]\n"
+        "          actions:\n            wave: {policy: wave_model, display_name: Wave}\n"
+        "            bow: {policy: bow_model, display_name: Bow}\n"
+        "      idle: {}\n      wave_model: {}\n      bow_model: {}\n";
+    const auto modes = LoadConfig(path.string());
+    assert(modes.policies.size() == 1 && modes.policies.front().name == "motions");
+    assert(modes.policies.front().display_name == "Motion mode");
+    assert(!modes.policies.front().manual_reference && modes.policies.front().actions.size() == 2);
+    assert(modes.policies.front().actions[0].key == "wave" && modes.policies.front().actions[0].display_name == "Wave");
+    assert(Service(modes).Catalog().at("policies").size() == 1);
     std::filesystem::remove_all(root);
 }
 } // namespace
@@ -221,6 +234,20 @@ int main(int argc, char **argv) {
     config.status_timeout = 0.08;
     config.request_timeout = 0.08;
     config.policies.push_back({"test_policy", true, {-0.1, -0.2, -0.3}, {0.1, 0.2, 0.3}, {{"wave", "Wave"}}});
+    {
+        Service offline(config);
+        const auto spectator = offline.Open();
+        uint64_t id = 0;
+        const auto request = [&](const std::string &op, const Json &args) {
+            return offline.Handle(spectator, {{"v", 1}, {"id", ++id}, {"op", op}, {"args", args}});
+        };
+        assert(!request("state", {{"state", "POWER_OFF"}})["ok"].get<bool>());
+        assert(request("hello", {{"token", config.token}, {"name", "spectator"}})["ok"].get<bool>());
+        assert(!offline.Snapshot(spectator).online && !offline.Snapshot(spectator).owns_control);
+        assert(!request("state", {{"state", "RL"}})["ok"].get<bool>());
+        assert(request("state", {{"state", "POWER_OFF"}})["ok"].get<bool>());
+        assert(offline.Command().key == -1 && !offline.Snapshot(spectator).owns_control);
+    }
     Service service(config);
     assert(!service.Catalog().at("teleop").contains("slow_limits"));
     assert(service.Catalog().at("policies").at(0).at("client_smoothing").get<bool>());
@@ -358,6 +385,8 @@ int main(int argc, char **argv) {
         assert(!request("policy", {{"policy", "hidden"}})["ok"].get<bool>());
         assert(!request("policy", {{"policy", "incompatible"}})["ok"].get<bool>());
         assert(request("velocity", {{"vx", 0.1}, {"vy", 0.0}, {"wz", 0.0}})["ok"].get<bool>());
+        running.interaction.phase = robot_base::InteractionStatus::Phase::PLAYING;
+        live.UpdateStatus(running, {});
         assert(request("policy", {{"policy", "peer"}})["ok"].get<bool>());
         assert(live.Command().vx == 0 && live.Command().switch_policy == "peer");
         assert(operator_service::DecodePolicy(live.Catalog()["policies"][0]).switch_group == "compatible");

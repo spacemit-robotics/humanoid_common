@@ -21,6 +21,10 @@
 
 namespace transport {
 
+bool IsValidInteractionStatus(const robot_base::InteractionStatus &status) {
+    return CanEncodeInteractionStatus(status);
+}
+
 std::unique_ptr<TransportBaseV2> CreateV2(const std::string &yaml_path) {
     robot_base::YamlFile yaml_file = robot_base::YamlFile::Load(yaml_path);
     std::string type = yaml_file.Read<std::string>("transport.type").value_or("udp");

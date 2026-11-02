@@ -215,6 +215,11 @@ function render() {
   document.querySelectorAll("[data-state]").forEach(b => {
     const target = b.dataset.state;
     b.classList.toggle("active", status?.state === target);
+    if (target === 'POWER_OFF') {
+      // Stale status must not disable an authenticated manual power-off.
+      b.disabled = !admin;
+      return;
+    }
     b.disabled = !online || !admin || status.state === target ||
       (!['POWER_OFF','DAMP'].includes(target) && (!owns || busy || fault?.latched ||
         before[target] !== status.state || (['RL','TRAJECTORY'].includes(target) && !status.zero_ready))) ||

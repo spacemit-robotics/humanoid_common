@@ -48,6 +48,8 @@ public:
     void ReplaceState(StateName name, std::unique_ptr<State> state);
     std::unique_ptr<State> ReplaceStateDeferred(StateName name, std::unique_ptr<State> state);
     bool ReadyForPolicySwitch() const;
+    void RequestPolicySwitch(bool requested, bool cancel_playback = false);
+    bool PolicyFinished() const;
 
     /**
      * @brief 初始化 FSM，设置初始状态为 POWER_OFF

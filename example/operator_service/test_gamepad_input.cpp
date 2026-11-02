@@ -148,6 +148,10 @@ void TestSingleAndCombinedBindings() {
 }
 
 int main() {
+    assert(operator_gamepad::IsPowerOffRequest({{"BACK"}, "state", "POWER_OFF", 1000}));
+    assert(!operator_gamepad::IsPowerOffRequest({{"START"}, "state", "DAMP", 1000}));
+    assert(!operator_gamepad::IsPowerOffRequest({{"LB", "RB"}, "state", "RL", 1000}));
+    assert(!operator_gamepad::IsPowerOffRequest({{"LT", "X"}, "policy", "dance", 1000}));
     TestHeldChords();
     TestSingleAndCombinedBindings();
     using operator_gamepad::MakeLayout;

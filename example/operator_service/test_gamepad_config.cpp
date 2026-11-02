@@ -47,6 +47,7 @@ operator_gamepad:
     bindings:
         - {buttons: [CAPTURE], operation: control, trigger: tap}
         - {buttons: [BACK], operation: state, value: POWER_OFF, hold_ms: 1000}
+        - {buttons: [L3], operation: reference, hold_ms: 1000, policy: dance}
         - {buttons: [Y], operation: preset, value: toggle, trigger: tap, policy: walk}
         - {buttons: [RT, A], operation: action, value: shake_hand, trigger: tap, policy: walk}
         - {buttons: [RT, A], operation: action, value: rhythm_1, hold_ms: 1000, policy: dance}

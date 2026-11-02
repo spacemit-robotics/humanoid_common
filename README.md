@@ -479,6 +479,11 @@ rl_policy:
 
 ### 策略协议适配
 
+对于“选择模式后待命、按动作键才执行”的入口，使用
+[`policy_actions` 动作目录](src/behavior_manager/README.md#模式内动作目录)，不要使用自动执行的前置链。
+目录可调度不同模型，待命模型、动作名称和子策略均由机型 YAML 配置；
+动作结束仍保留所选模式，返回该模式的待命模型。
+
 需要外置参考动作或特殊模型输入的策略，在机型 YAML 的策略段配置
 `policy_adapter`。它是 `behavior_manager` 的内部子模块，不是与
 `behavior_manager` 平级的新 common 模块：

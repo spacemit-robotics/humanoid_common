@@ -179,6 +179,7 @@ if(BUILD_RL)
         src/behavior_manager/rl_state_config.cpp
         src/behavior_manager/joint_trajectory.cpp
         src/behavior_manager/policy_adapter/policy_adapter.cpp
+        src/behavior_manager/policy_adapter/sonic_planner.cpp
         src/behavior_manager/policy_adapter/joint_trajectory_policy_adapter.cpp
         src/behavior_manager/policy_adapter/stance_motion_policy_adapter.cpp
         src/behavior_manager/policy_adapter/history_actor_policy_adapter.cpp
@@ -487,6 +488,12 @@ if(BUILD_TESTS)
             ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/test_web_connection.js)
     endif()
     enable_testing()
+    add_executable(test_status_reporting example/transport_executor/test_status_reporting.cpp)
+    target_include_directories(test_status_reporting PRIVATE
+        src/runtime/control src/transport/transport_executor)
+    target_link_libraries(test_status_reporting PRIVATE transport_executor robot_base)
+    target_compile_options(test_status_reporting PRIVATE -UNDEBUG)
+    add_test(NAME status_reporting COMMAND test_status_reporting)
     add_executable(test_operator_service example/operator_service/test_operator_service.cpp)
     target_link_libraries(test_operator_service PRIVATE operator_service)
     target_compile_options(test_operator_service PRIVATE -UNDEBUG)
@@ -602,6 +609,7 @@ if(BUILD_RL)
     target_include_directories(test_policy_adapter PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/transport/transport_executor
         ${RL_INCLUDE_DIR}
     )
     target_link_libraries(test_policy_adapter PRIVATE
@@ -610,6 +618,11 @@ if(BUILD_RL)
 
     if(BUILD_TESTS)
         add_test(NAME policy_adapter COMMAND test_policy_adapter)
+        add_executable(test_home_limits example/behavior_manager/test_home_limits.cpp)
+        target_include_directories(test_home_limits PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager ${RL_INCLUDE_DIR})
+        target_link_libraries(test_home_limits PRIVATE behavior_manager robot_base Eigen3::Eigen)
+        add_test(NAME home_limits COMMAND test_home_limits)
         add_executable(test_trajectory example/behavior_manager/test_trajectory.cpp)
         target_include_directories(test_trajectory PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager)
@@ -625,6 +638,7 @@ if(BUILD_RL)
 
         add_executable(test_policy_switch
             example/behavior_manager/test_policy_switch.cpp)
+        target_include_directories(test_policy_switch PRIVATE src/transport/transport_executor)
         target_link_libraries(test_policy_switch PRIVATE behavior_manager robot_base)
         add_test(NAME policy_switch COMMAND test_policy_switch)
         set_tests_properties(policy_switch PROPERTIES TIMEOUT 30)

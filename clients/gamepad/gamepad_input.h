@@ -30,6 +30,9 @@ struct Binding {
 inline bool Applies(const Binding &binding, const std::string &policy) {
     return binding.policy.empty() || binding.policy == policy;
 }
+inline bool IsPowerOffRequest(const Binding &binding) {
+    return binding.operation == "state" && binding.value == "POWER_OFF";
+}
 struct Layout {
     std::map<int, std::string> buttons;
     int left_x = ABS_X, left_y = ABS_Y, right_x = ABS_Z;

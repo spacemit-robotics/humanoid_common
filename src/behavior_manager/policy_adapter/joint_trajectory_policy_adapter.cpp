@@ -54,6 +54,12 @@ public:
 
     const char *Type() const override { return "joint_trajectory"; }
 
+    bool ReadyForPolicySwitch() const override { return active_clip_ == nullptr; }
+    void PreparePolicySwitch(bool requested, double elapsed_s) override {
+        if (requested && active_clip_ && status_.phase != Phase::BLEND_OUT)
+            BeginBlendOut(elapsed_s, status_.sequence);
+    }
+
     void Reset(const robot_base::RobotData &) override {
         applied_action_.assign(action_dim_, 0.0F);
         previous_applied_action_.assign(action_dim_, 0.0);

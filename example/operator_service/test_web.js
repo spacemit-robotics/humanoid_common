@@ -89,6 +89,9 @@ function element(key) {
 const context = vm.createContext({
     document: {body: element("body"), getElementById: element, hidden: false,
         querySelector: element, querySelectorAll: selector => {
+            if (selector === '[data-state]') return ['POWER_OFF', 'DAMP', 'HOME', 'ZERO', 'RL'].map(state => {
+                const button = element('state-' + state); button.dataset.state = state; return button;
+            });
             if (selector === '[data-motion]') return [...'wsadjl'].map(key => {
                 const button = element('direction-' + key); button.dataset.motion = key; return button;
             });
@@ -133,6 +136,21 @@ async function tick() {
     await Promise.resolve(); await Promise.resolve();
 }
 async function main() {
+    run("status.online = false; status.owns_control = false; status.state = 'POWER_OFF'; render();");
+    assert.equal(element('state-POWER_OFF').disabled, false, 'Stale POWER_OFF label must not block an explicit request');
+    for (const state of ['DAMP', 'HOME', 'ZERO', 'RL']) assert.equal(element('state-' + state).disabled, true);
+    element('state-POWER_OFF').onclick();
+    await Promise.resolve(); await Promise.resolve();
+    assert(captured.some(r => r.op === 'state' && r.args.state === 'POWER_OFF'));
+    run("authenticated = false; render();");
+    assert.equal(element('state-POWER_OFF').disabled, true, 'Authentication is still required');
+    render(catalog);
+    run("catalog.admin_required = true; status.admin = false; render();");
+    assert.equal(element('state-POWER_OFF').disabled, true, 'Administrator access is still required');
+    run("status.admin = true; status.online = false; render();");
+    assert.equal(element('state-POWER_OFF').disabled, false, 'An administrator can power off with stale status');
+    run("delete catalog.admin_required;");
+    render(catalog);
     close(Number(element("speed-vx").value), 0.6);
     element("speed-vx").value = "0.3";
     element("direction-w").onpointerdown(pointer(10, 73, 23));

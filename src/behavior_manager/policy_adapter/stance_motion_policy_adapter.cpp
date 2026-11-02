@@ -249,6 +249,10 @@ public:
         return active_name_ == "stance" && mode_ == 0 && !InteractionBusy() && !wait_for_zero_;
     }
 
+    void PreparePolicySwitch(bool requested, double elapsed_s) override {
+        if (trajectory_) trajectory_->PreparePolicySwitch(requested, elapsed_s);
+    }
+
     std::string ActiveModelName() const override { return active_name_; }
 
     void HandleInteractionRequest(const robot_base::InteractionRequest &request,

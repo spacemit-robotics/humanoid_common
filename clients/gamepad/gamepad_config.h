@@ -72,7 +72,8 @@ inline Config ReadConfig(const YAML::Node &root) {
     std::set<std::string> names{"UP", "DOWN", "LEFT", "RIGHT"};
     for (const auto &[code, name] : c.input.buttons)
         if (!names.insert(name).second) throw std::runtime_error("duplicated gamepad button name");
-    const std::set<std::string> operations{"control", "state", "policy", "preset", "action", "cancel", "ack"};
+    const std::set<std::string> operations{
+        "control", "state", "policy", "preset", "action", "cancel", "ack", "reference"};
     const auto policies = root["rl_policy"]["onnx_infer"]["policy_names"].as<std::vector<std::string>>();
     const auto known_policy = [&](const std::string &name) {
         return std::find(policies.begin(), policies.end(), name) != policies.end();

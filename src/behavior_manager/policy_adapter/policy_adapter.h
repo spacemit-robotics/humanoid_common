@@ -94,6 +94,7 @@ struct SonicPlannerConfig {
     bool enabled = false;
     std::string model_path;
     rl_policy::InferenceRuntimeConfig runtime;
+    robot_base::ThreadLoop thread = robot_base::ThreadLoop::Background("motion_planner");
     double output_fps = 50.0;
     double replan_interval = 1.0;
     double lookahead = 0.04;

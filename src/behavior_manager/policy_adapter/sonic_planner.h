@@ -54,8 +54,8 @@ public:
         const robot_base::Command &command,
         double elapsed_s);
 
-    /** @brief 获取当前已发布参考轨迹的线程安全副本 */
-    SonicPlannerMotion Motion() const;
+    /** @brief 获取当前已发布参考轨迹的只读快照，发布新轨迹不修改旧快照 */
+    std::shared_ptr<const SonicPlannerMotion> Motion() const;
 
     /** @brief Request cancellation without blocking the caller. */
     void RequestStop();

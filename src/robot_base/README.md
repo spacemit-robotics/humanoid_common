@@ -71,6 +71,10 @@ robot_base:
       cpu_id: 5
       sched: fifo
       priority: 85
+    motion_planner: # 可选异步规划线程，模型加载及其 CPU worker 使用此核心范围
+      cpu_affinity: [0, 1]
+      sched: other
+      priority: 0
 ```
 
 ### 1.4 机器人固有物理属性

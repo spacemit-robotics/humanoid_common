@@ -620,6 +620,7 @@ if(BUILD_RL)
         add_test(NAME policy_adapter COMMAND test_policy_adapter)
         add_executable(test_home_limits example/behavior_manager/test_home_limits.cpp)
         target_include_directories(test_home_limits PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager ${RL_INCLUDE_DIR})
         target_link_libraries(test_home_limits PRIVATE behavior_manager robot_base Eigen3::Eigen)
         add_test(NAME home_limits COMMAND test_home_limits)
@@ -631,6 +632,7 @@ if(BUILD_RL)
         install(TARGETS test_trajectory RUNTIME DESTINATION bin)
         add_executable(test_stance_motion example/behavior_manager/test_stance_motion.cpp)
         target_include_directories(test_stance_motion PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager ${RL_INCLUDE_DIR})
         target_link_libraries(test_stance_motion PRIVATE
             behavior_manager robot_base Eigen3::Eigen ${RL_LIB} cnpy)

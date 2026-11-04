@@ -7,8 +7,12 @@
  */
 
 #include "policy_adapter/policy_adapter.h"
+#include "policy_adapter/sonic_planner.h"
 #include "rl_test_model.h"
 #include "transport_packet.h"
+
+#include <pthread.h>
+#include <sched.h>
 
 #include <algorithm>
 #include <array>
@@ -18,10 +22,13 @@
 #include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
+#include <future>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <vector>
 
 #include <cnpy.h>
@@ -69,6 +76,22 @@ const char kSonicReferenceProbeOnnx[] =
     "DeEN4Q3hDeEN4Q3hDeEN4Q3hDeEN4Q3hDeEN4Q3hDeEN4Q3hDeENQgdpbmRpY2VzWiAKDXJl"
     "ZmVyZW5jZV9vYnMSDwoNCAESCQoCCAEKAwjiDVoVCgNvYnMSDgoMCAESCAoCCAEKAggDYhgK"
     "BmFjdGlvbhIOCgwIARIICgIIAQoCCB1CBAoAEA0";
+
+// Opset 13, IR 8: repeat the four context frames to produce 64 qpos frames.
+// Declares the planner's named inputs without requiring deployment model assets.
+const char kPlannerContextRepeatOnnx[] =
+    "CAg67QQKLQoTY29udGV4dF9tdWpvY29fcXBvcwoFc2hhcGUSBmZyYW1lcyIHUmVzaGFwZQokCgZm"
+    "cmFtZXMKB3JlcGVhdHMSC211am9jb19xcG9zIgRUaWxlCiIKBWNvdW50Eg9udW1fcHJlZF9mcmFt"
+    "ZXMiCElkZW50aXR5EhZwbGFubmVyX2NvbnRleHRfcmVwZWF0KhAIAxAHOgMBBCRCBXNoYXBlKhII"
+    "AxAHOgMBEAFCB3JlcGVhdHMqDggBEAYqAUBCBWNvdW50WiYKE2NvbnRleHRfbXVqb2NvX3Fwb3MS"
+    "DwoNCAESCQoCCAEKAwiQAVoYCgp0YXJnZXRfdmVsEgoKCAgBEgQKAggBWhIKBG1vZGUSCgoICAcS"
+    "BAoCCAFaIAoSbW92ZW1lbnRfZGlyZWN0aW9uEgoKCAgBEgQKAggDWh4KEGZhY2luZ19kaXJlY3Rp"
+    "b24SCgoICAESBAoCCANaGQoLcmFuZG9tX3NlZWQSCgoICAcSBAoCCAFaIQoTaGFzX3NwZWNpZmlj"
+    "X3RhcmdldBIKCggIBxIECgIIAVonChlzcGVjaWZpY190YXJnZXRfcG9zaXRpb25zEgoKCAgBEgQK"
+    "AggMWiYKGHNwZWNpZmljX3RhcmdldF9oZWFkaW5ncxIKCggIARIECgIIBFolChdhbGxvd2VkX3By"
+    "ZWRfbnVtX3Rva2VucxIKCggIBxIECgIIC1oUCgZoZWlnaHQSCgoICAESBAoCCAFiIQoLbXVqb2Nv"
+    "X3Fwb3MSEgoQCAESDAoCCAEKAghACgIIJGIdCg9udW1fcHJlZF9mcmFtZXMSCgoICAYSBAoCCAFC"
+    "BAoAEA0";
 
 // NumPy float32 [[1.2, -0.6], [1.4, -0.4]], stored in column-major order.
 const char kColumnMajorJointTrajectoryNpz[] =
@@ -847,6 +870,13 @@ void TestSonicReferenceAndConfig() {
 
 void TestSonicPlannerConfig() {
     const TempReference yaml("sonic_planner_yaml",
+        "robot_base:\n"
+        "  threads:\n"
+        "    motion_planner:\n"
+        "      cpu_affinity: [0, 3]\n"
+        "      sched: fifo\n"
+        "      priority: 40\n"
+        "      lock_memory: true\n"
         "rl_policy:\n"
         "  onnx_infer:\n"
         "    policies:\n"
@@ -870,6 +900,31 @@ void TestSonicPlannerConfig() {
         config.sonic_planner.lookahead == 0.8 &&
         config.sonic_planner.replan_interval == 0.5,
         "planner runtime and timing must come from YAML");
+    const auto &thread = config.sonic_planner.thread;
+    Require(thread.name == "motion_planner" && thread.cpu_id == -1 &&
+        thread.cpu_affinity == std::vector<int>({0, 3}) && thread.sched == "fifo" &&
+        thread.priority == 40 && thread.lock_memory,
+        "planner must use the shared YAML thread configuration");
+
+    const auto bare_yaml = std::string(
+        "rl_policy:\n  onnx_infer:\n    policies:\n      planner:\n"
+        "        policy_adapter:\n          type: sonic\n"
+        "          planner: {model_path: planner.onnx}\n");
+    const TempReference default_yaml("planner_default_thread", bare_yaml);
+    const auto defaults = LoadConfig(default_yaml.Path().string(), "planner",
+        fs::temp_directory_path().string());
+    Require(defaults.sonic_planner.thread.sched == "other" &&
+        defaults.sonic_planner.thread.priority == 0 &&
+        defaults.sonic_planner.thread.cpu_affinity ==
+            robot_base::ThreadLoop::Background("probe").cpu_affinity,
+        "planner defaults must restore background scheduling and launch affinity");
+    const TempReference single_yaml("planner_single_cpu",
+        "robot_base:\n  threads:\n    motion_planner: {cpu_id: 1}\n" + bare_yaml);
+    const auto single = LoadConfig(single_yaml.Path().string(), "planner",
+        fs::temp_directory_path().string());
+    Require(single.sonic_planner.thread.cpu_id == 1 &&
+        single.sonic_planner.thread.cpu_affinity.empty(),
+        "planner single-CPU configuration must not be overridden by defaults");
     auto policy = MakeSonicPolicyConfig(29);
     auto adapter = Create(config, policy);
     Require(adapter && !adapter->ReadyForPolicySwitch(),
@@ -882,6 +937,92 @@ void TestSonicPlannerConfig() {
         rejected = true;
     }
     Require(rejected, "planner must reject a non-permutation joint mapping");
+}
+
+std::set<int> NativeThreadIds() {
+    std::set<int> threads;
+    for (const auto &entry : fs::directory_iterator("/proc/self/task")) {
+        threads.insert(std::stoi(entry.path().filename().string()));
+    }
+    return threads;
+}
+
+void TestSonicPlannerScheduling(bool explicit_affinity) {
+    // Alter a disposable creator thread, never the test runner's scheduling.
+    std::async(std::launch::async, [explicit_affinity] {
+        using behavior_manager::policy_adapter::SonicPlanner;
+        using behavior_manager::policy_adapter::SonicPlannerConfig;
+        const TempSonicOnnx model(kPlannerContextRepeatOnnx);
+        SonicPlannerConfig config;
+        config.enabled = true;
+        config.model_path = model.Path().string();
+        config.runtime.provider = "cpu";
+        config.runtime.threads = 3;
+        config.runtime.ort_spinning = false;
+        const auto launch_cpus = config.thread.cpu_affinity;
+        Require(!launch_cpus.empty(), "cannot read launch affinity");
+        if (explicit_affinity) {
+            config.thread.cpu_affinity = {launch_cpus.back()};
+            if (launch_cpus.size() > 2) config.thread.cpu_affinity.push_back(launch_cpus[1]);
+        }
+        robot_base::ThreadLoop creator;
+        creator.name = "planner_creator";
+        creator.cpu_id = launch_cpus.front();
+        creator.Apply();
+        sched_param batch{};
+        Require(pthread_setschedparam(pthread_self(), SCHED_BATCH, &batch) == 0,
+            "cannot select unprivileged creator scheduling");
+
+        SonicPlanner planner(config, MakeSonicPolicyConfig(29));
+        auto robot = robot_base::RobotData::Create(29);
+        robot.joint_pos[0] = 0.125;
+        const auto before = NativeThreadIds();
+        planner.Reset(robot);
+        const auto wait_for_plan = [&](const auto &previous) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (std::chrono::steady_clock::now() < deadline) {
+                auto motion = planner.Motion();
+                if (motion != previous && motion->frames.size() != 100) return motion;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            throw std::runtime_error("planner did not publish the test trajectory");
+        };
+        const auto first = wait_for_plan(nullptr);
+        cpu_set_t expected;
+        CPU_ZERO(&expected);
+        for (const int cpu : config.thread.cpu_affinity) CPU_SET(cpu, &expected);
+        int new_threads = 0;
+        for (const int tid : NativeThreadIds()) {
+            if (before.count(tid)) continue;
+            cpu_set_t actual;
+            CPU_ZERO(&actual);
+            sched_param param{};
+            Require(sched_getaffinity(tid, sizeof(actual), &actual) == 0 &&
+                CPU_EQUAL(&actual, &expected) && sched_getscheduler(tid) == SCHED_OTHER &&
+                sched_getparam(tid, &param) == 0 && param.sched_priority == 0,
+                "planner or inference worker retained the creator's CPU/scheduling");
+            ++new_threads;
+        }
+        Require(new_threads == config.runtime.threads,
+            "expected planner caller plus its two CPU inference workers");
+
+        const auto old_size = first->frames.size();
+        const auto old_start = first->start_time_s;
+        robot_base::Command moving;
+        moving.vx = 0.1F;
+        planner.Update(robot, moving, 0.1);
+        const auto second = wait_for_plan(first);
+        Require(second->start_time_s >= 0.1 && first->frames.size() == old_size &&
+            first->start_time_s == old_start && first->frames[0].dof_pos[0] == 0.125F,
+            "publishing a new plan must not mutate the previous reference snapshot");
+        Require(!planner.Idle(), "a moving plan must not report an idle handoff");
+        planner.Update(robot, {}, 0.2);
+        const auto stopped = wait_for_plan(second);
+        planner.Update(robot, {}, stopped->start_time_s +
+            stopped->frames.size() / config.output_fps + 0.1);
+        Require(planner.Idle(), "a completed stop plan must allow policy handoff");
+        planner.RequestStop();
+    }).get();
 }
 
 void TestSonicPrepareInputs() {
@@ -1424,6 +1565,8 @@ int main(int argc, char **argv) {
         TestManualReferencePlayback();
         TestSonicReferenceAndConfig();
         TestSonicPlannerConfig();
+        TestSonicPlannerScheduling(false);
+        TestSonicPlannerScheduling(true);
         TestSonicPrepareInputs();
         TestSonicMotionCatalogPlayback();
         TestJointTrajectoryTakeover();

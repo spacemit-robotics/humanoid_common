@@ -163,7 +163,7 @@ public:
         Stop();
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            motion_ = BuildSeedMotion(robot);
+            motion_ = std::make_shared<const SonicPlannerMotion>(BuildSeedMotion(robot));
             latest_robot_ = robot;
             latest_command_ = {};
             latest_elapsed_s_ = 0.0;
@@ -200,7 +200,7 @@ public:
         }
     }
 
-    SonicPlannerMotion Motion() const {
+    std::shared_ptr<const SonicPlannerMotion> Motion() const {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!error_.empty()) throw std::runtime_error(error_);
         return motion_;
@@ -606,6 +606,9 @@ private:
 
     void PlannerLoop() {
         try {
+            // Apply before session creation so its CPU workers inherit this
+            // thread's affinity and scheduling, not the control loop's.
+            config_.thread.Apply();
             const auto load_start = std::chrono::steady_clock::now();
             planner_policy_.Init(planner_policy_config_);
             const double load_seconds = std::chrono::duration<double>(
@@ -629,7 +632,7 @@ private:
             robot_base::RobotData robot;
             robot_base::Command command;
             double elapsed_s = 0.0;
-            SonicPlannerMotion source;
+            std::shared_ptr<const SonicPlannerMotion> source;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 while (running_) {
@@ -662,14 +665,23 @@ private:
             const auto infer_start = std::chrono::steady_clock::now();
             try {
                 SonicPlannerMotion generated =
-                    Generate(robot, command, elapsed_s, source);
+                    Generate(robot, command, elapsed_s, *source);
                 const double infer_ms = 1000.0 * std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - infer_start).count();
+                double publish_time_s = 0.0;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (!running_) return;
-                    motion_ = BlendWithCurrentMotion(
-                        motion_, generated, latest_elapsed_s_);
+                    publish_time_s = latest_elapsed_s_;
+                }
+                // Build the immutable trajectory outside the tracker-facing lock.
+                // Only this worker publishes motion between Reset and Stop.
+                auto next_motion = std::make_shared<const SonicPlannerMotion>(
+                    BlendWithCurrentMotion(*source, generated, publish_time_s));
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (!running_) return;
+                    motion_.swap(next_motion);
                     idle_ = SelectMode(command) == 0;
                     idle_ready_at_s_ = generated.start_time_s +
                         static_cast<double>(generated.frames.size() - 1) /
@@ -725,7 +737,7 @@ private:
     bool idle_ = false;
     double idle_ready_at_s_ = 0.0;
     std::string error_;
-    SonicPlannerMotion motion_;
+    std::shared_ptr<const SonicPlannerMotion> motion_;
 };
 
 SonicPlanner::SonicPlanner(const SonicPlannerConfig &config,
@@ -744,7 +756,7 @@ void SonicPlanner::Update(const robot_base::RobotData &robot,
     impl_->Update(robot, command, elapsed_s);
 }
 
-SonicPlannerMotion SonicPlanner::Motion() const {
+std::shared_ptr<const SonicPlannerMotion> SonicPlanner::Motion() const {
     return impl_->Motion();
 }
 

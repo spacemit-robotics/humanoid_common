@@ -908,6 +908,7 @@ public:
         if (planner_) {
             latest_command_ = {};
             planner_switch_requested_ = false;
+            planner_motion_.reset();
             playback_active_ = true;
             heading_offset_ = Eigen::Quaternionf::Identity();
             planner_->Reset(robot);
@@ -1038,15 +1039,17 @@ private:
         planner_->Update(robot, planner_switch_requested_
             ? robot_base::Command{} : latest_command_, elapsed_s);
         const auto motion = planner_->Motion();
+        if (motion == planner_motion_) return;
         auto &frames = clips_.front().frames;
-        frames.resize(motion.frames.size());
+        frames.resize(motion->frames.size());
         for (std::size_t i = 0; i < frames.size(); ++i) {
-            frames[i].dof_pos = motion.frames[i].dof_pos;
-            frames[i].dof_vel = motion.frames[i].dof_vel;
-            const auto &q = motion.frames[i].root_quat;
+            frames[i].dof_pos = motion->frames[i].dof_pos;
+            frames[i].dof_vel = motion->frames[i].dof_vel;
+            const auto &q = motion->frames[i].root_quat;
             frames[i].root_quat = Eigen::Quaternionf(q[0], q[1], q[2], q[3]).normalized();
         }
-        playback_start_elapsed_ = motion.start_time_s;
+        playback_start_elapsed_ = motion->start_time_s;
+        planner_motion_ = motion;
     }
 
     void ValidateConfig() const {
@@ -1475,6 +1478,7 @@ private:
     robot_base::InteractionStatus status_;
     SonicFrame transition_source_;
     std::unique_ptr<SonicPlanner> planner_;
+    std::shared_ptr<const SonicPlannerMotion> planner_motion_;
     robot_base::Command latest_command_;
     bool planner_switch_requested_ = false;
     Eigen::Quaternionf last_robot_quat_ = Eigen::Quaternionf::Identity();
@@ -1609,6 +1613,13 @@ Config LoadConfig(const std::string &yaml_path,
             }
             config.sonic_planner.model_path =
                 ResolvePath(robot_dir, *planner_model).string();
+            config.sonic_planner.thread =
+                robot_base::ThreadLoop::FromYaml(yaml, "motion_planner");
+            if (config.sonic_planner.thread.cpu_id < 0 &&
+                config.sonic_planner.thread.cpu_affinity.empty()) {
+                config.sonic_planner.thread.cpu_affinity =
+                    robot_base::ThreadLoop::Background("motion_planner").cpu_affinity;
+            }
             config.sonic_planner.runtime.provider = yaml.Read<std::string>(
                 planner_base + ".runtime.provider").value_or("cpu");
             config.sonic_planner.runtime.threads = yaml.Read<int>(

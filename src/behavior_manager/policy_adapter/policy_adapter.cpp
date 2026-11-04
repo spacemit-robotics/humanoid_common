@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file policy_adapter.cpp
- * @brief MJLab、ProtoMotions 和 SONIC 策略输入适配
+ * @brief MJLab、ProtoMotions、SONIC 和 SuperMimic 策略输入适配
  */
 
 #include "policy_adapter.h"
@@ -14,6 +14,7 @@
 #include "history_actor_policy_adapter.h"
 
 #include <cnpy.h>
+#include <yaml-cpp/yaml.h>
 
 #include <Eigen/Geometry>
 #include <algorithm>
@@ -23,6 +24,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -207,6 +209,174 @@ void AppendZeros(int count, std::vector<float> &output) {
 double SmoothStep01(double value) {
     const double x = std::clamp(value, 0.0, 1.0);
     return x * x * (3.0 - 2.0 * x);
+}
+
+constexpr std::size_t kFrames = 10;
+constexpr double kPeriod = 0.02;
+
+void Require(bool condition, const char *message) {
+    if (!condition) throw std::runtime_error(std::string("[supermimic] ") + message);
+}
+
+float CheckedFloat(double value) {
+    Require(std::isfinite(value) && std::abs(value) <= std::numeric_limits<float>::max(),
+        "input must be finite and representable as float");
+    return static_cast<float>(value);
+}
+
+YAML::Node AtPath(YAML::Node node, const std::string &path) {
+    std::istringstream parts(path);
+    std::string part;
+    while (std::getline(parts, part, '.')) {
+        Require(node.IsMap(), "invalid adapter configuration path");
+        node.reset(node[part]);
+    }
+    return node;
+}
+
+class SupermimicPolicyAdapter final : public PolicyAdapter {
+public:
+    SupermimicPolicyAdapter(const Config &config,
+        const rl_policy::PolicyExecutorConfig &policy)
+        : defaults_(policy.rl_default_pos), joints_(defaults_.size()) {
+        Require(joints_ > 0 && joints_ <= 1024 && policy.action_joint_index.size() == joints_ &&
+            policy.action_scale.size() == joints_, "expected a complete canonical joint mapping");
+        for (std::size_t joint = 0; joint < joints_; ++joint) {
+            Require(policy.action_joint_index[joint] == static_cast<int>(joint),
+                "this contract requires canonical joint order");
+            CheckedFloat(defaults_[joint]);
+            Require(CheckedFloat(policy.action_scale[joint]) > 0.0F,
+                "action scales must be positive");
+        }
+        Require(policy.action_blend_ratio == 1.0 && policy.clip_actions.empty() &&
+            policy.clip_observations.empty(), "clipping or blending changes the model contract");
+        Require(policy.obs_segments.size() == 1 && policy.obs_segments[0].mode.empty() &&
+            policy.obs_segments[0].length == 0 && policy.obs_segments[0].terms ==
+                std::vector<std::string>{"supermimic_obs"}, "expected a single custom observation");
+        const auto dimension = policy.custom_array_dims.find("supermimic_obs");
+        Require(dimension != policy.custom_array_dims.end() &&
+            dimension->second == static_cast<int>((3 * joints_ + 6) * kFrames) &&
+            policy.strict_obs_dim_check, "invalid observation history dimensions");
+        Require(policy.model_io.inputs.size() == 2, "expected obs_hist and goal model inputs");
+        bool observation = false;
+        bool goal = false;
+        for (const auto &input : policy.model_io.inputs) {
+            if (input.name == "obs_hist" &&
+                input.source == rl_policy::ModelInputSource::OBSERVATION &&
+                input.observation_offset <= 0) {
+                observation = true;
+            } else if (input.name == "goal" &&
+                input.source == rl_policy::ModelInputSource::EXTERNAL &&
+                input.key == "supermimic_goal") {
+                goal = true;
+            }
+        }
+        Require(observation && goal, "incorrect model input bindings");
+        int action_outputs = 0;
+        for (const auto &output : policy.model_io.outputs) {
+            if (output.target == rl_policy::ModelOutputTarget::ACTION) {
+                Require(output.name == "actions", "incorrect action output name");
+                ++action_outputs;
+            }
+        }
+        Require(action_outputs == 1, "expected exactly one actions output");
+
+        const float height = CheckedFloat(config.supermimic.reference_height);
+        Require(height > 0.0F, "reference_height must be positive");
+        previous_action_.resize(joints_, 0.0F);
+        sample_.resize(3 * joints_ + 6, 0.0F);
+        history_.resize(sample_.size() * kFrames, 0.0F);
+        goal_.resize((2 * joints_ + 10) * kFrames, 0.0F);
+        for (std::size_t frame = 0; frame < kFrames; ++frame) {
+            // q-offset, q-velocity, gravity, body gyro, yaw-frame linear velocity, height.
+            const std::size_t start = frame * (2 * joints_ + 10);
+            goal_[start + 2 * joints_ + 2] = -1.0F;
+            goal_[start + 2 * joints_ + 9] = height;
+        }
+    }
+
+    const char *Type() const override { return "supermimic"; }
+    bool ReadyForPolicySwitch() const override { return true; }
+
+    void Reset(const robot_base::RobotData &robot) override {
+        (void)robot;
+        seeded_ = false;
+        std::fill(previous_action_.begin(), previous_action_.end(), 0.0F);
+    }
+
+    void PrepareInputs(const robot_base::RobotData &robot, double elapsed_s,
+        rl_policy::PolicyExecutor &policy) override {
+        Require(std::isfinite(elapsed_s) && elapsed_s >= 0.0, "invalid elapsed time");
+        Require(policy.ObsDim() == static_cast<int>(history_.size()) &&
+            policy.ActionDim() == static_cast<int>(joints_), "incompatible model dimensions");
+        Require(robot.joint_pos.size() == joints_ && robot.joint_vel.size() == joints_,
+            "incompatible sensor joint dimensions");
+        // Validate the complete sample before advancing persistent history.
+        for (std::size_t joint = 0; joint < joints_; ++joint) {
+            sample_[joint] = CheckedFloat(robot.joint_pos[joint] - defaults_[joint]);
+            sample_[joints_ + joint] = CheckedFloat(robot.joint_vel[joint]);
+        }
+        for (int axis = 0; axis < 3; ++axis)
+            sample_[2 * joints_ + axis] = CheckedFloat(robot.gyro[axis]);
+        for (double component : robot.base_quat) CheckedFloat(component);
+        Eigen::Quaterniond orientation(robot.base_quat[0], robot.base_quat[1],
+            robot.base_quat[2], robot.base_quat[3]);
+        Require(std::abs(orientation.norm() - 1.0) <= 0.01, "invalid unit quaternion");
+        orientation.normalize();
+        const Eigen::Vector3d gravity = orientation.conjugate() * -Eigen::Vector3d::UnitZ();
+        for (int axis = 0; axis < 3; ++axis)
+            sample_[2 * joints_ + 3 + axis] = CheckedFloat(gravity[axis]);
+        std::copy(previous_action_.begin(), previous_action_.end(),
+            sample_.begin() + 2 * joints_ + 6);
+
+        // Model bindings validate the goal size before history is mutated.
+        policy.SetModelInput("supermimic_goal", goal_.data(), static_cast<int>(goal_.size()));
+        const std::array<std::size_t, 5> widths = {joints_, joints_, 3, 3, joints_};
+        std::size_t offset = 0;
+        for (const std::size_t width : widths) {
+            auto begin = history_.begin() + offset * kFrames;
+            if (seeded_) std::rotate(begin, begin + width, begin + width * kFrames);
+            const std::size_t first = seeded_ ? kFrames - 1 : 0;
+            for (std::size_t frame = first; frame < kFrames; ++frame)
+                std::copy_n(sample_.begin() + offset, width, begin + frame * width);
+            offset += width;
+        }
+        seeded_ = true;
+        policy.SetCustomArray("supermimic_obs", history_.data(), static_cast<int>(history_.size()));
+    }
+
+    void OnAction(std::vector<double> &action) override {
+        Require(action.size() == joints_, "invalid raw action dimensions");
+        for (double value : action) CheckedFloat(value);
+        std::transform(action.begin(), action.end(), previous_action_.begin(),
+            [](double value) { return static_cast<float>(value); });
+    }
+
+private:
+    std::vector<double> defaults_;
+    const std::size_t joints_;
+    std::vector<float> previous_action_;
+    std::vector<float> sample_;
+    std::vector<float> history_;
+    std::vector<float> goal_;
+    bool seeded_ = false;
+};
+
+Config::SupermimicConfig LoadSupermimicConfig(
+    const std::string &yaml_path, const std::string &base) {
+    const YAML::Node root = YAML::LoadFile(yaml_path);
+    const YAML::Node adapter = AtPath(root, base);
+    Config::SupermimicConfig settings;
+    settings.reference_height = adapter["reference_height"].as<double>();
+    Require(CheckedFloat(settings.reference_height) > 0.0F,
+        "reference_height must be a finite positive float");
+    const double period = root["rl_policy"]["rl_dt"].as<double>();
+    Require(std::isfinite(period) && std::abs(period - kPeriod) < 1.0e-9,
+        "this model requires rl_dt = 0.02 (50 Hz)");
+    const YAML::Node policy = AtPath(root, base.substr(0, base.rfind('.')));
+    Require(policy["infer_decimation"].as<int>() == 1,
+        "this model requires infer_decimation = 1");
+    return settings;
 }
 
 class MjlabPolicyAdapter final : public PolicyAdapter {
@@ -1515,6 +1685,10 @@ Config LoadConfig(const std::string &yaml_path,
     }
     if (type) {
         config.type = *type;
+        if (config.type == "supermimic") {
+            config.supermimic = LoadSupermimicConfig(yaml_path, adapter_base);
+            return config;
+        }
         if (config.type == "history_actor") {
             config.history_actor = LoadHistoryActorConfig(yaml_path, adapter_base, robot_dir);
             return config;
@@ -1794,6 +1968,9 @@ std::unique_ptr<PolicyAdapter> Create(
     const rl_policy::PolicyExecutorConfig &policy_config) {
     if (!config.Enabled()) {
         return nullptr;
+    }
+    if (config.type == "supermimic") {
+        return std::make_unique<SupermimicPolicyAdapter>(config, policy_config);
     }
     if (config.type == "stance_motion") {
         return CreateStanceMotionPolicyAdapter(config, policy_config);

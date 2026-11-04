@@ -135,6 +135,11 @@ struct Config {
     ReferenceMotionCatalogConfig reference_motion_catalog;
     SonicPlannerConfig sonic_planner;
 
+    // Static SuperMimic goal; joint dimensions come from the policy mapping.
+    struct SupermimicConfig {
+        double reference_height = 0.0;
+    } supermimic;
+
     struct HistoryActorConfig {
         struct Motion {
             std::string name;

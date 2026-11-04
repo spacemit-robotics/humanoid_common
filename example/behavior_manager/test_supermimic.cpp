@@ -3,10 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file test_supermimic.cpp
- * @brief Exercise the static SuperMimic contract through the real executor.
+ * @brief Exercise SuperMimic observation and reference inputs through the real executor.
  */
 
 #include <unistd.h>
+
+#include <cnpy.h>
+#include <Eigen/Geometry>
 
 #include <algorithm>
 #include <array>
@@ -95,14 +98,45 @@ public:
     }
 
     void WriteConfig(const std::string &height = "0.95",
-        const std::string &period = "0.02", int decimation = 1) const {
+        const std::string &period = "0.02", int decimation = 1,
+        const std::string &reference_options = "") const {
         std::ofstream output(yaml);
         output << "rl_policy:\n  rl_dt: " << period <<
             "\n  onnx_infer:\n    policies:\n      probe:\n"
             "        infer_decimation: " << decimation <<
             "\n        policy_adapter:\n          type: supermimic\n";
         if (!height.empty()) output << "          reference_height: " << height << '\n';
+        output << reference_options;
         Require(output.good(), "cannot write configuration");
+    }
+
+    std::string WriteMotion(std::size_t joint_count = 28) const {
+        const std::string path = (directory_ / "motion.npz").string();
+        std::vector<float> joints(4 * joint_count, 0.1F), velocities(4 * joint_count, 1.0F);
+        std::vector<float> positions(4 * 2 * 3, 0.0F), quaternions(4 * 2 * 4, 0.0F);
+        std::vector<float> linear(positions.size(), 0.0F), angular(positions.size(), 0.0F);
+        for (int frame = 0; frame < 4; ++frame) {
+            joints[frame * joint_count] += 0.04F * frame;
+            const std::size_t body = frame * 2 + 1;
+            positions[body * 3 + 2] = 1.0F + 0.02F * frame;
+            const Eigen::Quaternionf q = Eigen::Quaternionf(
+                Eigen::AngleAxisf(std::acos(-1.0F) / 2, Eigen::Vector3f::UnitZ())) *
+                Eigen::Quaternionf(Eigen::AngleAxisf(frame == 0 ? std::acos(-1.0F) / 2 : 0.0F,
+                    Eigen::Vector3f::UnitX()));
+            quaternions[body * 4] = q.w();
+            quaternions[body * 4 + 1] = q.x();
+            quaternions[body * 4 + 2] = q.y();
+            quaternions[body * 4 + 3] = q.z();
+            linear[body * 3] = 1;
+            angular[body * 3 + 1] = 1;
+        }
+        cnpy::npz_save(path, "joint_pos", joints.data(), {4, joint_count}, "w");
+        cnpy::npz_save(path, "joint_vel", velocities.data(), {4, joint_count}, "a");
+        cnpy::npz_save(path, "body_pos_w", positions.data(), {4, 2, 3}, "a");
+        cnpy::npz_save(path, "body_quat_w", quaternions.data(), {4, 2, 4}, "a");
+        cnpy::npz_save(path, "body_lin_vel_w", linear.data(), {4, 2, 3}, "a");
+        cnpy::npz_save(path, "body_ang_vel_w", angular.data(), {4, 2, 3}, "a");
+        return path;
     }
 
     std::string model;
@@ -323,6 +357,105 @@ void TestInvalidConfiguration(const Fixture &fixture) {
     Reject([&] { Create(config, bad); }, "wrong external goal key must fail");
 }
 
+void TestReferencePlayback(const Fixture &fixture) {
+    const auto path = fixture.WriteMotion();
+    const std::string options =
+        "          reference_file: motion.npz\n"
+        "          anchor_body_index: 1\n"
+        "          motion_fps: 25\n"
+        "          start_mode: manual\n";
+    fixture.WriteConfig("", "0.02", 1, options);
+    const auto config = LoadConfig(fixture.yaml, "probe", std::filesystem::path(path).parent_path());
+    Require(config.reference_file == path && config.manual_start && config.motion_fps == 25,
+        "reference settings and relative resource path");
+    auto policy = Policy(fixture.model);
+    auto adapter = Create(config, policy);
+    rl_policy::PolicyExecutor executor;
+    executor.Init(policy);
+    auto robot = robot_base::RobotData::Create(28);
+    robot.base_quat = {1, 0, 0, 0};
+    robot.joint_pos.assign(28, 0.1);
+    auto tick = [&](double time) {
+        adapter->PrepareInputs(robot, time, executor);
+        Eigen::VectorXf observation;
+        std::vector<double> action;
+        executor.AssembleObs(robot.gyro, robot.rpy, 0, 0, 0,
+            robot.joint_pos, robot.joint_vel, robot.base_quat, {}, 0.02, observation);
+        executor.Infer(observation, action);
+        adapter->OnAction(action);
+        return executor.GetModelOutput("seen_goal");
+    };
+    adapter->Reset(robot);
+    auto goal = tick(45.0);
+    Require(adapter->ReadyForPolicySwitch() && !adapter->PlaybackFinished(), "manual wait state");
+    for (int frame = 0; frame < 10; ++frame) {
+        Near(goal[frame * 66], 0, "wait holds first position throughout the horizon");
+        Near(goal[frame * 66 + 28], 0, "waiting joint velocity");
+        Near(goal[frame * 66 + 57], -1, "reference gravity, not sensor gravity");
+        Near(goal[frame * 66 + 59], 0, "waiting root angular velocity");
+        Near(goal[frame * 66 + 63], 0, "waiting root linear velocity");
+    }
+    Require(adapter->StartPlayback(45.0) && !adapter->StartPlayback(45.1), "start once");
+    goal = tick(45.0);
+    Require(!adapter->ReadyForPolicySwitch(), "active reference blocks handoff");
+    Near(goal[28], 1, "reference joint velocity");
+    Near(goal[59], 1, "world angular velocity rotated by full root orientation");
+    Near(goal[63], -1, "world linear velocity rotated by root heading only");
+    Near(goal[66], 0.02, "20 ms future sampling at 25 fps");
+    Near(goal[66 + 57], -std::sqrt(0.5), "quaternion interpolation gravity y");
+    Near(goal[66 + 58], -std::sqrt(0.5), "quaternion interpolation gravity z");
+    Near(goal[66 + 65], 1.01, "interpolated reference height");
+    Near(goal[9 * 66], 0.12, "future window repeats final position");
+    Near(goal[9 * 66 + 28], 1, "future padding retains the final reference velocity");
+    goal = tick(45.04);
+    Near(goal[0], 0.04, "current reference advances from manual start");
+    goal = tick(45.2);
+    Require(adapter->PlaybackFinished() && adapter->ReadyForPolicySwitch(), "finite clip ends");
+    Near(goal[0], 0.12, "end holds last position");
+    Near(goal[28], 0, "end stops joint velocity");
+    Near(goal[59], 0, "end stops root rotation");
+    Near(goal[63], 0, "end stops root translation");
+    adapter->Reset(robot);
+    goal = tick(46.0);
+    Near(goal[0], 0, "reset restores manual wait and reference clock");
+    Require(!adapter->PlaybackFinished(), "reset clears completion");
+
+    auto loop = config;
+    loop.manual_start = false;
+    loop.loop = true;
+    loop.playback_speed = 0.5;
+    loop.loop_pause = 0.1;
+    adapter = Create(loop, policy);
+    adapter->Reset(robot);
+    goal = tick(0);
+    Near(goal[66], 0.01, "slow playback changes future sampling");
+    Near(goal[28], 0.5, "slow playback scales joint velocity");
+    Near(goal[59], 0.5, "slow playback scales root angular velocity");
+    Near(goal[63], -0.5, "slow playback scales root linear velocity");
+    goal = tick(0.35);
+    Near(goal[0], 0.12, "loop pause holds last position");
+    Near(goal[28], 0, "loop pause stops velocity");
+    Require(!adapter->PlaybackFinished(), "loop is not finite");
+    goal = tick(0.44);
+    Near(goal[0], 0.01, "next cycle begins after pause");
+    adapter->PreparePolicySwitch(true, 0.44);
+    goal = tick(0.85);
+    Near(goal[0], 0.12, "handoff holds final reference across loop boundary");
+    Require(adapter->ReadyForPolicySwitch(), "handoff becomes ready at clip end");
+    adapter->PreparePolicySwitch(false, 0.85);
+    goal = tick(0.9);
+    Near(goal[0], 0.12, "cancelled handoff does not jump back to a running clock");
+
+    auto bad = config;
+    bad.anchor_body_index = 2;
+    Reject([&] { Create(bad, policy); }, "reference body index must be valid");
+    bad = config;
+    bad.playback_speed = 0;
+    Reject([&] { Create(bad, policy); }, "reference speed must be positive");
+    fixture.WriteMotion(27);
+    Reject([&] { Create(config, policy); }, "reference joint shapes must match policy");
+}
+
 }  // namespace
 
 int main() {
@@ -330,7 +463,8 @@ int main() {
         const Fixture fixture;
         TestContract(fixture);
         TestInvalidConfiguration(fixture);
-        std::cout << "SuperMimic static contract, reset, mapping and error paths passed\n";
+        TestReferencePlayback(fixture);
+        std::cout << "SuperMimic history, reference playback and static goal tests passed\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "SuperMimic test failed: " << error.what() << '\n';

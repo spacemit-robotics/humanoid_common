@@ -489,7 +489,7 @@ rl_policy:
 `behavior_manager` 平级的新 common 模块：
 
 1. `model_zoo/rl` 负责推理后端、通用模型 I/O、feedback tensor 和观测项组装。
-2. [`policy_adapter`](src/behavior_manager/policy_adapter/) 负责参考动作读取、时间轴、朝向对齐，以及 ProtoMotions / SONIC 的输入协议。
+2. [`policy_adapter`](src/behavior_manager/policy_adapter/) 负责参考动作读取、时间轴、朝向对齐，以及 ProtoMotions / SONIC / SuperMimic 的输入协议。
 3. 应用层机型仓库只提供模型、参考动作和 YAML 参数，不放 tracker C++ 代码。
 
 `stance_motion` 适配器支持同一个 RL 行为内部按命令选择预加载的站立/运动模型。
@@ -547,6 +547,40 @@ policy_adapter:
   每个 `file` 都指向包含 `joint_pos.csv`、`joint_vel.csv` 和
   `body_quat.csv` 的参考动作目录。两种配置均使用 `future_frames` 和
   `future_step`。
+- SuperMimic：`reference_file` 指向 NPZ，支持 `motion_fps`、`playback_speed`、
+  `loop`、`loop_pause` 和 `start_mode`；不配置参考文件时，使用
+  `rl_default_pos` 与必填的 `reference_height` 生成静止直立目标。
+
+SuperMimic 使用 `obs_hist` 和 `goal` 两个模型输入。观测为十帧 term-major 历史：
+关节角减默认值、关节速度、机体角速度、机体重力、上一帧原始 action；首次观测填满历史。
+`goal` 按时间拼接当前及后九个目标，相邻目标间隔 20 ms。每个目标依次包含
+关节角减默认值、关节速度、参考机体重力、机体系角速度、航向系线速度和根部高度。
+观测通过自定义项 `supermimic_obs` 输入，目标绑定到 external 输入 `supermimic_goal`；
+模型输出为 `actions`。关节数为 N 时，两个输入维度分别为 `10*(3*N+6)` 和 `10*(2*N+10)`。
+模型关节顺序须与机器人一致，策略周期为 0.02 s、`infer_decimation: 1`，
+不额外裁剪或缩放观测，也不平滑模型 action。
+
+参考 NPZ 使用 C-order float32 数组：`joint_pos`、`joint_vel` 为 `[T,N]`，
+`body_pos_w`、`body_lin_vel_w`、`body_ang_vel_w` 为 `[T,B,3]`，
+`body_quat_w` 为 `[T,B,4]`，四元数顺序为 wxyz、表示机体到世界的旋转。
+`anchor_body_index` 指定参考根部，`motion_fps` 指定文件帧率。参考姿态采用四元数插值，
+播放速度同时作用于时间轴和速度目标；未来窗口超过动作末尾时重复末帧，不跨循环取帧。
+手动开始前保持首帧，播放结束或循环暂停时保持末帧，这些保持阶段的速度目标为零。
+运行中请求切换策略时，复用参考动作完成当前周期再交接的规则。
+
+```yaml
+policy_adapter:
+  type: supermimic
+  reference_file: policy/example/motion.npz
+  anchor_body_index: 0
+  motion_fps: 50
+  playback_speed: 1.0
+  loop: false
+  start_mode: manual
+```
+
+模型、关节参数、参考文件及其首帧对应的 `zero_target_pos` 均由机型仓库配置。
+多个动作可以沿用 `policy_actions` 选择各自的策略配置，不需要在 common 中写动作名称。
 
 SONIC 多动作模式复用 HMI 的交互动作页，但与 `joint_trajectory` 的局部关节
 接管不同：切换动作只更新策略的 `reference_obs`，ONNX 输出仍控制全部策略关节。

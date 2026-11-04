@@ -135,7 +135,7 @@ struct Config {
     ReferenceMotionCatalogConfig reference_motion_catalog;
     SonicPlannerConfig sonic_planner;
 
-    // Static SuperMimic goal; joint dimensions come from the policy mapping.
+    // Used for a stationary goal when reference_file is not configured.
     struct SupermimicConfig {
         double reference_height = 0.0;
     } supermimic;

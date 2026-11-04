@@ -121,8 +121,8 @@ cd ~/spacemit_robot
 - `rl_policy.onnx_infer.policies.<name>.target_position_lower / target_position_upper`（可选）：按机器人关节顺序给出目标位置上下限（rad），须同时配置且长度与 `rl_default_pos` 一致；同时省略时禁用
 - `rl_policy.onnx_infer.policies.<name>.target_limit_margin`（可选）：目标位置限位的内缩余量（rad），默认 `0`；`[lower + margin, upper - margin]` 必须为有效区间
 - `rl_policy.onnx_infer.policies.<name>.prerequisite.policy / .duration`（可选）：进入目标策略前运行的策略及持续时间
-- `rl_policy.onnx_infer.policies.<name>.policy_adapter`（可选）：参考动作、特殊模型输入或 RL 内关节轨迹接管；支持 `mjlab`、`protomotions`、`sonic`、`joint_trajectory`
-- `rl_policy.onnx_infer.policies.<name>.policy_adapter.start_mode`（MJLab 可选）：`auto`（默认）或 `manual`；手动模式进入 RL 后保持参考首帧，按 `G` 开始
+- `rl_policy.onnx_infer.policies.<name>.policy_adapter`（可选）：参考动作、特殊模型输入或 RL 内关节轨迹接管；支持 `mjlab`、`protomotions`、`sonic`、`supermimic`、`joint_trajectory`
+- `rl_policy.onnx_infer.policies.<name>.policy_adapter.start_mode`（MJLab / SuperMimic 参考播放可选）：`auto`（默认）或 `manual`；手动模式进入 RL 后保持参考首帧，按 `G` 开始
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.reference_action`（MJLab 可选）：指定采用参考动作与残差合成的关节
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.catalog`（SONIC 可选）：为同一全身策略注册多个参考动作；HMI 选择动作后仅切换 `reference_obs`，不覆盖模型 action
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.planner`（SONIC 可选）：独立线程运行 kinematic planner，将速度命令转换为 tracker 参考；与 `catalog` 互斥，启用后不要求静态 `reference_file`。`model_path`、`runtime`、规划周期 `replan_interval`、提前量 `lookahead` 和输出帧率 `output_fps` 均由 YAML 配置。规划周期包含推理耗时，不在推理结束后再次等待完整周期。

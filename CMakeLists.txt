@@ -622,7 +622,7 @@ if(BUILD_RL)
         target_include_directories(test_supermimic PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager ${RL_INCLUDE_DIR})
         target_link_libraries(test_supermimic PRIVATE
-            behavior_manager robot_base Eigen3::Eigen ${RL_LIB})
+            behavior_manager robot_base Eigen3::Eigen ${RL_LIB} cnpy)
         add_test(NAME supermimic COMMAND test_supermimic)
         set_tests_properties(supermimic PROPERTIES TIMEOUT 15)
         add_executable(test_home_limits example/behavior_manager/test_home_limits.cpp)

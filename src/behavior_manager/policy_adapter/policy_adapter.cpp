@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file policy_adapter.cpp
- * @brief MJLab、ProtoMotions 和 SONIC 策略输入适配
+ * @brief MJLab、ProtoMotions、SONIC 和 SuperMimic 策略输入适配
  */
 
 #include "policy_adapter.h"
@@ -14,6 +14,7 @@
 #include "history_actor_policy_adapter.h"
 
 #include <cnpy.h>
+#include <yaml-cpp/yaml.h>
 
 #include <Eigen/Geometry>
 #include <algorithm>
@@ -23,6 +24,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -207,6 +209,309 @@ void AppendZeros(int count, std::vector<float> &output) {
 double SmoothStep01(double value) {
     const double x = std::clamp(value, 0.0, 1.0);
     return x * x * (3.0 - 2.0 * x);
+}
+
+constexpr std::size_t kFrames = 10;
+constexpr double kPeriod = 0.02;
+
+void Require(bool condition, const char *message) {
+    if (!condition) throw std::runtime_error(std::string("[supermimic] ") + message);
+}
+
+float CheckedFloat(double value) {
+    Require(std::isfinite(value) && std::abs(value) <= std::numeric_limits<float>::max(),
+        "input must be finite and representable as float");
+    return static_cast<float>(value);
+}
+
+YAML::Node AtPath(YAML::Node node, const std::string &path) {
+    std::istringstream parts(path);
+    std::string part;
+    while (std::getline(parts, part, '.')) {
+        Require(node.IsMap(), "invalid adapter configuration path");
+        node.reset(node[part]);
+    }
+    return node;
+}
+
+class SupermimicPolicyAdapter final : public PolicyAdapter {
+public:
+    SupermimicPolicyAdapter(const Config &config,
+        const rl_policy::PolicyExecutorConfig &policy)
+        : config_(config), defaults_(policy.rl_default_pos), joints_(defaults_.size()) {
+        Require(joints_ > 0 && joints_ <= 1024 && policy.action_joint_index.size() == joints_ &&
+            policy.action_scale.size() == joints_, "expected a complete canonical joint mapping");
+        for (std::size_t joint = 0; joint < joints_; ++joint) {
+            Require(policy.action_joint_index[joint] == static_cast<int>(joint),
+                "this contract requires canonical joint order");
+            CheckedFloat(defaults_[joint]);
+            Require(CheckedFloat(policy.action_scale[joint]) > 0.0F,
+                "action scales must be positive");
+        }
+        Require(policy.action_blend_ratio == 1.0 && policy.clip_actions.empty() &&
+            policy.clip_observations.empty(), "clipping or blending changes the model contract");
+        Require(policy.obs_segments.size() == 1 && policy.obs_segments[0].mode.empty() &&
+            policy.obs_segments[0].length == 0 && policy.obs_segments[0].terms ==
+                std::vector<std::string>{"supermimic_obs"}, "expected a single custom observation");
+        const auto dimension = policy.custom_array_dims.find("supermimic_obs");
+        Require(dimension != policy.custom_array_dims.end() &&
+            dimension->second == static_cast<int>((3 * joints_ + 6) * kFrames) &&
+            policy.strict_obs_dim_check, "invalid observation history dimensions");
+        Require(policy.model_io.inputs.size() == 2, "expected obs_hist and goal model inputs");
+        bool observation = false;
+        bool goal = false;
+        for (const auto &input : policy.model_io.inputs) {
+            if (input.name == "obs_hist" &&
+                input.source == rl_policy::ModelInputSource::OBSERVATION &&
+                input.observation_offset <= 0) {
+                observation = true;
+            } else if (input.name == "goal" &&
+                input.source == rl_policy::ModelInputSource::EXTERNAL &&
+                input.key == "supermimic_goal") {
+                goal = true;
+            }
+        }
+        Require(observation && goal, "incorrect model input bindings");
+        int action_outputs = 0;
+        for (const auto &output : policy.model_io.outputs) {
+            if (output.target == rl_policy::ModelOutputTarget::ACTION) {
+                Require(output.name == "actions", "incorrect action output name");
+                ++action_outputs;
+            }
+        }
+        Require(action_outputs == 1, "expected exactly one actions output");
+
+        previous_action_.resize(joints_, 0.0F);
+        sample_.resize(3 * joints_ + 6, 0.0F);
+        history_.resize(sample_.size() * kFrames, 0.0F);
+        goal_.resize((2 * joints_ + 10) * kFrames, 0.0F);
+        if (config_.reference_file.empty()) {
+            const float height = CheckedFloat(config.supermimic.reference_height);
+            Require(height > 0.0F, "reference_height must be positive");
+            Require(!config_.manual_start, "manual start requires a reference_file");
+            for (std::size_t frame = 0; frame < kFrames; ++frame) {
+                const std::size_t start = frame * (2 * joints_ + 10);
+                goal_[start + 2 * joints_ + 2] = -1.0F;
+                goal_[start + 2 * joints_ + 9] = height;
+            }
+        } else {
+            LoadReference();
+        }
+    }
+
+    const char *Type() const override { return "supermimic"; }
+    bool ReadyForPolicySwitch() const override {
+        return reference_.empty() || handoff_.Ready();
+    }
+    bool PlaybackFinished() const override { return handoff_.Finished(); }
+
+    void PreparePolicySwitch(bool requested, double elapsed_s) override {
+        if (!reference_.empty()) {
+            handoff_.Request(requested, elapsed_s - playback_start_elapsed_,
+                static_cast<int>(reference_.size()), config_);
+        }
+    }
+
+    bool StartPlayback(double elapsed_s) override {
+        if (!config_.manual_start || playback_started_ ||
+            !std::isfinite(elapsed_s) || elapsed_s < 0.0) return false;
+        playback_started_ = true;
+        playback_start_elapsed_ = elapsed_s;
+        return true;
+    }
+
+    void Reset(const robot_base::RobotData &robot) override {
+        (void)robot;
+        seeded_ = false;
+        std::fill(previous_action_.begin(), previous_action_.end(), 0.0F);
+        handoff_.Reset();
+        playback_started_ = !config_.manual_start;
+        playback_start_elapsed_ = 0.0;
+    }
+
+    void PrepareInputs(const robot_base::RobotData &robot, double elapsed_s,
+        rl_policy::PolicyExecutor &policy) override {
+        Require(std::isfinite(elapsed_s) && elapsed_s >= 0.0, "invalid elapsed time");
+        Require(policy.ObsDim() == static_cast<int>(history_.size()) &&
+            policy.ActionDim() == static_cast<int>(joints_), "incompatible model dimensions");
+        Require(robot.joint_pos.size() == joints_ && robot.joint_vel.size() == joints_,
+            "incompatible sensor joint dimensions");
+        // Validate the complete sample before advancing persistent history.
+        for (std::size_t joint = 0; joint < joints_; ++joint) {
+            sample_[joint] = CheckedFloat(robot.joint_pos[joint] - defaults_[joint]);
+            sample_[joints_ + joint] = CheckedFloat(robot.joint_vel[joint]);
+        }
+        for (int axis = 0; axis < 3; ++axis)
+            sample_[2 * joints_ + axis] = CheckedFloat(robot.gyro[axis]);
+        for (double component : robot.base_quat) CheckedFloat(component);
+        Eigen::Quaterniond orientation(robot.base_quat[0], robot.base_quat[1],
+            robot.base_quat[2], robot.base_quat[3]);
+        Require(std::abs(orientation.norm() - 1.0) <= 0.01, "invalid unit quaternion");
+        orientation.normalize();
+        const Eigen::Vector3d gravity = orientation.conjugate() * -Eigen::Vector3d::UnitZ();
+        for (int axis = 0; axis < 3; ++axis)
+            sample_[2 * joints_ + 3 + axis] = CheckedFloat(gravity[axis]);
+        std::copy(previous_action_.begin(), previous_action_.end(),
+            sample_.begin() + 2 * joints_ + 6);
+
+        PrepareGoal(elapsed_s);
+        // Model bindings validate the goal size before history is mutated.
+        policy.SetModelInput("supermimic_goal", goal_.data(), static_cast<int>(goal_.size()));
+        const std::array<std::size_t, 5> widths = {joints_, joints_, 3, 3, joints_};
+        std::size_t offset = 0;
+        for (const std::size_t width : widths) {
+            auto begin = history_.begin() + offset * kFrames;
+            if (seeded_) std::rotate(begin, begin + width, begin + width * kFrames);
+            const std::size_t first = seeded_ ? kFrames - 1 : 0;
+            for (std::size_t frame = first; frame < kFrames; ++frame)
+                std::copy_n(sample_.begin() + offset, width, begin + frame * width);
+            offset += width;
+        }
+        seeded_ = true;
+        policy.SetCustomArray("supermimic_obs", history_.data(), static_cast<int>(history_.size()));
+    }
+
+    void OnAction(std::vector<double> &action) override {
+        Require(action.size() == joints_, "invalid raw action dimensions");
+        for (double value : action) CheckedFloat(value);
+        std::transform(action.begin(), action.end(), previous_action_.begin(),
+            [](double value) { return static_cast<float>(value); });
+    }
+
+private:
+    struct ReferenceFrame {
+        std::vector<float> joint_pos;
+        std::vector<float> joint_vel;
+        Eigen::Quaternionf orientation;
+        Eigen::Vector3f linear_velocity;
+        Eigen::Vector3f angular_velocity;
+        float height = 0.0F;
+    };
+
+    void LoadReference() {
+        Require(std::isfinite(config_.motion_fps) && config_.motion_fps > 0.0 &&
+            std::isfinite(config_.playback_speed) && config_.playback_speed > 0.0 &&
+            std::isfinite(config_.loop_pause) && config_.loop_pause >= 0.0,
+            "invalid reference playback timing");
+        const auto positions = cnpy::npz_load(config_.reference_file, "joint_pos");
+        const auto velocities = cnpy::npz_load(config_.reference_file, "joint_vel");
+        const auto body_positions = cnpy::npz_load(config_.reference_file, "body_pos_w");
+        const auto orientations = cnpy::npz_load(config_.reference_file, "body_quat_w");
+        const auto linear = cnpy::npz_load(config_.reference_file, "body_lin_vel_w");
+        const auto angular = cnpy::npz_load(config_.reference_file, "body_ang_vel_w");
+        for (const auto *array : {&positions, &velocities, &body_positions,
+                &orientations, &linear, &angular}) {
+            Require(array->word_size == sizeof(float) && !array->fortran_order,
+                "reference arrays must be C-order float32");
+        }
+        Require(positions.shape.size() == 2 && positions.shape[0] > 0 &&
+            positions.shape[0] <= static_cast<std::size_t>(std::numeric_limits<int>::max()) &&
+            positions.shape[1] == joints_ && velocities.shape == positions.shape,
+            "joint_pos and joint_vel must have shape [T, policy joints]");
+        const std::size_t frames = positions.shape[0];
+        Require(body_positions.shape.size() == 3 && body_positions.shape[0] == frames &&
+            body_positions.shape[2] == 3 && linear.shape == body_positions.shape &&
+            angular.shape == body_positions.shape,
+            "body position and velocities must have matching shapes [T, B, 3]");
+        const std::size_t bodies = body_positions.shape[1];
+        Require(orientations.shape == std::vector<std::size_t>{frames, bodies, 4},
+            "body_quat_w must have shape [T, B, 4]");
+        Require(config_.anchor_body_index >= 0 &&
+            static_cast<std::size_t>(config_.anchor_body_index) < bodies,
+            "anchor_body_index must select the reference root body");
+        reference_.resize(frames);
+        for (std::size_t frame = 0; frame < frames; ++frame) {
+            auto &out = reference_[frame];
+            out.joint_pos.resize(joints_);
+            out.joint_vel.resize(joints_);
+            for (std::size_t joint = 0; joint < joints_; ++joint) {
+                out.joint_pos[joint] = CheckedFloat(positions.data<float>()[frame * joints_ + joint]);
+                out.joint_vel[joint] = CheckedFloat(velocities.data<float>()[frame * joints_ + joint]);
+            }
+            const std::size_t body = frame * bodies + config_.anchor_body_index;
+            const float *q = orientations.data<float>() + body * 4;
+            for (int axis = 0; axis < 4; ++axis) CheckedFloat(q[axis]);
+            out.orientation = Eigen::Quaternionf(q[0], q[1], q[2], q[3]);
+            Require(std::abs(out.orientation.norm() - 1.0F) <= 0.01F,
+                "reference root quaternion must be unit length (wxyz)");
+            out.orientation.normalize();
+            out.height = CheckedFloat(body_positions.data<float>()[body * 3 + 2]);
+            for (int axis = 0; axis < 3; ++axis) {
+                out.linear_velocity[axis] = CheckedFloat(linear.data<float>()[body * 3 + axis]);
+                out.angular_velocity[axis] = CheckedFloat(angular.data<float>()[body * 3 + axis]);
+            }
+        }
+    }
+
+    void PrepareGoal(double elapsed_s) {
+        if (reference_.empty()) return;
+        const bool waiting = !playback_started_;
+        const auto sample = handoff_.Sample(elapsed_s - playback_start_elapsed_,
+            static_cast<int>(reference_.size()), config_, waiting);
+        const bool held = waiting || sample.hold_last_frame;
+        const double speed = held ? 0.0 : config_.playback_speed;
+        for (std::size_t future = 0; future < kFrames; ++future) {
+            // Match the model's 20 ms horizon; future samples clamp at this clip's end.
+            const double position = std::min(sample.frame0 + static_cast<double>(sample.alpha) +
+                future * kPeriod * config_.motion_fps * speed, reference_.size() - 1.0);
+            const std::size_t first = static_cast<std::size_t>(std::floor(position));
+            const std::size_t second = std::min(first + 1, reference_.size() - 1);
+            const float alpha = static_cast<float>(position - first);
+            const auto &a = reference_[first];
+            const auto &b = reference_[second];
+            float *out = goal_.data() + future * (2 * joints_ + 10);
+            for (std::size_t joint = 0; joint < joints_; ++joint) {
+                out[joint] = CheckedFloat((1.0 - alpha) * a.joint_pos[joint] +
+                    alpha * b.joint_pos[joint] - defaults_[joint]);
+                out[joints_ + joint] = CheckedFloat(speed *
+                    ((1.0 - alpha) * a.joint_vel[joint] + alpha * b.joint_vel[joint]));
+            }
+            const auto orientation = a.orientation.slerp(alpha, b.orientation).normalized();
+            const Eigen::Vector3f gravity = orientation.conjugate() * -Eigen::Vector3f::UnitZ();
+            const Eigen::Vector3f gyro = orientation.conjugate() *
+                ((1.0F - alpha) * a.angular_velocity + alpha * b.angular_velocity);
+            const Eigen::Vector3f velocity = YawQuaternion(QuaternionYaw(orientation)).conjugate() *
+                ((1.0F - alpha) * a.linear_velocity + alpha * b.linear_velocity);
+            for (int axis = 0; axis < 3; ++axis) {
+                out[2 * joints_ + axis] = gravity[axis];
+                out[2 * joints_ + 3 + axis] = CheckedFloat(speed * gyro[axis]);
+                out[2 * joints_ + 6 + axis] = CheckedFloat(speed * velocity[axis]);
+            }
+            out[2 * joints_ + 9] = (1.0F - alpha) * a.height + alpha * b.height;
+        }
+    }
+
+    Config config_;
+    std::vector<double> defaults_;
+    const std::size_t joints_;
+    std::vector<float> previous_action_;
+    std::vector<float> sample_;
+    std::vector<float> history_;
+    std::vector<float> goal_;
+    bool seeded_ = false;
+    std::vector<ReferenceFrame> reference_;
+    ReferenceHandoff handoff_;
+    bool playback_started_ = true;
+    double playback_start_elapsed_ = 0.0;
+};
+
+Config::SupermimicConfig LoadSupermimicConfig(
+    const std::string &yaml_path, const std::string &base) {
+    const YAML::Node root = YAML::LoadFile(yaml_path);
+    const YAML::Node adapter = AtPath(root, base);
+    Config::SupermimicConfig settings;
+    if (!adapter["reference_file"]) {
+        settings.reference_height = adapter["reference_height"].as<double>();
+        Require(CheckedFloat(settings.reference_height) > 0.0F,
+            "reference_height must be a finite positive float");
+    }
+    const double period = root["rl_policy"]["rl_dt"].as<double>();
+    Require(std::isfinite(period) && std::abs(period - kPeriod) < 1.0e-9,
+        "this model requires rl_dt = 0.02 (50 Hz)");
+    const YAML::Node policy = AtPath(root, base.substr(0, base.rfind('.')));
+    Require(policy["infer_decimation"].as<int>() == 1,
+        "this model requires infer_decimation = 1");
+    return settings;
 }
 
 class MjlabPolicyAdapter final : public PolicyAdapter {
@@ -1515,6 +1820,9 @@ Config LoadConfig(const std::string &yaml_path,
     }
     if (type) {
         config.type = *type;
+        if (config.type == "supermimic") {
+            config.supermimic = LoadSupermimicConfig(yaml_path, adapter_base);
+        }
         if (config.type == "history_actor") {
             config.history_actor = LoadHistoryActorConfig(yaml_path, adapter_base, robot_dir);
             return config;
@@ -1722,7 +2030,8 @@ Config LoadConfig(const std::string &yaml_path,
                     "[policy_adapter] SONIC default_action 不在动作目录中: " +
                     motion_catalog.default_action);
             }
-        } else if (!config.sonic_planner.Enabled()) {
+        } else if (!config.sonic_planner.Enabled() &&
+            (config.type != "supermimic" || yaml.Read<std::string>(adapter_base + ".reference_file"))) {
             config.reference_file =
                 ReadReferenceField(yaml, adapter_base, robot_dir);
         }
@@ -1794,6 +2103,9 @@ std::unique_ptr<PolicyAdapter> Create(
     const rl_policy::PolicyExecutorConfig &policy_config) {
     if (!config.Enabled()) {
         return nullptr;
+    }
+    if (config.type == "supermimic") {
+        return std::make_unique<SupermimicPolicyAdapter>(config, policy_config);
     }
     if (config.type == "stance_motion") {
         return CreateStanceMotionPolicyAdapter(config, policy_config);

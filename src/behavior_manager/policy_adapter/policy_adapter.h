@@ -135,6 +135,11 @@ struct Config {
     ReferenceMotionCatalogConfig reference_motion_catalog;
     SonicPlannerConfig sonic_planner;
 
+    // Used for a stationary goal when reference_file is not configured.
+    struct SupermimicConfig {
+        double reference_height = 0.0;
+    } supermimic;
+
     struct HistoryActorConfig {
         struct Motion {
             std::string name;

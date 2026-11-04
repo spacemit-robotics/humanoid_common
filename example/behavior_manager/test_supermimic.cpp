@@ -298,7 +298,7 @@ void TestInvalidConfiguration(const Fixture &fixture) {
     Reject([&] { Create(config, bad); }, "wrong default position dimensions must fail");
     bad = valid;
     bad.action_scale = {0.25};
-    Reject([&] { Create(config, bad); }, "checkpoint requires per-joint action scaling");
+    Reject([&] { Create(config, bad); }, "requires per-joint action scaling");
     bad = valid;
     bad.action_scale[0] = std::numeric_limits<double>::quiet_NaN();
     Reject([&] { Create(config, bad); }, "nonfinite action scale must fail");

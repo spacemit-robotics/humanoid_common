@@ -106,6 +106,8 @@ RLConfig LoadRLStateConfig(const std::string &yaml_path,
     config.zero_target_pos =
         yaml.Read<std::vector<double>>(base + ".zero_target_pos")
             .value_or(std::vector<double>{});
+    config.joint_names = yaml.Read<std::vector<std::string>>("robot_base.joint_names")
+        .value_or(std::vector<std::string>{});
     config.entry_target_transition_duration =
         yaml.Read<double>(base + ".entry_target_transition_duration")
             .value_or(0.0);

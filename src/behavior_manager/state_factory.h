@@ -93,6 +93,7 @@ struct RLConfig {
     std::vector<double> target_position_lower;
     std::vector<double> target_position_upper;
     double target_limit_margin = 0.0;
+    std::vector<std::string> joint_names;  // robot_base.joint_names，仅用于截幅诊断
 
     // ---- RL 策略增益 ----
     std::vector<double> kp;

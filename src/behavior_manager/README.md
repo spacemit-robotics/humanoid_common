@@ -120,6 +120,7 @@ cd ~/spacemit_robot
 - `behavior_manager.policy_switch.timeout_s`（可选）：后台准备与交接等待上限，默认 30 秒；超时取消本次请求，当前策略继续运行
 - `rl_policy.onnx_infer.policies.<name>.target_position_lower / target_position_upper`（可选）：按机器人关节顺序给出目标位置上下限（rad），须同时配置且长度与 `rl_default_pos` 一致；同时省略时禁用
 - `rl_policy.onnx_infer.policies.<name>.target_limit_margin`（可选）：目标位置限位的内缩余量（rad），默认 `0`；`[lower + margin, upper - margin]` 必须为有效区间
+  超出范围的目标会被截到边界后继续下发，不触发故障。每个被截幅的动作计入 `clamped_actions`；`events.log` 最多每秒一条 `RL target clamped` 警告，给出超出最多的关节、原目标、边界和超出量；开启策略追踪时 `control_policy_apply_<策略>.csv` 末尾追加 `clamped_joints`、`clamp_joint_index`、`clamp_max_excess`、`clamped_actions` 四列
 - `rl_policy.onnx_infer.policies.<name>.prerequisite.policy / .duration`（可选）：进入目标策略前运行的策略及持续时间
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter`（可选）：参考动作、特殊模型输入或 RL 内关节轨迹接管；支持 `mjlab`、`protomotions`、`sonic`、`supermimic`、`joint_trajectory`
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.start_mode`（MJLab / SuperMimic 参考播放可选）：`auto`（默认）或 `manual`；手动模式进入 RL 后保持参考首帧，按 `G` 开始

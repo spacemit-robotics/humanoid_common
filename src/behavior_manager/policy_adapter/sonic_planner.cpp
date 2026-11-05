@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -285,7 +286,8 @@ public:
         planner_policy_.ClearInferenceTermination();
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            motion_ = std::make_shared<const SonicPlannerMotion>(BuildSeedMotion(robot));
+            std::atomic_store(&motion_,
+                std::make_shared<const SonicPlannerMotion>(BuildSeedMotion(robot)));
             latest_robot_ = robot;
             latest_command_ = {};
             latest_elapsed_s_ = 0.0;
@@ -297,17 +299,21 @@ public:
             idle_ = false;
             idle_ready_at_s_ = 0.0;
             error_.clear();
+            failed_.store(false, std::memory_order_release);
             running_ = true;
         }
         worker_ = std::thread(&Impl::PlannerLoop, this);
     }
 
+    // Tracker side: never waits for the planner thread, which may run at a
+    // lower priority. A skipped update is retried on the next tracker step.
     void Update(const robot_base::RobotData &robot,
         const robot_base::Command &command,
         double elapsed_s) {
         bool command_changed = false;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+            if (!lock.owns_lock()) return;
             command_changed = CommandChanged(
                 latest_command_, command, config_.command_epsilon);
             latest_robot_ = robot;
@@ -324,9 +330,11 @@ public:
     }
 
     std::shared_ptr<const SonicPlannerMotion> Motion() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!error_.empty()) throw std::runtime_error(error_);
-        return motion_;
+        if (failed_.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            throw std::runtime_error(error_);
+        }
+        return std::atomic_load(&motion_);
     }
 
     void RequestStop() {
@@ -339,8 +347,8 @@ public:
     }
 
     bool Idle() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return idle_ && published_generation_ == request_generation_ &&
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        return lock.owns_lock() && idle_ && published_generation_ == request_generation_ &&
             latest_elapsed_s_ >= idle_ready_at_s_;
     }
 
@@ -695,8 +703,9 @@ private:
         config_.thread.Apply();
         std::uint64_t handled_generation = 0;
         auto next_periodic = std::chrono::steady_clock::now();
+        // Reused across plans so copying the snapshot under the lock does not allocate.
+        robot_base::RobotData robot;
         while (true) {
-            robot_base::RobotData robot;
             robot_base::Command command;
             double elapsed_s = 0.0;
             std::shared_ptr<const SonicPlannerMotion> source;
@@ -725,7 +734,7 @@ private:
                 robot = latest_robot_;
                 command = latest_command_;
                 elapsed_s = latest_elapsed_s_;
-                source = motion_;
+                source = std::atomic_load(&motion_);
                 handled_generation = request_generation_;
             }
 
@@ -750,7 +759,7 @@ private:
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (!running_) return;
-                    motion_.swap(next_motion);
+                    std::atomic_store(&motion_, std::move(next_motion));
                     idle_ = SelectMode(command) == 0;
                     idle_ready_at_s_ = MotionEndTime(generated, config_.output_fps);
                     published_generation_ = handled_generation;
@@ -761,6 +770,7 @@ private:
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (!running_) return;
                 error_ = std::string("[sonic_planner] inference failed: ") + error.what();
+                failed_.store(true, std::memory_order_release);
                 running_ = false;
                 return;
             }
@@ -841,6 +851,8 @@ private:
     bool idle_ = false;
     double idle_ready_at_s_ = 0.0;
     std::string error_;
+    std::atomic<bool> failed_{false};
+    // Published with std::atomic_store so the tracker reads it without mutex_.
     std::shared_ptr<const SonicPlannerMotion> motion_;
 };
 

@@ -1073,6 +1073,42 @@ void TestSonicPlannerScheduling(PlannerPlacement placement) {
     }).get();
 }
 
+// The tracker thread must not wait for a planner that is busy or starved:
+// publication is lock-free for readers and Update skips while the planner
+// holds its state lock.
+void TestSonicPlannerTrackerDoesNotBlock() {
+    using behavior_manager::policy_adapter::SonicPlanner;
+    using behavior_manager::policy_adapter::SonicPlannerConfig;
+    const TempSonicOnnx model(kPlannerContextRepeatOnnx);
+    SonicPlannerConfig config;
+    config.enabled = true;
+    config.model_path = model.Path().string();
+    config.runtime.provider = "cpu";
+    config.runtime.threads = 1;
+    SonicPlanner planner(config, MakeSonicPolicyConfig(29));
+    auto robot = robot_base::RobotData::Create(29);
+    planner.Reset(robot);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (planner.Motion()->frames.size() == 100 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // Hammer the tracker-facing calls while commands keep the planner busy.
+    double worst_ms = 0.0;
+    for (int i = 0; i < 2000; ++i) {
+        robot_base::Command command;
+        command.vx = (i % 2) ? 0.2F : 0.0F;
+        const auto start = std::chrono::steady_clock::now();
+        planner.Update(robot, command, 0.002 * i);
+        const auto motion = planner.Motion();
+        static_cast<void>(planner.Idle());
+        worst_ms = std::max(worst_ms, std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count());
+        Require(motion && !motion->frames.empty(), "tracker read an empty plan");
+    }
+    planner.RequestStop();
+    Require(worst_ms < 5.0, "tracker-facing planner calls blocked for " +
+        std::to_string(worst_ms) + " ms");
+}
+
 // One joint, 50 fps; position follows `value` so blends are easy to read back.
 behavior_manager::policy_adapter::SonicPlannerMotion ConstantMotion(
     double start_s, int frames, float value) {
@@ -1667,6 +1703,7 @@ int main(int argc, char **argv) {
         TestSonicPlannerScheduling(PlannerPlacement::kWorkerAffinity);
         TestSonicPlannerScheduling(PlannerPlacement::kIdle);
         TestSonicPlannerLateBlend();
+        TestSonicPlannerTrackerDoesNotBlock();
         TestSonicPrepareInputs();
         TestSonicMotionCatalogPlayback();
         TestJointTrajectoryTakeover();

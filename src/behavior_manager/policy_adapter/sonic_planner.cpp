@@ -708,6 +708,7 @@ private:
         while (true) {
             robot_base::Command command;
             double elapsed_s = 0.0;
+            bool source_idle = false;
             std::shared_ptr<const SonicPlannerMotion> source;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
@@ -735,6 +736,8 @@ private:
                 command = latest_command_;
                 elapsed_s = latest_elapsed_s_;
                 source = std::atomic_load(&motion_);
+                // Seed and standing plans are static; holding their last frame is expected.
+                source_idle = idle_ || plan_count_ == 0;
                 handled_generation = request_generation_;
             }
 
@@ -765,7 +768,8 @@ private:
                     published_generation_ = handled_generation;
                 }
                 ++plan_count_;
-                RecordPlan(command, elapsed_s, publish_time_s, infer_ms, generated, blend);
+                RecordPlan(command, elapsed_s, publish_time_s, infer_ms, generated, blend,
+                    source_idle);
             } catch (const std::exception &error) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (!running_) return;
@@ -785,7 +789,7 @@ private:
     // warning when inference outlasted the lookahead budget.
     void RecordPlan(const robot_base::Command &command, double request_time_s,
         double publish_time_s, double infer_ms, const SonicPlannerMotion &generated,
-        const SonicPlannerBlend &blend) {
+        const SonicPlannerBlend &blend, bool source_idle) {
         const int mode = SelectMode(command);
         std::ostringstream row;
         row << std::fixed << std::setprecision(6)
@@ -796,10 +800,12 @@ private:
             << publish_time_s << ',' << generated.start_time_s << ','
             << MotionEndTime(generated, config_.output_fps) << ',' << infer_ms << ','
             << generated.frames.size() << ',' << blend.late_s << ',' << blend.stale_s
-            << ',' << blend.blend_frames << ',' << (blend.expired ? 1 : 0);
+            << ',' << blend.blend_frames << ',' << (blend.expired ? 1 : 0)
+            << ',' << (source_idle ? 1 : 0);
         runtime_logging::RecordCsv("control_sonic_planner",
             "wall_time_s,plan,mode,vx,vy,wz,request_time_s,publish_time_s,"
-            "plan_start_s,plan_end_s,infer_ms,frames,late_s,stale_s,blend_frames,expired",
+            "plan_start_s,plan_end_s,infer_ms,frames,late_s,stale_s,blend_frames,expired,"
+            "source_static",
             row.str());
         if (plan_count_ == 1) {
             std::ostringstream detail;
@@ -808,7 +814,10 @@ private:
                 << ", infer_ms=" << infer_ms;
             runtime_logging::Log(runtime_logging::Level::kInfo, detail.str(), false);
         }
-        if (blend.late_s <= 0.0 && blend.stale_s <= 0.0 && !blend.expired) return;
+        // Holding the last frame of a static plan is normal; only a moving
+        // reference that ran out before the next plan arrived is a stall.
+        const double stalled_s = source_idle ? 0.0 : blend.stale_s;
+        if (blend.late_s <= 0.0 && stalled_s <= 0.0 && !blend.expired) return;
         const auto now = std::chrono::steady_clock::now();
         ++late_plans_;
         if (late_plans_ > 1 && now - last_late_report_ < std::chrono::seconds(10)) return;
@@ -817,7 +826,7 @@ private:
             << "SONIC planner plan published late: plan=" << plan_count_
             << ", infer_ms=" << infer_ms << ", lookahead_ms=" << config_.lookahead * 1000.0
             << ", late_ms=" << blend.late_s * 1000.0
-            << ", reference_stalled_ms=" << blend.stale_s * 1000.0
+            << ", reference_stalled_ms=" << stalled_s * 1000.0
             << ", expired=" << (blend.expired ? 1 : 0) << ", late_plans=" << late_plans_;
         runtime_logging::Log(runtime_logging::Level::kWarning, detail.str(), false);
         last_late_report_ = now;

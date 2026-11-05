@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "runtime_logger.h"
+#include "snapshot_worker.h"
 
 namespace behavior_manager {
 namespace policy_adapter {
@@ -275,6 +276,8 @@ public:
         }
         ValidateConfig();
         ValidateJointMapping();
+        plan_log_ = std::make_unique<runtime_logging::SnapshotWorker<PlanRecord, 16>>(
+            [this](const PlanRecord &record) { LogPlan(record); });
         LoadModel();
     }
 
@@ -294,7 +297,6 @@ public:
             has_snapshot_ = true;
             request_generation_ = 1;
             plan_count_ = 0;
-            late_plans_ = 0;
             published_generation_ = 0;
             idle_ = false;
             idle_ready_at_s_ = 0.0;
@@ -785,49 +787,80 @@ private:
         }
     }
 
-    // Planner worker only: one CSV row per published plan, plus a rate-limited
-    // warning when inference outlasted the lookahead budget.
+    // Plain values handed from the planner thread to a background formatter, so
+    // the low-priority planner never holds the logger's locks.
+    struct PlanRecord {
+        double wall_s = 0.0, request_s = 0.0, publish_s = 0.0, start_s = 0.0, end_s = 0.0;
+        double vx = 0.0, vy = 0.0, wz = 0.0, infer_ms = 0.0, late_s = 0.0, stale_s = 0.0;
+        std::uint64_t plan = 0;
+        int mode = 0, frames = 0, blend_frames = 0;
+        bool expired = false, source_static = false;
+    };
+
+    // Planner worker only.
     void RecordPlan(const robot_base::Command &command, double request_time_s,
         double publish_time_s, double infer_ms, const SonicPlannerMotion &generated,
         const SonicPlannerBlend &blend, bool source_idle) {
-        const int mode = SelectMode(command);
+        PlanRecord record;
+        record.wall_s = std::chrono::duration<double>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        record.plan = plan_count_;
+        record.mode = SelectMode(command);
+        record.vx = command.vx;
+        record.vy = command.vy;
+        record.wz = command.wz;
+        record.request_s = request_time_s;
+        record.publish_s = publish_time_s;
+        record.start_s = generated.start_time_s;
+        record.end_s = MotionEndTime(generated, config_.output_fps);
+        record.infer_ms = infer_ms;
+        record.frames = static_cast<int>(generated.frames.size());
+        record.late_s = blend.late_s;
+        record.stale_s = blend.stale_s;
+        record.blend_frames = blend.blend_frames;
+        record.expired = blend.expired;
+        record.source_static = source_idle;
+        plan_log_->Publish(record);
+    }
+
+    // Formatter thread only: one CSV row per published plan and a warning,
+    // at most every 10 s, when inference outlasted the lookahead budget.
+    void LogPlan(const PlanRecord &record) {
         std::ostringstream row;
         row << std::fixed << std::setprecision(6)
-            << std::chrono::duration<double>(
-                std::chrono::system_clock::now().time_since_epoch()).count()
-            << ',' << plan_count_ << ',' << mode << ',' << command.vx << ','
-            << command.vy << ',' << command.wz << ',' << request_time_s << ','
-            << publish_time_s << ',' << generated.start_time_s << ','
-            << MotionEndTime(generated, config_.output_fps) << ',' << infer_ms << ','
-            << generated.frames.size() << ',' << blend.late_s << ',' << blend.stale_s
-            << ',' << blend.blend_frames << ',' << (blend.expired ? 1 : 0)
-            << ',' << (source_idle ? 1 : 0);
+            << record.wall_s << ',' << record.plan << ',' << record.mode << ',' << record.vx
+            << ',' << record.vy << ',' << record.wz << ',' << record.request_s << ','
+            << record.publish_s << ',' << record.start_s << ',' << record.end_s << ','
+            << record.infer_ms << ',' << record.frames << ',' << record.late_s << ','
+            << record.stale_s << ',' << record.blend_frames << ',' << (record.expired ? 1 : 0)
+            << ',' << (record.source_static ? 1 : 0);
         runtime_logging::RecordCsv("control_sonic_planner",
             "wall_time_s,plan,mode,vx,vy,wz,request_time_s,publish_time_s,"
             "plan_start_s,plan_end_s,infer_ms,frames,late_s,stale_s,blend_frames,expired,"
             "source_static",
             row.str());
-        if (plan_count_ == 1) {
+        if (record.plan == 1) {
+            late_plans_ = 0;
             std::ostringstream detail;
             detail << std::fixed << std::setprecision(1)
-                << "SONIC planner first plan published: mode=" << mode
-                << ", infer_ms=" << infer_ms;
+                << "SONIC planner first plan published: mode=" << record.mode
+                << ", infer_ms=" << record.infer_ms;
             runtime_logging::Log(runtime_logging::Level::kInfo, detail.str(), false);
         }
         // Holding the last frame of a static plan is normal; only a moving
         // reference that ran out before the next plan arrived is a stall.
-        const double stalled_s = source_idle ? 0.0 : blend.stale_s;
-        if (blend.late_s <= 0.0 && stalled_s <= 0.0 && !blend.expired) return;
+        const double stalled_s = record.source_static ? 0.0 : record.stale_s;
+        if (record.late_s <= 0.0 && stalled_s <= 0.0 && !record.expired) return;
         const auto now = std::chrono::steady_clock::now();
         ++late_plans_;
         if (late_plans_ > 1 && now - last_late_report_ < std::chrono::seconds(10)) return;
         std::ostringstream detail;
         detail << std::fixed << std::setprecision(1)
-            << "SONIC planner plan published late: plan=" << plan_count_
-            << ", infer_ms=" << infer_ms << ", lookahead_ms=" << config_.lookahead * 1000.0
-            << ", late_ms=" << blend.late_s * 1000.0
+            << "SONIC planner plan published late: plan=" << record.plan
+            << ", infer_ms=" << record.infer_ms << ", lookahead_ms=" << config_.lookahead * 1000.0
+            << ", late_ms=" << record.late_s * 1000.0
             << ", reference_stalled_ms=" << stalled_s * 1000.0
-            << ", expired=" << (blend.expired ? 1 : 0) << ", late_plans=" << late_plans_;
+            << ", expired=" << (record.expired ? 1 : 0) << ", late_plans=" << late_plans_;
         runtime_logging::Log(runtime_logging::Level::kWarning, detail.str(), false);
         last_late_report_ = now;
     }
@@ -854,8 +887,8 @@ private:
     double latest_elapsed_s_ = 0.0;
     std::uint64_t request_generation_ = 0;
     std::uint64_t plan_count_ = 0;
-    std::uint64_t late_plans_ = 0;
-    std::chrono::steady_clock::time_point last_late_report_;
+    std::uint64_t late_plans_ = 0;  // formatter thread only
+    std::chrono::steady_clock::time_point last_late_report_;  // formatter thread only
     std::uint64_t published_generation_ = 0;
     bool idle_ = false;
     double idle_ready_at_s_ = 0.0;
@@ -863,6 +896,8 @@ private:
     std::atomic<bool> failed_{false};
     // Published with std::atomic_store so the tracker reads it without mutex_.
     std::shared_ptr<const SonicPlannerMotion> motion_;
+    // Declared last: stops before the members its formatter reads are destroyed.
+    std::unique_ptr<runtime_logging::SnapshotWorker<PlanRecord, 16>> plan_log_;
 };
 
 SonicPlanner::SonicPlanner(const SonicPlannerConfig &config,

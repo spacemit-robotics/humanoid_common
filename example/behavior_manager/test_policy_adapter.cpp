@@ -950,9 +950,14 @@ void TestSonicPlannerConfig() {
     Require(rejected, "planner must reject a non-permutation joint mapping");
 }
 
+// Threads of this process, excluding background log formatters.
 std::set<int> NativeThreadIds() {
     std::set<int> threads;
     for (const auto &entry : fs::directory_iterator("/proc/self/task")) {
+        std::ifstream comm(entry.path() / "comm");
+        std::string name;
+        std::getline(comm, name);
+        if (name == "log_format") continue;
         threads.insert(std::stoi(entry.path().filename().string()));
     }
     return threads;

@@ -42,7 +42,12 @@ namespace behavior_manager {
 
 class StateRL : public State {
 public:
-    ~StateRL() override { StopInference(); trace_worker_.reset(); progress_worker_.reset(); }
+    ~StateRL() override {
+        StopInference();
+        trace_worker_.reset();
+        progress_worker_.reset();
+        clamp_worker_.reset();
+    }
 
     void SetConfig(const RLConfig &cfg) {
         ValidateRLTargetPositionLimits(cfg);
@@ -118,6 +123,11 @@ public:
         clamped_actions_ = 0;
         clamped_actions_reported_ = 0;
         last_clamp_report_ = {};
+        clamp_worker_.reset();
+        if (!config_.target_position_lower.empty()) {
+            clamp_worker_ = std::make_unique<runtime_logging::SnapshotWorker<ClampReport, 4>>(
+                [this](const ClampReport &report) { LogClampReport(report); });
+        }
         infer_count_window_ = 0;
         time_since_last_infer_ = 0.0f;
         new_data_ready_ = false;
@@ -514,22 +524,16 @@ private:
     }
 
     // Control thread only. Keeps the policy running and reports at most once
-    // per second how far it asked beyond the hardware envelope.
+    // per second how far it asked beyond the hardware envelope. The report is
+    // handed to a background formatter: the control loop never formats text
+    // or waits for the logger.
     void RecordClampedTargets(RLRuntimeClock::time_point now) {
         ++clamped_actions_;
         if (clamp_stats_.excess > clamp_window_.excess) clamp_window_ = clamp_stats_;
         if (clamped_actions_reported_ != 0 &&
             now - last_clamp_report_ < std::chrono::seconds(1)) return;
-        const std::string joint = clamp_window_.joint < config_.joint_names.size()
-            ? config_.joint_names[clamp_window_.joint] : std::to_string(clamp_window_.joint);
-        std::ostringstream detail;
-        detail << std::fixed << std::setprecision(4)
-            << "RL target clamped: policy=" << config_.policy_name << ", joint=" << joint
-            << ", target=" << clamp_window_.target << ", limit=" << clamp_window_.limit
-            << ", excess=" << clamp_window_.excess << ", joints=" << clamp_window_.joints
-            << ", clamped_actions=" << clamped_actions_
-            << " (+" << clamped_actions_ - clamped_actions_reported_ << ")";
-        runtime_logging::Log(runtime_logging::Level::kWarning, detail.str(), false);
+        if (!clamp_worker_ || !clamp_worker_->Publish({clamp_window_, clamped_actions_,
+                clamped_actions_ - clamped_actions_reported_})) return;
         clamped_actions_reported_ = clamped_actions_;
         last_clamp_report_ = now;
         clamp_window_ = {};
@@ -827,6 +831,36 @@ private:
     std::uint64_t clamped_actions_ = 0;
     std::uint64_t clamped_actions_reported_ = 0;
     RLRuntimeClock::time_point last_clamp_report_;
+    struct ClampReport {
+        TargetClampStats worst;
+        std::uint64_t clamped_actions = 0, since_last = 0;
+    };
+    std::unique_ptr<runtime_logging::SnapshotWorker<ClampReport, 4>> clamp_worker_;
+
+    // Background formatter thread only.
+    void LogClampReport(const ClampReport &report) const {
+        const auto &worst = report.worst;
+        const std::string joint = worst.joint < config_.joint_names.size()
+            ? config_.joint_names[worst.joint] : std::to_string(worst.joint);
+        std::ostringstream detail;
+        detail << std::fixed << std::setprecision(4)
+            << "RL target clamped: policy=" << config_.policy_name << ", joint=" << joint
+            << ", target=" << worst.target << ", limit=" << worst.limit
+            << ", excess=" << worst.excess << ", joints=" << worst.joints
+            << ", clamped_actions=" << report.clamped_actions << " (+" << report.since_last << ")";
+        // The event line is best effort; the CSV row is queued even under contention.
+        runtime_logging::Log(runtime_logging::Level::kWarning, detail.str(), false);
+        std::ostringstream row;
+        row << std::fixed << std::setprecision(6)
+            << std::chrono::duration<double>(
+                std::chrono::system_clock::now().time_since_epoch()).count()
+            << ',' << config_.policy_name << ',' << joint << ',' << worst.target << ','
+            << worst.limit << ',' << worst.excess << ',' << worst.joints << ','
+            << report.clamped_actions << ',' << report.since_last;
+        runtime_logging::RecordCsv("control_target_clamp",
+            "wall_time_s,policy,joint,target,limit,excess,clamped_joints,clamped_actions,since_last",
+            row.str());
+    }
 
     bool policy_trace_enabled_ = false;
     std::string policy_trace_stream_;

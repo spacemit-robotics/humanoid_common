@@ -413,10 +413,10 @@ void TestClampedTargetReport() {
     for (std::size_t i = 0; i < expected.size(); ++i)
         Require(std::abs(applied[i] - expected[i]) < 1.0e-9, "target was not clamped to its limit");
 
-    const auto events = ReadText(log_directory / "events.log");
-    Require(events.find("RL target clamped: policy=probe, joint=joint_c, target=0.3000, "
-        "limit=0.1000, excess=0.2000, joints=3, clamped_actions=1 (+1)") != std::string::npos,
-        "clamp report must name the worst joint and its excess");
+    // The events line is best effort under logger contention; the CSV row is not.
+    const auto report = ReadText(log_directory / "control_target_clamp.csv");
+    Require(report.find("probe,joint_c,0.300000,0.100000,0.200000,3,1,1") != std::string::npos,
+        "clamp report must name the worst joint and its excess:\n" + report);
     std::ifstream input(log_directory / "control_policy_apply_probe.csv");
     std::string header, row;
     Require(std::getline(input, header) && std::getline(input, row), "apply trace is missing");

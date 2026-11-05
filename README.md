@@ -361,6 +361,9 @@ logging:
 - 错误事件及 whole_body 的通信重试触发前后片段，三个进程通过同一 boot ID、
   单调时钟和 incident ID 关联。`incident_*/trigger.json` 记录实际保留时长，
   `.complete` 表示片段关闭。连续故障合并，冷却时间内不重复生成海量片段。
+  冷却只约束警告级触发：ERROR 级事件（如故障锁存）在冷却期内仍会新建片段，
+  录制中再出现 ERROR 则把结束时间顺延一个 `post_trigger_s`（单个片段最长 120 秒），
+  顺延记录在 `incident_*/extensions.jsonl`，`trigger.json` 的 `fatal` 标明由 ERROR 触发。
   这是进程内存缓存；突然掉电/进程崩溃之前未触发落盘的高频数据不会自动恢复。
 - control 和 StateRL 的大行 CSV 使用预分配快照队列，生产者只复制固定容量数据、
   `try_lock` 失败即丢弃日志，不等待后台。策略快照上限 8192 维观测/128 维动作；

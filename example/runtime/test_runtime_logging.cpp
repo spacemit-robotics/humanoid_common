@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>  // NOLINT(build/c++17)
@@ -16,6 +17,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 #include <yaml-cpp/yaml.h>
 
 #include "log_storage.h"
@@ -161,6 +163,58 @@ void EarlyCaptureTest(const fs::path &root, bool fail_sync) {
     }
 }
 
+// A warning capture must not hide a later error inside the cooldown window.
+void FatalCaptureTest(const fs::path &root) {
+    const auto config = root / "fatal.yaml";
+    std::ofstream(config) << "robot_base: {name: fatal_capture}\nlogging:\n  directory: logs\n"
+        "  console: {enabled: false}\n  file: {enabled: true}\n"
+        "  telemetry: {enabled: true}\n"
+        "  blackbox: {enabled: true, pre_trigger_s: 2, post_trigger_s: 0.3, cooldown_s: 30}\n";
+    fs::path session;
+    const auto wait_for = [](bool active) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (runtime_logging::HighRateRequested() != active &&
+            std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return runtime_logging::HighRateRequested() == active;
+    };
+    {
+        const auto yaml = robot_base::YamlFile::Load(config.string());
+        runtime_logging::Session logging(yaml, config.string(), "control", false);
+        session = runtime_logging::GetSessionDirectory();
+        for (int i = 0; i < 5; ++i)
+            runtime_logging::RecordCsv("probe", "time,value", std::to_string(i) + ",1");
+        runtime_logging::TriggerSnapshot("warning before the fault");
+        Require(wait_for(true) && wait_for(false), "warning capture did not run");
+        runtime_logging::TriggerSnapshot("second warning inside the cooldown");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        Require(!runtime_logging::HighRateRequested(), "warning bypassed the cooldown");
+        runtime_logging::RecordCsv("probe", "time,value", "5,2");
+        runtime_logging::Log(runtime_logging::Level::kError, "injected fault inside cooldown", false);
+        Require(wait_for(true), "error inside the cooldown was not captured");
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        runtime_logging::Log(runtime_logging::Level::kError, "second fault extends the capture", false);
+        Require(wait_for(false), "extended capture did not finish");
+    }
+    std::vector<fs::path> incidents;
+    for (const auto &entry : fs::directory_iterator(session)) {
+        if (entry.is_directory() && entry.path().filename().string().rfind("incident_", 0) == 0)
+            incidents.push_back(entry.path());
+    }
+    std::sort(incidents.begin(), incidents.end());
+    Require(incidents.size() == 2, "expected one warning capture and one error capture");
+    for (const auto &incident : incidents)
+        Require(fs::exists(incident / ".complete"), "capture not finalized");
+    const auto warning = YAML::LoadFile((incidents[0] / "trigger.json").string());
+    const auto fault = YAML::LoadFile((incidents[1] / "trigger.json").string());
+    Require(warning["fatal"].as<int>() == 0 && fault["fatal"].as<int>() == 1,
+        "trigger metadata does not mark the error capture");
+    Require(fault["reason"].as<std::string>().find("injected fault inside cooldown") != std::string::npos,
+        "error capture lost its reason");
+    Require(Lines(incidents[1] / "probe.csv") == 7, "error capture lost its pre-trigger rows");
+    Require(Lines(incidents[1] / "extensions.jsonl") == 1, "second error did not extend the capture");
+}
+
 void ProducerTest() {
     std::atomic<bool> release{false};
     std::atomic<bool> entered{false};
@@ -208,8 +262,8 @@ void WriteRecoveryTest(const fs::path &root) {
 }  // namespace
 
 int main() {
-    char directory[] = "/tmp/humanoid_logging_XXXXXX";
-    const auto *created = mkdtemp(directory);
+    std::string pattern = (fs::temp_directory_path() / "humanoid_logging_XXXXXX").string();
+    const auto *created = mkdtemp(pattern.data());
     if (!created) return 1;
     const fs::path root(created);
     try {
@@ -217,6 +271,7 @@ int main() {
         RecordTest(root);
         EarlyCaptureTest(root, false);
         EarlyCaptureTest(root, true);
+        FatalCaptureTest(root);
         StorageTest(root);
         WriteRecoveryTest(root);
         fs::remove_all(root);

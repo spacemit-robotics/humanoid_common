@@ -1025,6 +1025,55 @@ void TestSonicPlannerScheduling(bool explicit_affinity) {
     }).get();
 }
 
+// One joint, 50 fps; position follows `value` so blends are easy to read back.
+behavior_manager::policy_adapter::SonicPlannerMotion ConstantMotion(
+    double start_s, int frames, float value) {
+    behavior_manager::policy_adapter::SonicPlannerMotion motion;
+    motion.start_time_s = start_s;
+    behavior_manager::policy_adapter::SonicMotionFrame frame;
+    frame.dof_pos = {value};
+    frame.dof_vel = {0.0F};
+    motion.frames.assign(frames, frame);
+    return motion;
+}
+
+void TestSonicPlannerLateBlend() {
+    using behavior_manager::policy_adapter::BlendSonicPlannerMotion;
+    constexpr double kFps = 50.0;
+    constexpr int kBlend = 8;
+    // A plan requested at t=0 with 0.8 s lookahead starts at t=0.8 and
+    // covers 1.2 s; the reference being tracked holds 0.0 until t=2.0.
+    const auto current = ConstantMotion(0.0, 101, 0.0F);
+    const auto generated = ConstantMotion(0.8, 61, 1.0F);
+
+    // On time: the crossfade starts at the plan start and keeps eight steps.
+    const auto on_time = BlendSonicPlannerMotion(current, generated, 0.5, kFps, kBlend);
+    Require(!on_time.expired && on_time.late_s == 0.0 && on_time.blend_frames == kBlend,
+        "on-time plan must keep the full crossfade");
+    Require(std::abs(on_time.blend_start_s - 0.8) < 1.0e-9, "on-time crossfade must start at the plan");
+
+    // 1.107 s inference as on G1 (11/04): the plan is published 0.307 s
+    // after its own start. The first published frame must still equal the
+    // tracked reference and the new pose must arrive over eight frames.
+    const auto late = BlendSonicPlannerMotion(current, generated, 1.107, kFps, kBlend);
+    Require(!late.expired && std::abs(late.late_s - 0.307) < 1.0e-9, "late plan was not measured");
+    Require(late.blend_frames == kBlend, "late plan lost part of its crossfade");
+    Require(late.motion.frames.front().dof_pos[0] == 0.0F,
+        "late plan must not jump at publication");
+    for (std::size_t i = 1; i < late.motion.frames.size(); ++i) {
+        const float step = late.motion.frames[i].dof_pos[0] - late.motion.frames[i - 1].dof_pos[0];
+        Require(step >= 0.0F && step <= 1.0F / kBlend + 1.0e-6F,
+            "late crossfade advanced faster than one blend step per frame");
+    }
+    Require(late.motion.frames.back().dof_pos[0] == 1.0F, "late plan never reached the new pose");
+
+    // Inference longer than the whole new plan: the plan has expired and the
+    // tracked reference has already stalled; both are reported.
+    const auto stale_reference = ConstantMotion(0.0, 51, 0.0F);
+    const auto expired = BlendSonicPlannerMotion(stale_reference, generated, 2.5, kFps, kBlend);
+    Require(expired.expired && expired.stale_s > 1.4, "expired plan was not reported");
+}
+
 void TestSonicPrepareInputs() {
     constexpr int kG1JointCount = 29;
     const TempSonicReference reference(kG1JointCount);
@@ -1567,6 +1616,7 @@ int main(int argc, char **argv) {
         TestSonicPlannerConfig();
         TestSonicPlannerScheduling(false);
         TestSonicPlannerScheduling(true);
+        TestSonicPlannerLateBlend();
         TestSonicPrepareInputs();
         TestSonicMotionCatalogPlayback();
         TestJointTrajectoryTakeover();

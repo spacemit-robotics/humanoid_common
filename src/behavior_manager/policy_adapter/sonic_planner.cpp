@@ -16,12 +16,17 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include "runtime_logger.h"
 
 namespace behavior_manager {
 namespace policy_adapter {
@@ -129,7 +134,121 @@ rl_policy::PolicyExecutorConfig BuildPlannerPolicyConfig(
     return policy;
 }
 
+double MotionEndTime(const SonicPlannerMotion &motion, double fps) {
+    return motion.start_time_s +
+        static_cast<double>(motion.frames.size() - 1) / fps;
+}
+
 }  // namespace
+
+SonicMotionFrame SampleSonicPlannerMotion(const SonicPlannerMotion &motion,
+    double time_s, double fps) {
+    if (motion.frames.empty()) {
+        throw std::runtime_error(
+            "[sonic_planner] 没有可用于 planner context 的参考帧");
+    }
+    const double frame_position = std::clamp(
+        (time_s - motion.start_time_s) * fps,
+        0.0,
+        static_cast<double>(motion.frames.size() - 1));
+    const int frame0 = static_cast<int>(std::floor(frame_position));
+    const int frame1 = std::min(
+        frame0 + 1, static_cast<int>(motion.frames.size()) - 1);
+    const float alpha = static_cast<float>(frame_position - frame0);
+    const auto &source0 = motion.frames[frame0];
+    const auto &source1 = motion.frames[frame1];
+
+    SonicMotionFrame sampled;
+    sampled.dof_pos.resize(source0.dof_pos.size());
+    sampled.dof_vel.resize(source0.dof_vel.size());
+    for (std::size_t joint = 0; joint < sampled.dof_pos.size(); ++joint) {
+        sampled.dof_pos[joint] =
+            (1.0F - alpha) * source0.dof_pos[joint] +
+            alpha * source1.dof_pos[joint];
+    }
+    for (std::size_t joint = 0; joint < sampled.dof_vel.size(); ++joint) {
+        sampled.dof_vel[joint] =
+            (1.0F - alpha) * source0.dof_vel[joint] +
+            alpha * source1.dof_vel[joint];
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        sampled.root_pos[axis] =
+            (1.0F - alpha) * source0.root_pos[axis] +
+            alpha * source1.root_pos[axis];
+    }
+    const Eigen::Quaternionf quat0 = NormalizeQuaternion(source0.root_quat);
+    const Eigen::Quaternionf quat1 = NormalizeQuaternion(source1.root_quat);
+    const Eigen::Quaternionf quat = quat0.slerp(alpha, quat1).normalized();
+    sampled.root_quat = {quat.w(), quat.x(), quat.y(), quat.z()};
+    return sampled;
+}
+
+SonicPlannerBlend BlendSonicPlannerMotion(const SonicPlannerMotion &current,
+    const SonicPlannerMotion &generated, double publish_time_s, double fps,
+    int blend_frames) {
+    if (generated.frames.empty() || current.frames.empty()) {
+        throw std::runtime_error(
+            "[sonic_planner] planner 生成了空参考轨迹");
+    }
+    if (!(fps > 0.0) || blend_frames <= 0) {
+        throw std::runtime_error("[sonic_planner] 过渡参数无效");
+    }
+    SonicPlannerBlend result;
+    result.late_s = std::max(0.0, publish_time_s - generated.start_time_s);
+    result.stale_s = std::max(0.0, publish_time_s - MotionEndTime(current, fps));
+    // A plan published after its start must still crossfade from the
+    // reference being tracked, or the tracker sees a step at publication.
+    result.blend_start_s = std::max(generated.start_time_s, publish_time_s);
+    const double generated_end_s = MotionEndTime(generated, fps);
+    if (generated_end_s < publish_time_s) {
+        result.expired = true;
+        result.motion = generated;
+        return result;
+    }
+
+    const int output_frames = std::max(2,
+        static_cast<int>(std::floor(
+            (generated_end_s - publish_time_s) * fps)) + 1);
+    result.motion.frames.reserve(output_frames);
+    result.motion.start_time_s = publish_time_s;
+    for (int frame_index = 0; frame_index < output_frames; ++frame_index) {
+        const double sample_time_s = publish_time_s +
+            static_cast<double>(frame_index) / fps;
+        SonicMotionFrame old_frame =
+            SampleSonicPlannerMotion(current, sample_time_s, fps);
+        const SonicMotionFrame new_frame =
+            SampleSonicPlannerMotion(generated, sample_time_s, fps);
+        const float new_weight = static_cast<float>(std::clamp(
+            (sample_time_s - result.blend_start_s) * fps / blend_frames,
+            0.0, 1.0));
+        if (sample_time_s >= result.blend_start_s && new_weight < 1.0F) {
+            ++result.blend_frames;
+        }
+        const float old_weight = 1.0F - new_weight;
+        for (std::size_t joint = 0; joint < old_frame.dof_pos.size(); ++joint) {
+            old_frame.dof_pos[joint] =
+                old_weight * old_frame.dof_pos[joint] +
+                new_weight * new_frame.dof_pos[joint];
+            old_frame.dof_vel[joint] =
+                old_weight * old_frame.dof_vel[joint] +
+                new_weight * new_frame.dof_vel[joint];
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            old_frame.root_pos[axis] =
+                old_weight * old_frame.root_pos[axis] +
+                new_weight * new_frame.root_pos[axis];
+        }
+        const Eigen::Quaternionf blended_quat = NormalizeQuaternion(
+            old_frame.root_quat).slerp(
+                new_weight,
+                NormalizeQuaternion(new_frame.root_quat)).normalized();
+        old_frame.root_quat = {
+            blended_quat.w(), blended_quat.x(),
+            blended_quat.y(), blended_quat.z()};
+        result.motion.frames.push_back(std::move(old_frame));
+    }
+    return result;
+}
 
 class SonicPlanner::Impl {
 public:
@@ -170,6 +289,7 @@ public:
             has_snapshot_ = true;
             request_generation_ = 1;
             plan_count_ = 0;
+            late_plans_ = 0;
             published_generation_ = 0;
             idle_ = false;
             idle_ready_at_s_ = 0.0;
@@ -296,44 +416,7 @@ private:
 
     SonicMotionFrame SampleMotion(const SonicPlannerMotion &motion,
         double absolute_time_s) const {
-        if (motion.frames.empty()) {
-            throw std::runtime_error(
-                "[sonic_planner] 没有可用于 planner context 的参考帧");
-        }
-        const double frame_position = std::clamp(
-            (absolute_time_s - motion.start_time_s) * config_.output_fps,
-            0.0,
-            static_cast<double>(motion.frames.size() - 1));
-        const int frame0 = static_cast<int>(std::floor(frame_position));
-        const int frame1 = std::min(
-            frame0 + 1, static_cast<int>(motion.frames.size()) - 1);
-        const float alpha = static_cast<float>(frame_position - frame0);
-        const auto &source0 = motion.frames[frame0];
-        const auto &source1 = motion.frames[frame1];
-
-        SonicMotionFrame sampled;
-        sampled.dof_pos.resize(kPlannerDofCount);
-        sampled.dof_vel.resize(kPlannerDofCount);
-        for (int joint = 0; joint < kPlannerDofCount; ++joint) {
-            sampled.dof_pos[joint] =
-                (1.0F - alpha) * source0.dof_pos[joint] +
-                alpha * source1.dof_pos[joint];
-            sampled.dof_vel[joint] =
-                (1.0F - alpha) * source0.dof_vel[joint] +
-                alpha * source1.dof_vel[joint];
-        }
-        for (int axis = 0; axis < 3; ++axis) {
-            sampled.root_pos[axis] =
-                (1.0F - alpha) * source0.root_pos[axis] +
-                alpha * source1.root_pos[axis];
-        }
-        const Eigen::Quaternionf quat0 =
-            NormalizeQuaternion(source0.root_quat);
-        const Eigen::Quaternionf quat1 =
-            NormalizeQuaternion(source1.root_quat);
-        const Eigen::Quaternionf quat = quat0.slerp(alpha, quat1).normalized();
-        sampled.root_quat = {quat.w(), quat.x(), quat.y(), quat.z()};
-        return sampled;
+        return SampleSonicPlannerMotion(motion, absolute_time_s, config_.output_fps);
     }
 
     int SelectMode(const robot_base::Command &command) const {
@@ -544,66 +627,6 @@ private:
         return ConvertPlannerOutput(qpos, valid_frames, context_start_s);
     }
 
-    SonicPlannerMotion BlendWithCurrentMotion(
-        const SonicPlannerMotion &current,
-        const SonicPlannerMotion &generated,
-        double publish_time_s) const {
-        if (generated.frames.empty()) {
-            throw std::runtime_error(
-                "[sonic_planner] planner 生成了空参考轨迹");
-        }
-        const double generated_end_s = generated.start_time_s +
-            static_cast<double>(generated.frames.size() - 1) /
-                config_.output_fps;
-        if (generated_end_s < publish_time_s) {
-            return generated;
-        }
-
-        const int output_frames = std::max(2,
-            static_cast<int>(std::floor(
-                (generated_end_s - publish_time_s) * config_.output_fps)) +
-                1);
-        SonicPlannerMotion blended;
-        blended.frames.reserve(output_frames);
-        blended.start_time_s = publish_time_s;
-        for (int frame_index = 0; frame_index < output_frames;
-            ++frame_index) {
-            const double sample_time_s = publish_time_s +
-                static_cast<double>(frame_index) / config_.output_fps;
-            SonicMotionFrame old_frame = SampleMotion(current, sample_time_s);
-            const SonicMotionFrame new_frame =
-                SampleMotion(generated, sample_time_s);
-            const float new_weight = static_cast<float>(std::clamp(
-                (sample_time_s - generated.start_time_s) *
-                    config_.output_fps / kPlannerBlendFrames,
-                0.0,
-                1.0));
-            const float old_weight = 1.0F - new_weight;
-            for (int joint = 0; joint < kPlannerDofCount; ++joint) {
-                old_frame.dof_pos[joint] =
-                    old_weight * old_frame.dof_pos[joint] +
-                    new_weight * new_frame.dof_pos[joint];
-                old_frame.dof_vel[joint] =
-                    old_weight * old_frame.dof_vel[joint] +
-                    new_weight * new_frame.dof_vel[joint];
-            }
-            for (int axis = 0; axis < 3; ++axis) {
-                old_frame.root_pos[axis] =
-                    old_weight * old_frame.root_pos[axis] +
-                    new_weight * new_frame.root_pos[axis];
-            }
-            const Eigen::Quaternionf blended_quat = NormalizeQuaternion(
-                old_frame.root_quat).slerp(
-                    new_weight,
-                    NormalizeQuaternion(new_frame.root_quat)).normalized();
-            old_frame.root_quat = {
-                blended_quat.w(), blended_quat.x(),
-                blended_quat.y(), blended_quat.z()};
-            blended.frames.push_back(std::move(old_frame));
-        }
-        return blended;
-    }
-
     void PlannerLoop() {
         try {
             // Apply before session creation so its CPU workers inherit this
@@ -676,27 +699,20 @@ private:
                 }
                 // Build the immutable trajectory outside the tracker-facing lock.
                 // Only this worker publishes motion between Reset and Stop.
+                SonicPlannerBlend blend = BlendSonicPlannerMotion(*source,
+                    generated, publish_time_s, config_.output_fps, kPlannerBlendFrames);
                 auto next_motion = std::make_shared<const SonicPlannerMotion>(
-                    BlendWithCurrentMotion(*source, generated, publish_time_s));
+                    std::move(blend.motion));
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (!running_) return;
                     motion_.swap(next_motion);
                     idle_ = SelectMode(command) == 0;
-                    idle_ready_at_s_ = generated.start_time_s +
-                        static_cast<double>(generated.frames.size() - 1) /
-                        config_.output_fps;
+                    idle_ready_at_s_ = MotionEndTime(generated, config_.output_fps);
                     published_generation_ = handled_generation;
                 }
                 ++plan_count_;
-                if (plan_count_ <= 3 || plan_count_ % 10 == 0) {
-                    std::cout << "[sonic_planner] plan=" << plan_count_
-                        << ", mode=" << SelectMode(command)
-                        << ", speed=" << std::hypot(command.vx, command.vy)
-                        << ", infer_ms=" << infer_ms
-                        << ", frames=" << generated.frames.size()
-                        << std::endl;
-                }
+                RecordPlan(command, elapsed_s, publish_time_s, infer_ms, generated, blend);
             } catch (const std::exception &error) {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (!running_) return;
@@ -709,6 +725,48 @@ private:
                 std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                     std::chrono::duration<double>(config_.replan_interval));
         }
+    }
+
+    // Planner worker only: one CSV row per published plan, plus a rate-limited
+    // warning when inference outlasted the lookahead budget.
+    void RecordPlan(const robot_base::Command &command, double request_time_s,
+        double publish_time_s, double infer_ms, const SonicPlannerMotion &generated,
+        const SonicPlannerBlend &blend) {
+        const int mode = SelectMode(command);
+        std::ostringstream row;
+        row << std::fixed << std::setprecision(6)
+            << std::chrono::duration<double>(
+                std::chrono::system_clock::now().time_since_epoch()).count()
+            << ',' << plan_count_ << ',' << mode << ',' << command.vx << ','
+            << command.vy << ',' << command.wz << ',' << request_time_s << ','
+            << publish_time_s << ',' << generated.start_time_s << ','
+            << MotionEndTime(generated, config_.output_fps) << ',' << infer_ms << ','
+            << generated.frames.size() << ',' << blend.late_s << ',' << blend.stale_s
+            << ',' << blend.blend_frames << ',' << (blend.expired ? 1 : 0);
+        runtime_logging::RecordCsv("control_sonic_planner",
+            "wall_time_s,plan,mode,vx,vy,wz,request_time_s,publish_time_s,"
+            "plan_start_s,plan_end_s,infer_ms,frames,late_s,stale_s,blend_frames,expired",
+            row.str());
+        if (plan_count_ == 1) {
+            std::ostringstream detail;
+            detail << std::fixed << std::setprecision(1)
+                << "SONIC planner first plan published: mode=" << mode
+                << ", infer_ms=" << infer_ms;
+            runtime_logging::Log(runtime_logging::Level::kInfo, detail.str(), false);
+        }
+        if (blend.late_s <= 0.0 && blend.stale_s <= 0.0 && !blend.expired) return;
+        const auto now = std::chrono::steady_clock::now();
+        ++late_plans_;
+        if (late_plans_ > 1 && now - last_late_report_ < std::chrono::seconds(10)) return;
+        std::ostringstream detail;
+        detail << std::fixed << std::setprecision(1)
+            << "SONIC planner plan published late: plan=" << plan_count_
+            << ", infer_ms=" << infer_ms << ", lookahead_ms=" << config_.lookahead * 1000.0
+            << ", late_ms=" << blend.late_s * 1000.0
+            << ", reference_stalled_ms=" << blend.stale_s * 1000.0
+            << ", expired=" << (blend.expired ? 1 : 0) << ", late_plans=" << late_plans_;
+        runtime_logging::Log(runtime_logging::Level::kWarning, detail.str(), false);
+        last_late_report_ = now;
     }
 
     void Stop() {
@@ -733,6 +791,8 @@ private:
     double latest_elapsed_s_ = 0.0;
     std::uint64_t request_generation_ = 0;
     std::uint64_t plan_count_ = 0;
+    std::uint64_t late_plans_ = 0;
+    std::chrono::steady_clock::time_point last_late_report_;
     std::uint64_t published_generation_ = 0;
     bool idle_ = false;
     double idle_ready_at_s_ = 0.0;

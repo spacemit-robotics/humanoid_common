@@ -34,6 +34,30 @@ struct SonicPlannerMotion {
     double start_time_s = 0.0;
 };
 
+/** @brief 新规划拼接到已发布参考的结果及时序诊断 */
+struct SonicPlannerBlend {
+    SonicPlannerMotion motion;
+    double blend_start_s = 0.0;  ///< 新旧参考开始过渡的 RL 时间
+    double late_s = 0.0;         ///< 发布晚于新轨迹起点的时长
+    double stale_s = 0.0;        ///< 发布前旧参考已经播完、停在末帧的时长
+    int blend_frames = 0;        ///< 新旧参考实际过渡的帧数
+    bool expired = false;        ///< 新轨迹在发布前已经结束，只能直接替换
+};
+
+/** @brief 按绝对 RL 时间采样参考；超出两端时取端点帧 */
+SonicMotionFrame SampleSonicPlannerMotion(const SonicPlannerMotion &motion,
+    double time_s, double fps);
+
+/**
+ * @brief 把新规划拼接到当前参考
+ *
+ * 过渡从新轨迹起点和发布时刻中较晚的一个开始，推理超过 lookahead 时
+ * 仍保留完整的 blend_frames 帧过渡，不在发布瞬间跳到新轨迹。
+ */
+SonicPlannerBlend BlendSonicPlannerMotion(const SonicPlannerMotion &current,
+    const SonicPlannerMotion &generated, double publish_time_s, double fps,
+    int blend_frames);
+
 /**
  * @brief 在独立线程中运行 planner，避免大模型推理阻塞 50 Hz tracker
  */

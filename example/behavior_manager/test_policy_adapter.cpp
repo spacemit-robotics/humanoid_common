@@ -925,7 +925,18 @@ void TestSonicPlannerConfig() {
     Require(single.sonic_planner.thread.cpu_id == 1 &&
         single.sonic_planner.thread.cpu_affinity.empty(),
         "planner single-CPU configuration must not be overridden by defaults");
+    // Construction loads the planner, so a missing model fails during preparation.
     auto policy = MakeSonicPolicyConfig(29);
+    bool missing_rejected = false;
+    try {
+        static_cast<void>(Create(config, policy));
+    } catch (const std::runtime_error &) {
+        missing_rejected = true;
+    }
+    Require(missing_rejected, "a missing planner model must fail policy preparation");
+    const TempSonicOnnx model(kPlannerContextRepeatOnnx);
+    config.sonic_planner.model_path = model.Path().string();
+    config.sonic_planner.thread = robot_base::ThreadLoop::Background("motion_planner");
     auto adapter = Create(config, policy);
     Require(adapter && !adapter->ReadyForPolicySwitch(),
         "planner handoff must wait for a published idle trajectory");
@@ -947,9 +958,11 @@ std::set<int> NativeThreadIds() {
     return threads;
 }
 
-void TestSonicPlannerScheduling(bool explicit_affinity) {
+enum class PlannerPlacement { kInherit, kThreadAffinity, kWorkerAffinity, kIdle };
+
+void TestSonicPlannerScheduling(PlannerPlacement placement) {
     // Alter a disposable creator thread, never the test runner's scheduling.
-    std::async(std::launch::async, [explicit_affinity] {
+    std::async(std::launch::async, [placement] {
         using behavior_manager::policy_adapter::SonicPlanner;
         using behavior_manager::policy_adapter::SonicPlannerConfig;
         const TempSonicOnnx model(kPlannerContextRepeatOnnx);
@@ -961,10 +974,21 @@ void TestSonicPlannerScheduling(bool explicit_affinity) {
         config.runtime.ort_spinning = false;
         const auto launch_cpus = config.thread.cpu_affinity;
         Require(!launch_cpus.empty(), "cannot read launch affinity");
-        if (explicit_affinity) {
+        std::vector<int> worker_cpus;
+        if (placement == PlannerPlacement::kThreadAffinity) {
             config.thread.cpu_affinity = {launch_cpus.back()};
             if (launch_cpus.size() > 2) config.thread.cpu_affinity.push_back(launch_cpus[1]);
+        } else if (placement == PlannerPlacement::kWorkerAffinity) {
+            // Workers get their own CPU, away from the planner thread's CPU set.
+            Require(launch_cpus.size() >= 2, "worker affinity test needs two CPUs");
+            config.thread.cpu_affinity = {launch_cpus.front()};
+            worker_cpus = {launch_cpus.back()};
+            config.runtime.affinity = std::to_string(launch_cpus.back());
+        } else if (placement == PlannerPlacement::kIdle) {
+            config.thread.sched = "idle";
         }
+        if (worker_cpus.empty()) worker_cpus = config.thread.cpu_affinity;
+        const int expected_policy = placement == PlannerPlacement::kIdle ? SCHED_IDLE : SCHED_OTHER;
         robot_base::ThreadLoop creator;
         creator.name = "planner_creator";
         creator.cpu_id = launch_cpus.front();
@@ -973,10 +997,11 @@ void TestSonicPlannerScheduling(bool explicit_affinity) {
         Require(pthread_setschedparam(pthread_self(), SCHED_BATCH, &batch) == 0,
             "cannot select unprivileged creator scheduling");
 
+        // The model is loaded and warmed up during construction, before Reset.
+        const auto before = NativeThreadIds();
         SonicPlanner planner(config, MakeSonicPolicyConfig(29));
         auto robot = robot_base::RobotData::Create(29);
         robot.joint_pos[0] = 0.125;
-        const auto before = NativeThreadIds();
         planner.Reset(robot);
         const auto wait_for_plan = [&](const auto &previous) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -988,23 +1013,36 @@ void TestSonicPlannerScheduling(bool explicit_affinity) {
             throw std::runtime_error("planner did not publish the test trajectory");
         };
         const auto first = wait_for_plan(nullptr);
-        cpu_set_t expected;
-        CPU_ZERO(&expected);
-        for (const int cpu : config.thread.cpu_affinity) CPU_SET(cpu, &expected);
-        int new_threads = 0;
+        const auto cpu_set_of = [](const std::vector<int> &cpus) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            for (const int cpu : cpus) CPU_SET(cpu, &set);
+            return set;
+        };
+        const cpu_set_t planner_set = cpu_set_of(config.thread.cpu_affinity);
+        const cpu_set_t worker_set = cpu_set_of(worker_cpus);
+        int on_planner_cpus = 0, on_worker_cpus = 0;
         for (const int tid : NativeThreadIds()) {
             if (before.count(tid)) continue;
+            sched_param param{};
+            Require(sched_getscheduler(tid) == expected_policy &&
+                sched_getparam(tid, &param) == 0 && param.sched_priority == 0,
+                "planner or inference worker retained the creator's scheduling");
             cpu_set_t actual;
             CPU_ZERO(&actual);
-            sched_param param{};
-            Require(sched_getaffinity(tid, sizeof(actual), &actual) == 0 &&
-                CPU_EQUAL(&actual, &expected) && sched_getscheduler(tid) == SCHED_OTHER &&
-                sched_getparam(tid, &param) == 0 && param.sched_priority == 0,
-                "planner or inference worker retained the creator's CPU/scheduling");
-            ++new_threads;
+            Require(sched_getaffinity(tid, sizeof(actual), &actual) == 0, "cannot read affinity");
+            if (CPU_EQUAL(&actual, &planner_set)) {
+                ++on_planner_cpus;
+            } else {
+                Require(CPU_EQUAL(&actual, &worker_set), "planner thread or worker left its CPU set");
+                ++on_worker_cpus;
+            }
         }
-        Require(new_threads == config.runtime.threads,
-            "expected planner caller plus its two CPU inference workers");
+        // ORT leaves the calling thread alone, so only workers follow runtime.affinity.
+        const bool separate = !CPU_EQUAL(&planner_set, &worker_set);
+        Require(on_planner_cpus + on_worker_cpus == config.runtime.threads &&
+            (!separate || (on_planner_cpus == 1 && on_worker_cpus == config.runtime.threads - 1)),
+            "expected one planner thread plus its two CPU inference workers");
 
         const auto old_size = first->frames.size();
         const auto old_start = first->start_time_s;
@@ -1021,6 +1059,16 @@ void TestSonicPlannerScheduling(bool explicit_affinity) {
         planner.Update(robot, {}, stopped->start_time_s +
             stopped->frames.size() / config.output_fps + 0.1);
         Require(planner.Idle(), "a completed stop plan must allow policy handoff");
+
+        // Re-entry reuses the loaded session: a stopped planner plans again
+        // without starting new inference workers.
+        planner.RequestStop();
+        const auto before_reentry = NativeThreadIds();
+        planner.Reset(robot);
+        static_cast<void>(wait_for_plan(nullptr));
+        int new_threads = 0;
+        for (const int tid : NativeThreadIds()) new_threads += before_reentry.count(tid) ? 0 : 1;
+        Require(new_threads == 1, "re-entry must reuse the loaded planner session");
         planner.RequestStop();
     }).get();
 }
@@ -1614,8 +1662,10 @@ int main(int argc, char **argv) {
         TestManualReferencePlayback();
         TestSonicReferenceAndConfig();
         TestSonicPlannerConfig();
-        TestSonicPlannerScheduling(false);
-        TestSonicPlannerScheduling(true);
+        TestSonicPlannerScheduling(PlannerPlacement::kInherit);
+        TestSonicPlannerScheduling(PlannerPlacement::kThreadAffinity);
+        TestSonicPlannerScheduling(PlannerPlacement::kWorkerAffinity);
+        TestSonicPlannerScheduling(PlannerPlacement::kIdle);
         TestSonicPlannerLateBlend();
         TestSonicPrepareInputs();
         TestSonicMotionCatalogPlayback();

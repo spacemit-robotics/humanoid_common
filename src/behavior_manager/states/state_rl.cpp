@@ -52,6 +52,14 @@ public:
     void PrepareRuntime() {
         policy_adapter_.reset();
         policy_.Init(config_.policy);
+        const auto runtime = policy_.GetRuntimeInfo();
+        runtime_logging::Log(runtime_logging::Level::kInfo,
+            "RL runtime ready: policy=" + config_.policy_name +
+            ", provider=" + runtime.initialized_provider +
+            ", intra=" + std::to_string(runtime.ort_intra_threads) +
+            ", spinning=" + (runtime.ort_spinning ? "on" : "off") +
+            ", affinity=" + (runtime.affinity.empty() ? "inherit" : runtime.affinity) +
+            ", workers=" + (runtime.worker_threads.empty() ? "none" : runtime.worker_threads), false);
         if (config_.policy_adapter.Enabled()) {
             policy_adapter_ = policy_adapter::Create(
                 config_.policy_adapter, config_.policy);

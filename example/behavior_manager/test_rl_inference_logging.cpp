@@ -6,6 +6,8 @@
  * @brief Verify rejected inference diagnostics without publishing late actions
  */
 
+#include <sched.h>
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -85,7 +87,8 @@ public:
 
     const fs::path &Directory() const { return directory_; }
 
-    fs::path WriteConfig(bool debug, bool limited = false) const {
+    fs::path WriteConfig(bool debug, bool limited = false,
+        const std::string &runtime = "{provider: cpu}") const {
         const auto path = directory_ / "config.yaml";
         std::ofstream yaml(path);
         yaml << "robot_base:\n"
@@ -104,7 +107,7 @@ public:
             "    policies:\n"
             "      probe:\n"
             "        model_path: identity.onnx\n"
-            "        runtime: {provider: cpu}\n"
+            "        runtime: " << runtime << "\n"
             "        model_io:\n"
             "          inputs: [{name: obs, source: observation}]\n"
             "          outputs: [{name: action, target: action}]\n"
@@ -337,6 +340,36 @@ void TestDelayedInferenceRecovery() {
     fsm.ForceSwitch(StateName::POWER_OFF, "bounded recovery test complete");
 }
 
+// Policy YAML controls ORT worker spinning and CPU placement, and the
+// prepared runtime reports where the workers actually run.
+void TestRuntimePlacement() {
+    cpu_set_t launch;
+    CPU_ZERO(&launch);
+    Require(sched_getaffinity(0, sizeof(launch), &launch) == 0, "cannot read launch affinity");
+    int cpu = -1;
+    for (int i = 0; i < CPU_SETSIZE; ++i) if (CPU_ISSET(i, &launch)) cpu = i;
+    const Fixture fixture;
+    const auto yaml_path = fixture.WriteConfig(false, false,
+        "{provider: cpu, threads: 2, ort_spinning: false, affinity: \"" + std::to_string(cpu) + "\"}");
+    const auto config = behavior_manager::LoadRLStateConfig(
+        yaml_path.string(), "probe", fixture.Directory().string());
+    Require(!config.policy.runtime.ort_spinning && config.policy.runtime.affinity == std::to_string(cpu),
+        "runtime.ort_spinning and runtime.affinity were not loaded from YAML");
+    fs::path log_directory;
+    {
+        const auto yaml = robot_base::YamlFile::Load(yaml_path.string());
+        runtime_logging::Session logging(yaml, yaml_path.string(), "control", false);
+        log_directory = runtime_logging::GetSessionDirectory();
+        static_cast<void>(behavior_manager::CreatePreparedStateRl(config));
+    }
+    const auto events = ReadText(log_directory / "events.log");
+    Require(events.find("RL runtime ready: policy=probe, provider=cpu, intra=2, spinning=off, affinity=" +
+        std::to_string(cpu) + ", workers=") != std::string::npos,
+        "prepared runtime was not reported");
+    Require(events.find("@" + std::to_string(cpu) + "/other") != std::string::npos,
+        "ORT worker did not move to the configured CPU");
+}
+
 void TestClampedTargetReport() {
     const Fixture fixture;
     const auto yaml_path = fixture.WriteConfig(true, true);
@@ -407,6 +440,7 @@ int main() {
         TestLogging(true, true, true);
         TestDelayedInferenceRecovery();
         TestClampedTargetReport();
+        TestRuntimePlacement();
         std::cout << "StateRL inference logging regression passed\n";
         return 0;
     } catch (const std::exception &error) {

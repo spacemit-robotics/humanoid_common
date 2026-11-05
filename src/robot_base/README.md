@@ -44,7 +44,7 @@
 | `name` | 线程名（最长 15 字符，用于 `ps`/`htop` 中识别） |
 | `cpu_id` | CPU 亲和性，`-1` 不绑定 |
 | `cpu_affinity` | 当前线程可运行的 CPU 编号列表；非空时不能再配 `cpu_id`，不表示每核各启一个线程 |
-| `sched` | 调度策略：`"other"`（CFS 默认）\| `"fifo"` \| `"rr"` |
+| `sched` | 调度策略：`"other"`（CFS 默认）\| `"fifo"` \| `"rr"` \| `"batch"` \| `"idle"`；`idle` 只用空闲 CPU，适合可让路的后台推理，`priority` 仅对 fifo/rr 生效 |
 | `priority` | 优先级（`fifo`/`rr`: 1~99；`other` 忽略） |
 | `FromYaml(yaml, name)` | 静态工厂：从 `robot_base.threads.{name}` 加载配置，返回未启动的 ThreadLoop |
 | `Apply()` | 对调用线程应用当前配置（`fifo`/`rr` 需 root 权限）；`Start()` 内部自动调用 |
@@ -61,7 +61,7 @@ robot_base:
   threads:
     rl_infer:       # RL 推理线程
       cpu_affinity: [2, 3]
-      sched: fifo   # other（默认）| fifo | rr（需 root）
+      sched: fifo   # other（默认）| fifo | rr（需 root）| batch | idle
       priority: 80
     control_main:   # control_demo 主控制循环
       cpu_id: 4

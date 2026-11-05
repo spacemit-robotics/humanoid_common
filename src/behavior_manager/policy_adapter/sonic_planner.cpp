@@ -16,8 +16,8 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <iomanip>
-#include <iostream>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -274,12 +274,15 @@ public:
         }
         ValidateConfig();
         ValidateJointMapping();
+        LoadModel();
     }
 
     ~Impl() { Stop(); }
 
     void Reset(const robot_base::RobotData &robot) {
         Stop();
+        // The model is loaded once; a previous Stop() must not cancel new plans.
+        planner_policy_.ClearInferenceTermination();
         {
             std::lock_guard<std::mutex> lock(mutex_);
             motion_ = std::make_shared<const SonicPlannerMotion>(BuildSeedMotion(robot));
@@ -342,6 +345,66 @@ public:
     }
 
 private:
+    // Runs during policy preparation, before the policy can be selected, on a
+    // thread with the planner's CPU set and scheduling so the inference workers
+    // created with the session inherit them instead of the preparing thread's.
+    void LoadModel() {
+        std::exception_ptr failure;
+        double load_s = 0.0;
+        std::array<double, 2> warmup_ms = {};
+        std::thread loader([&] {
+            try {
+                config_.thread.Apply();
+                const auto start = std::chrono::steady_clock::now();
+                planner_policy_.Init(planner_policy_config_);
+                load_s = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start).count();
+                warmup_ms = Warmup();
+            } catch (...) {
+                failure = std::current_exception();
+            }
+        });
+        loader.join();
+        if (failure) {
+            try {
+                std::rethrow_exception(failure);
+            } catch (const std::exception &error) {
+                throw std::runtime_error(
+                    std::string("[sonic_planner] initialization failed: ") + error.what());
+            }
+        }
+        const auto runtime = planner_policy_.GetRuntimeInfo();
+        std::ostringstream detail;
+        detail << std::fixed << std::setprecision(1)
+            << "SONIC planner model ready: load_s=" << load_s
+            << ", warmup_idle_ms=" << warmup_ms[0] << ", warmup_walk_ms=" << warmup_ms[1]
+            << ", provider=" << runtime.initialized_provider
+            << ", intra=" << runtime.ort_intra_threads
+            << ", spinning=" << (runtime.ort_spinning ? "on" : "off")
+            << ", affinity=" << (runtime.affinity.empty() ? "inherit" : runtime.affinity)
+            << ", workers=" << (runtime.worker_threads.empty() ? "none" : runtime.worker_threads);
+        runtime_logging::Log(runtime_logging::Level::kInfo, detail.str());
+    }
+
+    // One standing and one walking plan, so the first real plan does not pay
+    // for lazy allocation inside the inference runtime.
+    std::array<double, 2> Warmup() {
+        auto robot = robot_base::RobotData::Create(kPlannerDofCount);
+        robot.base_quat = {1.0, 0.0, 0.0, 0.0};
+        const SonicPlannerMotion seed = BuildSeedMotion(robot);
+        robot_base::Command walk;
+        walk.vx = static_cast<float>(0.5 * config_.slow_walk_max_speed);
+        std::array<double, 2> elapsed_ms = {};
+        const std::array<robot_base::Command, 2> commands = {robot_base::Command{}, walk};
+        for (std::size_t i = 0; i < commands.size(); ++i) {
+            const auto start = std::chrono::steady_clock::now();
+            static_cast<void>(Generate(robot, commands[i], 0.0, seed));
+            elapsed_ms[i] = 1000.0 * std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start).count();
+        }
+        return elapsed_ms;
+    }
+
     void ValidateConfig() const {
         if (!config_.Enabled()) {
             throw std::runtime_error(
@@ -628,27 +691,8 @@ private:
     }
 
     void PlannerLoop() {
-        try {
-            // Apply before session creation so its CPU workers inherit this
-            // thread's affinity and scheduling, not the control loop's.
-            config_.thread.Apply();
-            const auto load_start = std::chrono::steady_clock::now();
-            planner_policy_.Init(planner_policy_config_);
-            const double load_seconds = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - load_start).count();
-            const auto runtime = planner_policy_.GetRuntimeInfo();
-            std::cout << "[sonic_planner] 模型就绪: provider="
-                << runtime.initialized_provider << ", load_s="
-                << load_seconds << std::endl;
-        } catch (const std::exception &error) {
-            std::cerr << "[sonic_planner] 模型初始化失败: "
-                << error.what() << std::endl;
-            std::lock_guard<std::mutex> lock(mutex_);
-            error_ = std::string("[sonic_planner] initialization failed: ") + error.what();
-            running_ = false;
-            return;
-        }
-
+        // The calling thread joins the inference work; keep it on the planner CPUs.
+        config_.thread.Apply();
         std::uint64_t handled_generation = 0;
         auto next_periodic = std::chrono::steady_clock::now();
         while (true) {

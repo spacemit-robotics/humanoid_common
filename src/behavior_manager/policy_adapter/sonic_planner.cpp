@@ -43,6 +43,7 @@ constexpr int kPlannerBlendFrames = 8;
 constexpr int kPlannerOutputSize =
     kPlannerMaxFrames * kPlannerQposDim;
 constexpr double kPlannerFps = 30.0;
+constexpr std::chrono::milliseconds kStopPoll{50};
 
 Eigen::Quaternionf NormalizeQuaternion(
     const std::array<float, 4> &quat_wxyz) {
@@ -302,6 +303,7 @@ public:
             idle_ready_at_s_ = 0.0;
             error_.clear();
             failed_.store(false, std::memory_order_release);
+            stop_requested_.store(false, std::memory_order_release);
             running_ = true;
         }
         worker_ = std::thread(&Impl::PlannerLoop, this);
@@ -339,12 +341,12 @@ public:
         return std::atomic_load(&motion_);
     }
 
+    // Called from the control thread when the policy exits; must not wait
+    // for the low-priority planner thread to release mutex_. A wakeup lost
+    // to the race costs the worker at most one bounded wait (kStopPoll).
     void RequestStop() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            running_ = false;
-        }
-        condition_.notify_one();
+        stop_requested_.store(true, std::memory_order_release);
+        condition_.notify_all();
         planner_policy_.RequestInferenceTermination();
     }
 
@@ -714,7 +716,7 @@ private:
             std::shared_ptr<const SonicPlannerMotion> source;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                while (running_) {
+                while (Running()) {
                     const bool command_request =
                         request_generation_ != handled_generation;
                     const bool periodic_request = has_snapshot_ &&
@@ -724,14 +726,11 @@ private:
                         (command_request || periodic_request)) {
                         break;
                     }
-                    if (has_snapshot_ &&
-                        NeedsPeriodicReplan(latest_command_)) {
-                        condition_.wait_until(lock, next_periodic);
-                    } else {
-                        condition_.wait(lock);
-                    }
+                    const auto poll = std::chrono::steady_clock::now() + kStopPoll;
+                    condition_.wait_until(lock, has_snapshot_ &&
+                        NeedsPeriodicReplan(latest_command_) ? std::min(next_periodic, poll) : poll);
                 }
-                if (!running_) {
+                if (!Running()) {
                     return;
                 }
                 robot = latest_robot_;
@@ -752,7 +751,7 @@ private:
                 double publish_time_s = 0.0;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    if (!running_) return;
+                    if (!Running()) return;
                     publish_time_s = latest_elapsed_s_;
                 }
                 // Build the immutable trajectory outside the tracker-facing lock.
@@ -763,7 +762,7 @@ private:
                     std::move(blend.motion));
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    if (!running_) return;
+                    if (!Running()) return;
                     std::atomic_store(&motion_, std::move(next_motion));
                     idle_ = SelectMode(command) == 0;
                     idle_ready_at_s_ = MotionEndTime(generated, config_.output_fps);
@@ -774,7 +773,7 @@ private:
                     source_idle);
             } catch (const std::exception &error) {
                 std::lock_guard<std::mutex> lock(mutex_);
-                if (!running_) return;
+                if (!Running()) return;
                 error_ = std::string("[sonic_planner] inference failed: ") + error.what();
                 failed_.store(true, std::memory_order_release);
                 running_ = false;
@@ -865,11 +864,21 @@ private:
         last_late_report_ = now;
     }
 
+    // Non-realtime callers only (Reset, destruction): joins the worker.
     void Stop() {
         RequestStop();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            running_ = false;
+        }
+        condition_.notify_all();
         if (worker_.joinable()) {
             worker_.join();
         }
+    }
+
+    bool Running() const {
+        return running_ && !stop_requested_.load(std::memory_order_acquire);
     }
 
     SonicPlannerConfig config_;
@@ -881,6 +890,7 @@ private:
     std::condition_variable condition_;
     std::thread worker_;
     bool running_ = false;
+    std::atomic<bool> stop_requested_{false};
     bool has_snapshot_ = false;
     robot_base::RobotData latest_robot_;
     robot_base::Command latest_command_;

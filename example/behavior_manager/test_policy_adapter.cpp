@@ -1109,9 +1109,14 @@ void TestSonicPlannerTrackerDoesNotBlock() {
             std::chrono::steady_clock::now() - start).count());
         Require(motion && !motion->frames.empty(), "tracker read an empty plan");
     }
+    // RequestStop runs on the control thread when the policy exits.
+    const auto stop_start = std::chrono::steady_clock::now();
     planner.RequestStop();
+    const double stop_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - stop_start).count();
     Require(worst_ms < 5.0, "tracker-facing planner calls blocked for " +
         std::to_string(worst_ms) + " ms");
+    Require(stop_ms < 5.0, "RequestStop blocked for " + std::to_string(stop_ms) + " ms");
 }
 
 // One joint, 50 fps; position follows `value` so blends are easy to read back.

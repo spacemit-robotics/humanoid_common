@@ -317,11 +317,10 @@ public:
     void Update(const robot_base::RobotData &robot,
         const robot_base::Command &command,
         double elapsed_s) {
-        bool command_changed = false;
         {
             std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
             if (!lock.owns_lock()) return;
-            command_changed = CommandChanged(
+            const bool command_changed = CommandChanged(
                 latest_command_, command, config_.command_epsilon);
             latest_robot_ = robot;
             latest_command_ = command;
@@ -331,9 +330,7 @@ public:
                 ++request_generation_;
             }
         }
-        if (command_changed) {
-            condition_.notify_one();
-        }
+        // Coalesce updates until the next check tick; only stopping wakes the worker early.
     }
 
     std::shared_ptr<const SonicPlannerMotion> Motion() const {
@@ -427,9 +424,16 @@ private:
                 "[sonic_planner] enabled=true 时必须配置 model_path");
         }
         if (config_.output_fps <= 0.0 ||
-            config_.replan_interval <= 0.0 || config_.lookahead < 0.0) {
+            config_.check_interval < std::chrono::duration<double>(
+                std::chrono::steady_clock::duration{1}).count() ||
+            !std::isfinite(config_.check_interval) ||
+            config_.replan_interval <= 0.0 || config_.running_replan_interval <= 0.0 ||
+            config_.crawling_replan_interval <= 0.0 || config_.lookahead < 0.0 ||
+            !std::isfinite(config_.replan_interval) || !std::isfinite(config_.lookahead) ||
+            !std::isfinite(config_.running_replan_interval) ||
+            !std::isfinite(config_.crawling_replan_interval)) {
             throw std::runtime_error(
-                "[sonic_planner] fps/replan_interval/lookahead 配置无效");
+                "[sonic_planner] fps/check_interval/replan_interval/lookahead 配置无效");
         }
         if (config_.mode < -1 || config_.mode > 26) {
             throw std::runtime_error(
@@ -711,30 +715,34 @@ private:
         config_.thread.Apply();
         std::uint64_t handled_generation = 0;
         bool retry_expired_plan = false;
-        auto next_periodic = std::chrono::steady_clock::now();
+        const auto check_interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(config_.check_interval));
+        auto next_check = std::chrono::steady_clock::now();
+        auto next_periodic = next_check;
         // Reused across plans so copying the snapshot under the lock does not allocate.
         robot_base::RobotData robot;
         while (true) {
             robot_base::Command command;
             double elapsed_s = 0.0;
             bool source_idle = false;
+            std::chrono::steady_clock::time_point check_time;
             std::shared_ptr<const SonicPlannerMotion> source;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 while (Running()) {
-                    const bool command_request =
-                        request_generation_ != handled_generation;
-                    const bool periodic_request = has_snapshot_ &&
-                        (retry_expired_plan || NeedsPeriodicReplan(latest_command_)) &&
-                        std::chrono::steady_clock::now() >= next_periodic;
-                    if (has_snapshot_ &&
-                        (command_request || periodic_request)) {
-                        break;
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= next_check) {
+                        next_check = now + check_interval;
+                        const bool command_request = request_generation_ != handled_generation;
+                        const bool periodic_request =
+                            (retry_expired_plan || NeedsPeriodicReplan(latest_command_)) &&
+                            now >= next_periodic;
+                        if (has_snapshot_ && (command_request || periodic_request)) {
+                            check_time = now;
+                            break;
+                        }
                     }
-                    const auto poll = std::chrono::steady_clock::now() + kStopPoll;
-                    condition_.wait_until(lock, has_snapshot_ &&
-                        (retry_expired_plan || NeedsPeriodicReplan(latest_command_))
-                            ? std::min(next_periodic, poll) : poll);
+                    condition_.wait_until(lock, std::min(next_check, now + kStopPoll));
                 }
                 if (!Running()) {
                     return;
@@ -785,10 +793,17 @@ private:
                 running_ = false;
                 return;
             }
-            // The configured interval is start-to-start, including inference.
-            next_periodic = infer_start +
+            // Measure from the triggering check, so snapshot copying does not miss a run-mode tick.
+            next_periodic = check_time +
                 std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                    std::chrono::duration<double>(config_.replan_interval));
+                    std::chrono::duration<double>(SelectMode(command) == 3
+                        ? config_.running_replan_interval : SelectMode(command) == 8
+                            ? config_.crawling_replan_interval : config_.replan_interval));
+            // Skip ticks missed during inference, rather than immediately running queued requests.
+            const auto now = std::chrono::steady_clock::now();
+            if (next_check <= now) {
+                next_check += check_interval * ((now - next_check) / check_interval + 1);
+            }
         }
     }
 

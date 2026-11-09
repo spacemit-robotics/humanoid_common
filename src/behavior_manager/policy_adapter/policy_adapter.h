@@ -96,7 +96,10 @@ struct SonicPlannerConfig {
     rl_policy::InferenceRuntimeConfig runtime;
     robot_base::ThreadLoop thread = robot_base::ThreadLoop::Background("motion_planner");
     double output_fps = 50.0;
+    double check_interval = 0.1;
     double replan_interval = 1.0;
+    double running_replan_interval = 0.1;
+    double crawling_replan_interval = 0.2;
     double lookahead = 0.04;
     double default_height = 0.788740;
     double facing_horizon = 1.0;
@@ -106,7 +109,7 @@ struct SonicPlannerConfig {
     int mode = -1;
     int random_seed = 1234;
     std::vector<int> allowed_pred_num_tokens = {
-        0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0};
+        0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0};
 
     bool Enabled() const { return enabled && !model_path.empty(); }
 };
@@ -134,6 +137,15 @@ struct Config {
     JointTrajectoryConfig joint_trajectory;
     ReferenceMotionCatalogConfig reference_motion_catalog;
     SonicPlannerConfig sonic_planner;
+
+    struct SonicEncoderConfig {
+        std::string model_path;
+        std::string observation_term = "sonic_latent";
+        int latent_dim = 64;
+        rl_policy::InferenceRuntimeConfig runtime;
+
+        bool Enabled() const { return !model_path.empty(); }
+    } sonic_encoder;
 
     // Used for a stationary goal when reference_file is not configured.
     struct SupermimicConfig {

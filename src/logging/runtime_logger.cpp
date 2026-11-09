@@ -882,8 +882,15 @@ private:
                 if (value["boot_id"].as<std::string>() == boot_id_ && age >= 0 &&
                     age < std::max(config_.post_trigger_s, config_.trigger_cooldown_s) &&
                     (!fatal || (age < config_.post_trigger_s && existing != seen_capture_))) {
-                    StartCapture(existing, value["reason"].as<std::string>(),
-                        std::max(0.0, config_.post_trigger_s - age), fatal);
+                    if (fatal) {
+                        // Upgrade the peer request even if this writer has not
+                        // joined it yet; every process gets a full fault window.
+                        WriteCaptureRequest(request, existing, now, reason, true);
+                        StartCapture(existing, reason, config_.post_trigger_s, true);
+                    } else {
+                        StartCapture(existing, value["reason"].as<std::string>(),
+                            std::max(0.0, config_.post_trigger_s - age));
+                    }
                     return;
                 }
             } catch (...) { /* Replace a malformed request. */ }

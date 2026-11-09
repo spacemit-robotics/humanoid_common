@@ -13,6 +13,7 @@
 #include <chrono>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -66,6 +67,10 @@ void RecordTest(const fs::path &root) {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+        // Finalization includes background fsync; do not race it under build/test load.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (runtime_logging::HighRateRequested() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         Require(!runtime_logging::HighRateRequested(), "recording failed to expire");
         runtime_logging::RecordCsv("oversize", "value", std::string(2 * 1024 * 1024, '1'));
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -215,6 +220,41 @@ void FatalCaptureTest(const fs::path &root) {
     Require(Lines(incidents[1] / "extensions.jsonl") == 1, "second error did not extend the capture");
 }
 
+// An error must upgrade a peer warning even before this writer has joined it.
+void PeerFatalCaptureTest(const fs::path &root) {
+    const auto config = root / "peer_fatal.yaml";
+    std::ofstream(config) << "robot_base: {name: peer_fatal}\nlogging:\n  directory: logs\n"
+        "  console: {enabled: false}\n  file: {enabled: true}\n"
+        "  blackbox: {enabled: true, pre_trigger_s: 2, post_trigger_s: 10, cooldown_s: 30}\n";
+    const auto yaml = robot_base::YamlFile::Load(config.string());
+    runtime_logging::Session logging(yaml, config.string(), "driver", false);
+    const auto request = fs::path(runtime_logging::GetConfig().directory) / ".peer_fatal.capture.json";
+    std::string boot_id;
+    std::ifstream boot("/proc/sys/kernel/random/boot_id");
+    std::getline(boot, boot_id);
+    Require(!boot_id.empty(), "cannot read boot ID for peer capture test");
+    const double old_time = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() - 3.0;
+    // Older than the polling window but still inside the peer's post-trigger window.
+    std::ofstream(request) << "{\"id\":\"peer_warning\",\"boot_id\":\"" << boot_id
+        << "\",\"monotonic_s\":" << std::setprecision(17) << old_time
+        << ",\"fatal\":0,\"reason\":\"warning in peer\"}";
+    runtime_logging::Log(runtime_logging::Level::kError, "local error upgrades peer warning", false);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    YAML::Node updated;
+    while (std::chrono::steady_clock::now() < deadline) {
+        updated = YAML::LoadFile(request.string());
+        if (updated["fatal"].as<int>(0) == 1) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    Require(updated["fatal"].as<int>(0) == 1, "peer warning was not upgraded for other processes");
+    Require(updated["id"].as<std::string>() == "peer_warning", "peer incident ID was not retained");
+    Require(updated["monotonic_s"].as<double>() > old_time + 2.0,
+        "peer error retained the warning's old recording deadline");
+    Require(updated["reason"].as<std::string>().find("local error upgrades peer warning") != std::string::npos,
+        "peer error retained the warning's reason");
+}
+
 void ProducerTest() {
     std::atomic<bool> release{false};
     std::atomic<bool> entered{false};
@@ -272,6 +312,7 @@ int main() {
         EarlyCaptureTest(root, false);
         EarlyCaptureTest(root, true);
         FatalCaptureTest(root);
+        PeerFatalCaptureTest(root);
         StorageTest(root);
         WriteRecoveryTest(root);
         fs::remove_all(root);

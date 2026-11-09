@@ -114,8 +114,9 @@ std::string StateRoot() {
     if (home && *home) return std::string(home) + "/.local/state";
     throw std::runtime_error("operator service requires HOME or XDG_STATE_HOME");
 }
-std::optional<Velocity> ReadTeleopVector(const robot_base::YamlFile &yaml, const std::string &name, bool positive) {
-    const auto key = "operator_service.teleop." + name;
+std::optional<Velocity> ReadTeleopVector(const robot_base::YamlFile &yaml, const std::string &name, bool positive,
+    const std::string &base = "operator_service.teleop") {
+    const auto key = base + "." + name;
     const auto values = yaml.Read<std::vector<double>>(key);
     if (!values) return std::nullopt;
     if (values->size() != 3 || std::any_of(values->begin(), values->end(), [positive](double value) {
@@ -230,6 +231,12 @@ Config LoadConfig(const std::string &path) {
         const auto limits = runtime_config::LoadOnePolicyCommandLimits(yaml, name);
         p.minimum = {limits.min_vx, limits.min_vy, limits.min_wz};
         p.maximum = {limits.max_vx, limits.max_vy, limits.max_wz};
+        p.slow_limits = ReadTeleopVector(yaml, "slow_limits", false, base + ".command.teleop");
+        p.fast_limits = ReadTeleopVector(yaml, "fast_limits", false, base + ".command.teleop");
+        const auto slow = p.slow_limits ? p.slow_limits : c.teleop.slow_limits;
+        const auto fast = p.fast_limits ? p.fast_limits : c.teleop.fast_limits;
+        if (slow && fast && (slow->vx > fast->vx || slow->vy > fast->vy || slow->wz > fast->wz))
+            throw std::runtime_error(base + ".command.teleop slow_limits must not exceed fast_limits");
         const std::string adapter = base + ".policy_adapter";
         const auto type = yaml.Read<std::string>(adapter + ".type").value_or("");
         const auto configured = yaml.Read<std::string>(adapter +

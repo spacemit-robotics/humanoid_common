@@ -225,7 +225,8 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
                 Velocity target{};
                 const double dt = std::clamp(std::chrono::duration<double>(now - last_send).count(), 0.0, 0.1);
                 if (ready && armed && it != policies.end()) {
-                    target = operator_gamepad::Scale(input, *it, fast ? config.fast : config.slow);
+                    const auto caps = operator_gamepad::SpeedCaps(*it, fast, fast ? config.fast : config.slow);
+                    target = operator_gamepad::Scale(input, *it, caps);
                     if (it->client_smoothing) {
                         target = {
                             operator_gamepad::Advance(output.vx, target.vx, config.acceleration[0],

@@ -10,7 +10,7 @@ try {
   else token = sessionStorage.getItem("operator.session") || "";
 } catch (_) { /* Browser privacy mode can disable tab storage. */ }
 let lastActionCatalog = "", lastPolicyCatalog = "";
-let lastVelocityCatalog = "", speedPresetsInitialized = false;
+let lastVelocityCatalog = "";
 const motion = new window.OperatorTeleop.Motion();
 const keys = new Set();
 const pointers = new Map();
@@ -245,14 +245,14 @@ function render() {
     $("action").replaceChildren(...actions.map(a => new Option(a.display_name, a.key)));
     lastActionCatalog = signature;
   }
-  const velocityCatalog = JSON.stringify([p?.name, p?.minimum, p?.maximum, p?.client_smoothing, catalog?.teleop]);
+  const velocityCatalog = JSON.stringify([p?.name, p?.minimum, p?.maximum, p?.client_smoothing,
+    p?.teleop, catalog?.teleop]);
   if (velocityCatalog !== lastVelocityCatalog) {
     lastVelocityCatalog = velocityCatalog;
     endMotion();
     motion.mode = 'slow';
     motion.configure(p, catalog?.teleop);
-    updateSpeedPresets(!speedPresetsInitialized);
-    if (p && ['vx','vy','wz'].some(axis => !$("speed-" + axis).disabled)) speedPresetsInitialized = true;
+    updateSpeedPresets(true);
   }
   const rl = !trajectory && owns && status.state === 'RL' && !fault?.latched;
   const actionReady = owns && status.state === (trajectory ? 'TRAJECTORY' : 'RL') && !fault?.latched;
@@ -344,6 +344,7 @@ function renderMotion() {
     const movable = stick.dataset.stick === 'move' ? caps[0] || caps[1] : caps[2];
     stick.setAttribute('aria-disabled', String(!allowed || !movable));
   });
+  $('speed-modes').hidden = !motion.hasSpeedModes;
   document.querySelectorAll('[data-speed-mode]').forEach(button => {
     const active = button.dataset.speedMode === motion.mode;
     button.classList.toggle('active', active);
@@ -445,6 +446,7 @@ document.querySelectorAll('[data-motion]').forEach(button => {
 });
 document.querySelectorAll('[data-speed-mode]').forEach(button => {
   button.onclick = () => {
+    if (!motion.hasSpeedModes) return;
     const changed = motion.mode !== button.dataset.speedMode;
     motion.mode = button.dataset.speedMode; updateSpeedPresets(true); renderMotion();
     if (changed && status?.owns_control) clientEvent('teleop_preset', motion.mode);

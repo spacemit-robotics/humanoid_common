@@ -32,7 +32,7 @@
             this.configure();
         }
         configure(policy, config = {}) {
-            this.config = config;
+            this.config = {...config, ...policy?.teleop};
             this.clientSmoothing = policy?.client_smoothing !== false;
             this.minimum = zero();
             this.maximum = zero();
@@ -46,10 +46,16 @@
                 this.value[axis] = clamp(this.value[axis], this.minimum[axis], this.maximum[axis]);
             }
         }
-        limits(axis) {
-            const fallback = Math.max(-this.minimum[axis], this.maximum[axis]) * (this.mode === "slow" ? 0.4 : 1);
-            const cap = Math.max(0, finite(this.config[`${this.mode}_limits`]?.[axis], fallback));
+        limits(axis, mode = this.mode) {
+            const fallback = Math.max(-this.minimum[axis], this.maximum[axis]) * (mode === "slow" ? 0.4 : 1);
+            const cap = Math.max(0, finite(this.config[`${mode}_limits`]?.[axis], fallback));
             return {min: Math.max(this.minimum[axis], -cap), max: Math.min(this.maximum[axis], cap)};
+        }
+        get hasSpeedModes() {
+            return axes.some(axis => {
+                const slow = this.limits(axis, "slow"), fast = this.limits(axis, "fast");
+                return slow.min !== fast.min || slow.max !== fast.max;
+            });
         }
         step(input, dt) {
             dt = clamp(finite(dt, 0), 0, 0.1);

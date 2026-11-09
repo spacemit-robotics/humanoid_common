@@ -203,15 +203,19 @@ SonicPlannerBlend BlendSonicPlannerMotion(const SonicPlannerMotion &current,
     // reference being tracked, or the tracker sees a step at publication.
     result.blend_start_s = std::max(generated.start_time_s, publish_time_s);
     const double generated_end_s = MotionEndTime(generated, fps);
-    if (generated_end_s < publish_time_s) {
+    if (generated_end_s <= publish_time_s) {
         result.expired = true;
-        result.motion = generated;
         return result;
     }
 
+    // Hold the generated endpoint when its remaining duration is shorter
+    // than the crossfade, so the published motion still reaches weight 1.
+    const double blend_end_s = result.blend_start_s +
+        static_cast<double>(blend_frames) / fps;
+    const double output_end_s = std::max(generated_end_s, blend_end_s);
     const int output_frames = std::max(2,
-        static_cast<int>(std::floor(
-            (generated_end_s - publish_time_s) * fps)) + 1);
+        static_cast<int>(std::ceil(
+            (output_end_s - publish_time_s) * fps)) + 1);
     result.motion.frames.reserve(output_frames);
     result.motion.start_time_s = publish_time_s;
     for (int frame_index = 0; frame_index < output_frames; ++frame_index) {
@@ -290,8 +294,8 @@ public:
         planner_policy_.ClearInferenceTermination();
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            std::atomic_store(&motion_,
-                std::make_shared<const SonicPlannerMotion>(BuildSeedMotion(robot)));
+            motion_ = std::make_shared<const SonicPlannerMotion>(BuildSeedMotion(robot));
+            tracker_motion_ = motion_;
             latest_robot_ = robot;
             latest_command_ = {};
             latest_elapsed_s_ = 0.0;
@@ -302,7 +306,6 @@ public:
             idle_ = false;
             idle_ready_at_s_ = 0.0;
             error_.clear();
-            failed_.store(false, std::memory_order_release);
             stop_requested_.store(false, std::memory_order_release);
             running_ = true;
         }
@@ -334,11 +337,12 @@ public:
     }
 
     std::shared_ptr<const SonicPlannerMotion> Motion() const {
-        if (failed_.load(std::memory_order_acquire)) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            throw std::runtime_error(error_);
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (lock.owns_lock()) {
+            if (!error_.empty()) throw std::runtime_error(error_);
+            tracker_motion_ = motion_;
         }
-        return std::atomic_load(&motion_);
+        return tracker_motion_;
     }
 
     // Called from the control thread when the policy exits; must not wait
@@ -706,6 +710,7 @@ private:
         // The calling thread joins the inference work; keep it on the planner CPUs.
         config_.thread.Apply();
         std::uint64_t handled_generation = 0;
+        bool retry_expired_plan = false;
         auto next_periodic = std::chrono::steady_clock::now();
         // Reused across plans so copying the snapshot under the lock does not allocate.
         robot_base::RobotData robot;
@@ -720,7 +725,7 @@ private:
                     const bool command_request =
                         request_generation_ != handled_generation;
                     const bool periodic_request = has_snapshot_ &&
-                        NeedsPeriodicReplan(latest_command_) &&
+                        (retry_expired_plan || NeedsPeriodicReplan(latest_command_)) &&
                         std::chrono::steady_clock::now() >= next_periodic;
                     if (has_snapshot_ &&
                         (command_request || periodic_request)) {
@@ -728,7 +733,8 @@ private:
                     }
                     const auto poll = std::chrono::steady_clock::now() + kStopPoll;
                     condition_.wait_until(lock, has_snapshot_ &&
-                        NeedsPeriodicReplan(latest_command_) ? std::min(next_periodic, poll) : poll);
+                        (retry_expired_plan || NeedsPeriodicReplan(latest_command_))
+                            ? std::min(next_periodic, poll) : poll);
                 }
                 if (!Running()) {
                     return;
@@ -736,9 +742,9 @@ private:
                 robot = latest_robot_;
                 command = latest_command_;
                 elapsed_s = latest_elapsed_s_;
-                source = std::atomic_load(&motion_);
+                source = motion_;
                 // Seed and standing plans are static; holding their last frame is expected.
-                source_idle = idle_ || plan_count_ == 0;
+                source_idle = idle_ || published_generation_ == 0;
                 handled_generation = request_generation_;
             }
 
@@ -758,14 +764,15 @@ private:
                 // Only this worker publishes motion between Reset and Stop.
                 SonicPlannerBlend blend = BlendSonicPlannerMotion(*source,
                     generated, publish_time_s, config_.output_fps, kPlannerBlendFrames);
-                auto next_motion = std::make_shared<const SonicPlannerMotion>(
-                    std::move(blend.motion));
-                {
+                retry_expired_plan = blend.expired;
+                if (!blend.expired) {
+                    auto next_motion = std::make_shared<const SonicPlannerMotion>(
+                        std::move(blend.motion));
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (!Running()) return;
-                    std::atomic_store(&motion_, std::move(next_motion));
+                    motion_ = std::move(next_motion);
                     idle_ = SelectMode(command) == 0;
-                    idle_ready_at_s_ = MotionEndTime(generated, config_.output_fps);
+                    idle_ready_at_s_ = MotionEndTime(*motion_, config_.output_fps);
                     published_generation_ = handled_generation;
                 }
                 ++plan_count_;
@@ -775,7 +782,6 @@ private:
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (!Running()) return;
                 error_ = std::string("[sonic_planner] inference failed: ") + error.what();
-                failed_.store(true, std::memory_order_release);
                 running_ = false;
                 return;
             }
@@ -822,7 +828,7 @@ private:
         plan_log_->Publish(record);
     }
 
-    // Formatter thread only: one CSV row per published plan and a warning,
+    // Formatter thread only: one CSV row per completed plan and a warning,
     // at most every 10 s, when inference outlasted the lookahead budget.
     void LogPlan(const PlanRecord &record) {
         std::ostringstream row;
@@ -842,8 +848,8 @@ private:
             late_plans_ = 0;
             std::ostringstream detail;
             detail << std::fixed << std::setprecision(1)
-                << "SONIC planner first plan published: mode=" << record.mode
-                << ", infer_ms=" << record.infer_ms;
+                << "SONIC planner first plan completed: mode=" << record.mode
+                << ", infer_ms=" << record.infer_ms << ", expired=" << record.expired;
             runtime_logging::Log(runtime_logging::Level::kInfo, detail.str(), false);
         }
         // Holding the last frame of a static plan is normal; only a moving
@@ -855,7 +861,7 @@ private:
         if (late_plans_ > 1 && now - last_late_report_ < std::chrono::seconds(10)) return;
         std::ostringstream detail;
         detail << std::fixed << std::setprecision(1)
-            << "SONIC planner plan published late: plan=" << record.plan
+            << "SONIC planner plan completed late: plan=" << record.plan
             << ", infer_ms=" << record.infer_ms << ", lookahead_ms=" << config_.lookahead * 1000.0
             << ", late_ms=" << record.late_s * 1000.0
             << ", reference_stalled_ms=" << stalled_s * 1000.0
@@ -903,9 +909,10 @@ private:
     bool idle_ = false;
     double idle_ready_at_s_ = 0.0;
     std::string error_;
-    std::atomic<bool> failed_{false};
-    // Published with std::atomic_store so the tracker reads it without mutex_.
+    // Protected by mutex_; the single tracker reader uses try_lock and its
+    // own cached snapshot, avoiding shared_ptr atomic operations' internal lock.
     std::shared_ptr<const SonicPlannerMotion> motion_;
+    mutable std::shared_ptr<const SonicPlannerMotion> tracker_motion_;
     // Declared last: stops before the members its formatter reads are destroyed.
     std::unique_ptr<runtime_logging::SnapshotWorker<PlanRecord, 16>> plan_log_;
 };

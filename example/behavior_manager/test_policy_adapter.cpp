@@ -1079,7 +1079,7 @@ void TestSonicPlannerScheduling(PlannerPlacement placement) {
 }
 
 // The tracker thread must not wait for a planner that is busy or starved:
-// publication is lock-free for readers and Update skips while the planner
+// readers retain their previous snapshot and Update skips while the planner
 // holds its state lock.
 void TestSonicPlannerTrackerDoesNotBlock() {
     using behavior_manager::policy_adapter::SonicPlanner;
@@ -1146,8 +1146,8 @@ void TestSonicPlannerLateBlend() {
         "on-time plan must keep the full crossfade");
     Require(std::abs(on_time.blend_start_s - 0.8) < 1.0e-9, "on-time crossfade must start at the plan");
 
-    // 1.107 s inference as on G1 (11/04): the plan is published 0.307 s
-    // after its own start. The first published frame must still equal the
+    // The plan is published 0.307 s after its own start.
+    // The first published frame must still equal the
     // tracked reference and the new pose must arrive over eight frames.
     const auto late = BlendSonicPlannerMotion(current, generated, 1.107, kFps, kBlend);
     Require(!late.expired && std::abs(late.late_s - 0.307) < 1.0e-9, "late plan was not measured");
@@ -1161,11 +1161,29 @@ void TestSonicPlannerLateBlend() {
     }
     Require(late.motion.frames.back().dof_pos[0] == 1.0F, "late plan never reached the new pose");
 
+    // A short remaining horizon must not truncate the crossfade.
+    const auto near_end = BlendSonicPlannerMotion(current, generated, 1.96, kFps, kBlend);
+    Require(!near_end.expired && near_end.motion.frames.size() >= kBlend + 1,
+        "near-expired plan truncated its crossfade");
+    Require(near_end.motion.frames.front().dof_pos[0] == 0.0F &&
+        near_end.motion.frames.back().dof_pos[0] == 1.0F,
+        "near-expired plan did not complete the handoff");
+    for (std::size_t i = 1; i < near_end.motion.frames.size(); ++i) {
+        const float step = near_end.motion.frames[i].dof_pos[0] -
+            near_end.motion.frames[i - 1].dof_pos[0];
+        Require(step >= 0.0F && step <= 1.0F / kBlend + 1.0e-6F,
+            "extended crossfade advanced faster than one blend step per frame");
+    }
+
     // Inference longer than the whole new plan: the plan has expired and the
     // tracked reference has already stalled; both are reported.
     const auto stale_reference = ConstantMotion(0.0, 51, 0.0F);
     const auto expired = BlendSonicPlannerMotion(stale_reference, generated, 2.5, kFps, kBlend);
-    Require(expired.expired && expired.stale_s > 1.4, "expired plan was not reported");
+    Require(expired.expired && expired.stale_s > 1.4 && expired.motion.frames.empty(),
+        "expired plan must be discarded instead of replacing the current reference");
+    const auto at_end = BlendSonicPlannerMotion(current, generated, 2.0, kFps, kBlend);
+    Require(at_end.expired && at_end.motion.frames.empty(),
+        "a plan with no remaining horizon must not be published");
 }
 
 void TestSonicPrepareInputs() {

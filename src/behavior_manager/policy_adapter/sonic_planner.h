@@ -41,7 +41,7 @@ struct SonicPlannerBlend {
     double late_s = 0.0;         ///< 发布晚于新轨迹起点的时长
     double stale_s = 0.0;        ///< 发布前旧参考已经播完、停在末帧的时长
     int blend_frames = 0;        ///< 新旧参考实际过渡的帧数
-    bool expired = false;        ///< 新轨迹在发布前已经结束，只能直接替换
+    bool expired = false;        ///< 新轨迹已过期，motion 为空，调用方保留旧参考
 };
 
 /** @brief 按绝对 RL 时间采样参考；超出两端时取端点帧 */
@@ -52,7 +52,7 @@ SonicMotionFrame SampleSonicPlannerMotion(const SonicPlannerMotion &motion,
  * @brief 把新规划拼接到当前参考
  *
  * 过渡从新轨迹起点和发布时刻中较晚的一个开始，推理超过 lookahead 时
- * 仍保留完整的 blend_frames 帧过渡，不在发布瞬间跳到新轨迹。
+ * 仍保留完整的 blend_frames 帧过渡；剩余帧不足时延长末帧，已过期时丢弃。
  */
 SonicPlannerBlend BlendSonicPlannerMotion(const SonicPlannerMotion &current,
     const SonicPlannerMotion &generated, double publish_time_s, double fps,
@@ -78,7 +78,7 @@ public:
         const robot_base::Command &command,
         double elapsed_s);
 
-    /** @brief 获取当前已发布参考轨迹的只读快照，发布新轨迹不修改旧快照 */
+    /** @brief 单一 tracker 线程读取只读快照，发布繁忙时沿用上次快照；Reset 不得并发 */
     std::shared_ptr<const SonicPlannerMotion> Motion() const;
 
     /** @brief Request cancellation without blocking the caller. */

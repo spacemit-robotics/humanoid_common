@@ -1975,6 +1975,10 @@ Config LoadConfig(const std::string &yaml_path,
             encoder.runtime.threads = yaml.Read<int>(encoder_base + ".runtime.threads").value_or(1);
             encoder.runtime.affinity = yaml.Read<std::string>(
                 encoder_base + ".runtime.affinity").value_or("");
+            encoder.runtime.worker_sched = yaml.Read<std::string>(
+                encoder_base + ".runtime.worker_sched").value_or("");
+            encoder.runtime.worker_priority = yaml.Read<int>(
+                encoder_base + ".runtime.worker_priority").value_or(0);
             encoder.runtime.ort_spinning = yaml.Read<bool>(
                 encoder_base + ".runtime.ort_spinning").value_or(false);
             encoder.runtime.warmup_runs = yaml.Read<int>(
@@ -2014,6 +2018,10 @@ Config LoadConfig(const std::string &yaml_path,
                 planner_base + ".runtime.threads").value_or(2);
             config.sonic_planner.runtime.affinity = yaml.Read<std::string>(
                 planner_base + ".runtime.affinity").value_or("");
+            config.sonic_planner.runtime.worker_sched = yaml.Read<std::string>(
+                planner_base + ".runtime.worker_sched").value_or("");
+            config.sonic_planner.runtime.worker_priority = yaml.Read<int>(
+                planner_base + ".runtime.worker_priority").value_or(0);
             config.sonic_planner.runtime.ort_spinning = yaml.Read<bool>(
                 planner_base + ".runtime.ort_spinning").value_or(false);
             config.sonic_planner.runtime.ep_dump_subgraphs = yaml.Read<bool>(

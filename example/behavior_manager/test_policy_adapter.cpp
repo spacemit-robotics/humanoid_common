@@ -898,25 +898,31 @@ void TestSonicPlannerConfig() {
         "          future_step: 5\n"
         "          encoder:\n"
         "            model_path: encoder.onnx\n"
-        "            runtime: {provider: auto, threads: 2, ort_spinning: false}\n"
+        "            runtime: {provider: cpu, threads: 2, ort_spinning: false, "
+        "worker_sched: fifo, worker_priority: 55}\n"
         "          planner:\n"
         "            enabled: true\n"
         "            model_path: planner.onnx\n"
         "            check_interval: 0.2\n"
         "            lookahead: 0.8\n"
         "            replan_interval: 0.5\n"
-        "            runtime: {provider: cpu, threads: 4, ort_spinning: false}\n");
+        "            runtime: {provider: cpu, threads: 4, ort_spinning: false, "
+        "worker_sched: other, worker_priority: 0}\n");
     auto config = LoadConfig(yaml.Path().string(), "planner",
         fs::temp_directory_path().string());
     Require(config.reference_file.empty() && config.sonic_planner.Enabled(),
         "planner should not require a recorded reference");
     Require(config.sonic_planner.runtime.threads == 4 &&
         !config.sonic_planner.runtime.ort_spinning &&
+        config.sonic_planner.runtime.worker_sched == "other" &&
+        config.sonic_planner.runtime.worker_priority == 0 &&
         config.sonic_planner.lookahead == 0.8 && config.sonic_planner.check_interval == 0.2 &&
         config.sonic_planner.replan_interval == 0.5,
         "planner runtime and timing must come from YAML");
     Require(config.sonic_encoder.Enabled() && config.sonic_encoder.latent_dim == 64 &&
-        config.sonic_encoder.runtime.provider == "auto" && config.sonic_encoder.runtime.threads == 2 &&
+        config.sonic_encoder.runtime.provider == "cpu" && config.sonic_encoder.runtime.threads == 2 &&
+        config.sonic_encoder.runtime.worker_sched == "fifo" &&
+        config.sonic_encoder.runtime.worker_priority == 55 &&
         !config.sonic_encoder.runtime.ort_spinning,
         "encoder runtime must come from YAML");
     const auto &thread = config.sonic_planner.thread;

@@ -17,9 +17,12 @@ Json Encode(const Policy &p) {
     Json actions = Json::array();
     for (const auto &a : p.actions)
         actions.push_back({{"key", a.key}, {"display_name", a.display_name}});
-    return {{"name", p.name}, {"manual_reference", p.manual_reference}, {"minimum", Encode(p.minimum)},
+    Json result = {{"name", p.name}, {"manual_reference", p.manual_reference}, {"minimum", Encode(p.minimum)},
         {"maximum", Encode(p.maximum)}, {"actions", actions}, {"client_smoothing", p.client_smoothing},
         {"switch_group", p.switch_group}, {"display_name", p.display_name.empty() ? p.name : p.display_name}};
+    if (p.slow_limits) result["teleop"]["slow_limits"] = Encode(*p.slow_limits);
+    if (p.fast_limits) result["teleop"]["fast_limits"] = Encode(*p.fast_limits);
+    return result;
 }
 Json Encode(const RequestResult &r) {
     return {{"sequence", r.sequence}, {"operation", r.operation}, {"phase", r.phase}, {"message", r.message}};
@@ -76,6 +79,9 @@ Policy DecodePolicy(const Json &v) {
     p.switch_group = v.value("switch_group", "");
     p.minimum = ReadVelocity(v.at("minimum"));
     p.maximum = ReadVelocity(v.at("maximum"));
+    const auto teleop = v.value("teleop", Json::object());
+    if (teleop.contains("slow_limits")) p.slow_limits = ReadVelocity(teleop.at("slow_limits"));
+    if (teleop.contains("fast_limits")) p.fast_limits = ReadVelocity(teleop.at("fast_limits"));
     for (const auto &a : v.at("actions"))
         p.actions.push_back({a.at("key"), a.at("display_name")});
     return p;

@@ -302,6 +302,7 @@ void PrintUsage(const char *program) {
     std::cerr << "内存中覆盖参考动作为循环，不修改 YAML\n";
     std::cerr << "  --restart-smoke             ";
     std::cerr << "测量后复用同一 StateRL 对象完成一次退出和重入\n";
+    std::cerr << "  --runtime-from-yaml         使用策略 YAML 的 provider、线程与亲和性\n";
     std::cerr << "\n本工具运行真实 StateRL 周期路径，仅支持 --mode periodic；";
     std::cerr << "未指定 --mode 时默认 periodic。\n";
 }
@@ -344,6 +345,7 @@ Options ParseRuntimeOptions(
             *restart_smoke = true;
             continue;
         }
+        if (index >= 4 && std::string(argv[index]) == "--runtime-from-yaml") continue;
         common_argv.push_back(argv[index]);
     }
 
@@ -774,14 +776,20 @@ int main(int argc, char *argv[]) {
         const std::string requested_ep_affinity = options.ep_affinity.empty()
             ? options.affinity
             : options.ep_affinity;
-        config.policy.runtime.provider = options.provider;
-        config.policy.runtime.threads = options.threads;
-        config.policy.runtime.affinity = rl_benchmark::EpAffinityFromCpuList(
-            requested_ep_affinity, options.threads,
-            rl_benchmark::ShouldConfigureSpaceMITProvider(options.provider));
-        config.policy.runtime.ep_dump_subgraphs = options.ep_dump_subgraphs;
-        config.policy.runtime.ep_profile_prefix = options.ep_profile_prefix;
-        config.policy.runtime.ort_spinning = options.ort_spinning;
+        if (HasOption(argc, argv, "--runtime-from-yaml")) {
+            options.provider = config.policy.runtime.provider;
+            options.threads = config.policy.runtime.threads;
+            options.ort_spinning = config.policy.runtime.ort_spinning;
+        } else {
+            config.policy.runtime.provider = options.provider;
+            config.policy.runtime.threads = options.threads;
+            config.policy.runtime.affinity = rl_benchmark::EpAffinityFromCpuList(
+                requested_ep_affinity, options.threads,
+                rl_benchmark::ShouldConfigureSpaceMITProvider(options.provider));
+            config.policy.runtime.ep_dump_subgraphs = options.ep_dump_subgraphs;
+            config.policy.runtime.ep_profile_prefix = options.ep_profile_prefix;
+            config.policy.runtime.ort_spinning = options.ort_spinning;
+        }
 
         RuntimeCollector collector(static_cast<std::size_t>(std::max(
             options.warmup + options.rounds, 2)));

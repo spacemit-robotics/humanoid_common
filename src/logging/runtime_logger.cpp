@@ -96,8 +96,12 @@ struct QueueItem {
     bool emit_console = false;
     bool console_error = false;
     bool trigger = false;
+    bool fatal = false;  // error-level event: capture even inside the trigger cooldown
     double monotonic_s = 0.0;
 };
+
+// Longest post-trigger recording of one incident, including extensions.
+constexpr double kMaxCaptureSeconds = 120.0;
 
 struct FileState {
     std::ofstream stream;
@@ -524,9 +528,11 @@ public:
             high_rate_.store(false);
             queue_bytes_ = 0;
             last_trigger_ = capture_started_ = -1.0e9;
+            capture_id_.clear();
             last_maintenance_ = last_health_ = 0.0;
             seen_capture_.clear();
             snapshot_pending_.store(false);
+            fatal_pending_.store(false);
             total_dropped_ = 0;
             io_errors_ = 0;
             formatter_drops.store(0);
@@ -627,6 +633,7 @@ public:
         item.emit_console = emit_console && config.console_enabled;
         item.console_error = level >= Level::kWarning;
         item.trigger = level >= Level::kError;
+        item.fatal = item.trigger;
         if (config.file_enabled || item.emit_console) Enqueue(std::move(item));
     }
 
@@ -704,7 +711,7 @@ private:
         std::atomic<int> state{0};  // 0 free, 1 producer owns, 2 ready, 3 consumer owns.
         std::array<char, 4096> line{};
         double monotonic_s = 0;
-        bool emit_console = false, console_error = false;
+        bool emit_console = false, console_error = false, fatal = false;
     };
 
     bool PreserveCritical(const QueueItem &item) {
@@ -717,11 +724,12 @@ private:
             slot.monotonic_s = item.monotonic_s;
             slot.emit_console = item.emit_console;
             slot.console_error = item.console_error;
+            slot.fatal = item.fatal;
             slot.state.store(2, std::memory_order_release);
             condition_.notify_one();
             return true;
         }
-        snapshot_pending_.store(true);
+        (item.fatal ? fatal_pending_ : snapshot_pending_).store(true);
         return false;
     }
 
@@ -734,6 +742,7 @@ private:
             item.emit_console = slot.emit_console;
             item.console_error = slot.console_error;
             item.trigger = true;
+            item.fatal = slot.fatal;
             slot.state.store(0, std::memory_order_release);
             try { WriteRecord(item); } catch (...) { ++dropped_; snapshot_pending_.store(true); }
         }
@@ -791,7 +800,7 @@ private:
 
     void WriteRecord(const QueueItem &item) {
         if (item.trigger && config_.file_enabled && config_.blackbox_enabled) {
-            try { RequestCapture(item.line); } catch (...) { ++dropped_; }
+            try { RequestCapture(item.line, item.fatal); } catch (...) { ++dropped_; }
         }
         if (item.emit_console) {
             std::ostream &output = item.console_error ? std::cerr : std::cout;
@@ -846,45 +855,77 @@ private:
         }
     }
 
-    void RequestCapture(const std::string &reason) {
+    // Warnings share the cooldown. An error-level event always gets a
+    // capture: it extends the incident being recorded, or starts a new one
+    // even inside the cooldown, so an earlier warning cannot hide the fault.
+    void RequestCapture(const std::string &reason, bool fatal = false) {
         const double now = MonotonicSeconds();
-        if (now - last_trigger_ < config_.trigger_cooldown_s) return;
+        if (!fatal && now - last_trigger_ < config_.trigger_cooldown_s) return;
         FileLock guard(std::filesystem::path(config_.directory) / ("." + robot_ + ".capture.lock"));
-        if (!guard.Locked()) { snapshot_pending_.store(true); return; }
+        if (!guard.Locked()) { (fatal ? fatal_pending_ : snapshot_pending_).store(true); return; }
         last_trigger_ = now;
-        const std::string id = std::to_string(static_cast<uint64_t>(now * 1e9)) +
-            "_" + std::to_string(getpid());
         const auto request = std::filesystem::path(config_.directory) / ("." + robot_ + ".capture.json");
+        if (fatal && !capture_.empty()) {
+            // Peers extend the same incident when they read this request.
+            WriteCaptureRequest(request, capture_id_, now, reason, true);
+            StartCapture(capture_id_, reason, config_.post_trigger_s, true);
+            return;
+        }
         // All processes reuse the first trigger in a burst, so their files share one incident ID.
         if (!std::filesystem::is_symlink(request) && std::filesystem::is_regular_file(request) &&
             std::filesystem::file_size(request) <= 4096) {
             try {
                 const auto value = YAML::LoadFile(request.string());
                 const double age = now - value["monotonic_s"].as<double>();
+                const std::string existing = value["id"].as<std::string>();
+                // A fatal event starts its own incident once the previous one is recorded.
                 if (value["boot_id"].as<std::string>() == boot_id_ && age >= 0 &&
-                    age < std::max(config_.post_trigger_s, config_.trigger_cooldown_s)) {
-                    StartCapture(value["id"].as<std::string>(), value["reason"].as<std::string>(),
-                        std::max(0.0, config_.post_trigger_s - age));
+                    age < std::max(config_.post_trigger_s, config_.trigger_cooldown_s) &&
+                    (!fatal || (age < config_.post_trigger_s && existing != seen_capture_))) {
+                    if (fatal) {
+                        // Upgrade the peer request even if this writer has not
+                        // joined it yet; every process gets a full fault window.
+                        WriteCaptureRequest(request, existing, now, reason, true);
+                        StartCapture(existing, reason, config_.post_trigger_s, true);
+                    } else {
+                        StartCapture(existing, value["reason"].as<std::string>(),
+                            std::max(0.0, config_.post_trigger_s - age));
+                    }
                     return;
                 }
             } catch (...) { /* Replace a malformed request. */ }
         }
+        const std::string id = std::to_string(static_cast<uint64_t>(now * 1e9)) +
+            "_" + std::to_string(getpid());
+        WriteCaptureRequest(request, id, now, reason, fatal);
+        StartCapture(id, reason, config_.post_trigger_s, fatal);
+    }
+
+    void WriteCaptureRequest(const std::filesystem::path &request, const std::string &id,
+        double now, const std::string &reason, bool fatal) {
         const auto temporary = request.string() + "." + std::to_string(getpid()) + ".tmp";
         std::ofstream output(temporary);
         output << "{\"id\":\"" << id << "\",\"boot_id\":\"" << boot_id_
             << "\",\"monotonic_s\":" << std::setprecision(17) << now
+            << ",\"fatal\":" << (fatal ? 1 : 0)
             << ",\"reason\":\"" << JsonEscape(reason.substr(0, 512)) << "\"}";
         output.close();
         if (output) std::filesystem::rename(temporary, request);
-        StartCapture(id, reason, config_.post_trigger_s);
     }
 
-    void StartCapture(const std::string &id, const std::string &reason, double post_s) {
+    void StartCapture(const std::string &id, const std::string &reason, double post_s,
+        bool fatal = false) {
+        const double now = MonotonicSeconds();
+        if (!capture_.empty()) {
+            // Coalesce a fault storm into the current incident; an error keeps
+            // recording for its own post-trigger window.
+            seen_capture_ = id;
+            if (fatal) ExtendCapture(now, post_s, reason);
+            return;
+        }
         if (id == seen_capture_) return;
         seen_capture_ = id;
-        const double now = MonotonicSeconds();
-        if (!capture_.empty()) return;  // Coalesce a fault storm into the current incident.
-        if (now - capture_started_ < config_.trigger_cooldown_s) return;
+        if (!fatal && now - capture_started_ < config_.trigger_cooldown_s) return;
         if (storage_ && !storage_->Allow(2048, false)) return;
         while (!ring_.empty() && now - ring_.front().monotonic_s > config_.pre_trigger_s) {
             ring_bytes_ -= ItemBytes(ring_.front());
@@ -892,7 +933,8 @@ private:
         }
         capture_started_ = now;
         capture_write_failed_ = false;
-        capture_deadline_ = now + std::clamp(post_s, 0.0, 120.0);
+        capture_deadline_ = now + std::clamp(post_s, 0.0, kMaxCaptureSeconds);
+        capture_id_ = id;
         capture_ = "incident_" + Sanitize(id);
         std::error_code error;
         std::filesystem::create_directory(std::filesystem::path(session_directory_) / capture_, error);
@@ -903,7 +945,7 @@ private:
             << now << ",\"buffer_records\":" << ring_.size()
             << ",\"buffer_bytes\":" << ring_bytes_
             << ",\"retained_seconds\":" << (ring_.empty() ? 0.0 : now - ring_.front().monotonic_s)
-            << "}";
+            << ",\"fatal\":" << (fatal ? 1 : 0) << "}";
         metadata.close();
         if (!metadata) { capture_write_failed_ = true; ++io_errors_; }
         high_rate_.store(true);
@@ -911,6 +953,19 @@ private:
         // Save the pre-trigger evidence now, not after the post-trigger window.
         // This runs only on log_writer; realtime producers never wait for I/O.
         SyncCapture();
+    }
+
+    void ExtendCapture(double now, double post_s, const std::string &reason) {
+        const double deadline = std::min(capture_started_ + kMaxCaptureSeconds,
+            now + std::clamp(post_s, 0.0, kMaxCaptureSeconds));
+        if (deadline <= capture_deadline_) return;
+        capture_deadline_ = deadline;
+        std::ofstream extension(std::filesystem::path(session_directory_) / capture_ / "extensions.jsonl",
+            std::ios::app);
+        extension << "{\"monotonic_s\":" << std::setprecision(17) << now
+            << ",\"deadline_s\":" << deadline
+            << ",\"reason\":\"" << JsonEscape(reason.substr(0, 512)) << "\"}\n";
+        if (!extension) { capture_write_failed_ = true; ++io_errors_; }
     }
 
     void WriteCaptureItem(const QueueItem &item) {
@@ -974,6 +1029,7 @@ private:
             } else { ++io_errors_; }
         }
         capture_.clear();
+        capture_id_.clear();
         high_rate_.store(false);
     }
 
@@ -990,6 +1046,8 @@ private:
             WriteHealth();
         }
         if (!config_.file_enabled || !config_.blackbox_enabled) return;
+        if (fatal_pending_.exchange(false))
+            RequestCapture("error trigger preserved after queue overflow", true);
         if (snapshot_pending_.exchange(false)) RequestCapture("fault trigger preserved after queue overflow");
         const auto request = std::filesystem::path(config_.directory) / ("." + robot_ + ".capture.json");
         std::error_code error;
@@ -1000,8 +1058,10 @@ private:
             const auto value = YAML::LoadFile(request.string());
             const double time = value["monotonic_s"].as<double>();
             if (value["boot_id"].as<std::string>() != boot_id_ || now - time > 2.0 || time > now) return;
+            // Deadlines count from the request, so re-reading it cannot extend a capture.
             StartCapture(value["id"].as<std::string>(), value["reason"].as<std::string>(),
-                value["post_s"].as<double>(config_.post_trigger_s));
+                std::max(0.0, value["post_s"].as<double>(config_.post_trigger_s) - (now - time)),
+                value["fatal"].as<int>(0) != 0);
         } catch (...) { /* An invalid/stale request cannot affect the runtime. */ }
     }
 
@@ -1211,6 +1271,7 @@ private:
     std::atomic<uint64_t> dropped_{0};
     std::atomic<bool> high_rate_{false};
     std::atomic<bool> snapshot_pending_{false};
+    std::atomic<bool> fatal_pending_{false};
     std::array<CriticalSlot, 8> critical_;
     uint64_t total_dropped_ = 0;
     uint64_t io_errors_ = 0;
@@ -1220,7 +1281,7 @@ private:
     std::map<std::string, std::string> csv_headers_;
     std::map<std::string, double> summary_times_;
     std::unique_ptr<LogStorage> storage_;
-    std::string robot_, boot_id_, capture_, seen_capture_;
+    std::string robot_, boot_id_, capture_, capture_id_, seen_capture_;
     double capture_deadline_ = 0.0, capture_started_ = -3600.0;
     double last_capture_sync_ = 0.0;
     bool capture_write_failed_ = false;

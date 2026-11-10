@@ -224,6 +224,12 @@ int main(int argc, char **argv) {
         auto legacy = policy;
         legacy.erase("client_smoothing");
         assert(operator_service::DecodePolicy(legacy).client_smoothing);
+        auto presets = operator_service::DecodePolicy(policy);
+        assert(!presets.slow_limits && !presets.fast_limits);
+        presets.slow_limits = operator_service::Velocity{0.7, 0.4, 1};
+        presets.fast_limits = presets.slow_limits;
+        const auto decoded = operator_service::DecodePolicy(Encode(presets));
+        assert(decoded.slow_limits->vx == 0.7 && decoded.fast_limits->vy == 0.4);
     }
     Config config;
     config.terminal_only = false;

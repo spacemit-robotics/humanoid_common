@@ -12,6 +12,7 @@
 #include "joint_trajectory_policy_adapter.h"
 #include "stance_motion_policy_adapter.h"
 #include "history_actor_policy_adapter.h"
+#include "runtime_logger.h"
 
 #include <cnpy.h>
 #include <yaml-cpp/yaml.h>
@@ -1147,6 +1148,45 @@ public:
             ? static_cast<int>(policy_config.rl_default_pos.size())
             : static_cast<int>(policy_config.action_joint_index.size());
         ValidateConfig();
+        if (config_.sonic_encoder.Enabled()) {
+            const auto &settings = config_.sonic_encoder;
+            const auto term = policy_config.custom_array_dims.find(settings.observation_term);
+            if (settings.latent_dim <= 0 || term == policy_config.custom_array_dims.end() ||
+                term->second != settings.latent_dim) {
+                throw std::runtime_error("[sonic] encoder latent dimension must match decoder observation term");
+            }
+            rl_policy::PolicyExecutorConfig encoder_config;
+            encoder_config.model_path = settings.model_path;
+            encoder_config.runtime = settings.runtime;
+            encoder_config.action_scale = {1.0};
+            encoder_config.rl_default_pos.assign(settings.latent_dim, 0.0);
+            encoder_config.strict_obs_dim_check = true;
+            encoder_config.custom_array_dims["reference_obs"] = static_cast<int>(ReferenceObsDim());
+            rl_policy::ObsSegmentConfig segment;
+            segment.terms = {"reference_obs"};
+            encoder_config.obs_segments.push_back(std::move(segment));
+            rl_policy::ModelInputBindingConfig input;
+            input.name = "obs_dict";
+            input.source = rl_policy::ModelInputSource::OBSERVATION;
+            encoder_config.model_io.inputs.push_back(std::move(input));
+            rl_policy::ModelOutputBindingConfig output;
+            output.name = "encoded_tokens";
+            output.target = rl_policy::ModelOutputTarget::ACTION;
+            encoder_config.model_io.outputs.push_back(std::move(output));
+            encoder_ = std::make_unique<rl_policy::PolicyExecutor>();
+            encoder_->Init(encoder_config);
+            if (encoder_->ActionDim() != settings.latent_dim) {
+                throw std::runtime_error("[sonic] encoder output does not match latent dimension");
+            }
+            encoder_observation_.resize(static_cast<int>(ReferenceObsDim()));
+            latent_.resize(settings.latent_dim);
+            latent_action_.reserve(settings.latent_dim);
+            runtime_logging::RecordArtifact("policy_aux_model", "sonic_encoder", settings.model_path);
+            const auto runtime = encoder_->GetRuntimeInfo();
+            runtime_logging::Log(runtime_logging::Level::kInfo,
+                "SONIC encoder ready: provider=" + runtime.initialized_provider +
+                ", workers=" + runtime.worker_threads, false);
+        }
         if (config_.sonic_planner.Enabled()) {
             if (config_.reference_motion_catalog.Enabled())
                 throw std::runtime_error("[policy_adapter] planner and motion catalog are exclusive");
@@ -1170,6 +1210,7 @@ public:
     }
 
     void RequestInferenceTermination() override {
+        if (encoder_) encoder_->RequestInferenceTermination();
         if (planner_) planner_->RequestStop();
     }
 
@@ -1200,6 +1241,7 @@ public:
     }
 
     void Reset(const robot_base::RobotData &robot) override {
+        if (encoder_) encoder_->ClearInferenceTermination();
         handoff_.Reset();
         active_clip_index_ = default_clip_index_;
         playback_start_elapsed_ = 0.0;
@@ -1268,8 +1310,17 @@ public:
                 std::to_string(values.size()) + ", 期望=" +
                 std::to_string(reference_obs_dim));
         }
-        policy.SetModelInput(
-            "reference_obs", values.data(), values.size());
+        if (encoder_) {
+            std::copy(values.begin(), values.end(), encoder_observation_.data());
+            encoder_->Infer(encoder_observation_, latent_action_);
+            for (std::size_t i = 0; i < latent_.size(); ++i) {
+                latent_[i] = static_cast<float>(latent_action_[i]);
+            }
+            policy.SetCustomArray(config_.sonic_encoder.observation_term,
+                latent_.data(), static_cast<int>(latent_.size()));
+        } else {
+            policy.SetModelInput("reference_obs", values.data(), values.size());
+        }
     }
 
     void HandleInteractionRequest(
@@ -1768,6 +1819,10 @@ private:
 
     Config config_;
     int model_dof_count_ = 0;
+    std::unique_ptr<rl_policy::PolicyExecutor> encoder_;
+    Eigen::VectorXf encoder_observation_;
+    std::vector<double> latent_action_;
+    std::vector<float> latent_;
     std::vector<SonicClip> clips_;
     std::unordered_map<std::string, std::size_t> clips_by_name_;
     std::size_t default_clip_index_ = 0;
@@ -1904,6 +1959,35 @@ Config LoadConfig(const std::string &yaml_path,
             yaml.Read<bool>(adapter_base + ".loop").value_or(false);
         config.loop_pause = yaml.Read<double>(
             adapter_base + ".loop_pause").value_or(0.0);
+        const std::string encoder_base = adapter_base + ".encoder";
+        const auto encoder_model = yaml.Read<std::string>(encoder_base + ".model_path");
+        if (encoder_model && !encoder_model->empty()) {
+            if (config.type != "sonic") {
+                throw std::runtime_error("[policy_adapter] encoder is only supported by SONIC");
+            }
+            auto &encoder = config.sonic_encoder;
+            encoder.model_path = ResolvePath(robot_dir, *encoder_model).string();
+            encoder.observation_term = yaml.Read<std::string>(
+                encoder_base + ".observation_term").value_or("sonic_latent");
+            encoder.latent_dim = yaml.Read<int>(encoder_base + ".latent_dim").value_or(64);
+            encoder.runtime.provider = yaml.Read<std::string>(
+                encoder_base + ".runtime.provider").value_or("cpu");
+            encoder.runtime.threads = yaml.Read<int>(encoder_base + ".runtime.threads").value_or(1);
+            encoder.runtime.affinity = yaml.Read<std::string>(
+                encoder_base + ".runtime.affinity").value_or("");
+            encoder.runtime.worker_sched = yaml.Read<std::string>(
+                encoder_base + ".runtime.worker_sched").value_or("");
+            encoder.runtime.worker_priority = yaml.Read<int>(
+                encoder_base + ".runtime.worker_priority").value_or(0);
+            encoder.runtime.ort_spinning = yaml.Read<bool>(
+                encoder_base + ".runtime.ort_spinning").value_or(false);
+            encoder.runtime.warmup_runs = yaml.Read<int>(
+                encoder_base + ".runtime.warmup_runs").value_or(0);
+            encoder.runtime.ep_dump_subgraphs = yaml.Read<bool>(
+                encoder_base + ".runtime.ep_dump_subgraphs").value_or(false);
+            encoder.runtime.ep_profile_prefix = yaml.Read<std::string>(
+                encoder_base + ".runtime.ep_profile_prefix").value_or("");
+        }
         const std::string planner_base = adapter_base + ".planner";
         const auto planner_model =
             yaml.Read<std::string>(planner_base + ".model_path");
@@ -1934,6 +2018,10 @@ Config LoadConfig(const std::string &yaml_path,
                 planner_base + ".runtime.threads").value_or(2);
             config.sonic_planner.runtime.affinity = yaml.Read<std::string>(
                 planner_base + ".runtime.affinity").value_or("");
+            config.sonic_planner.runtime.worker_sched = yaml.Read<std::string>(
+                planner_base + ".runtime.worker_sched").value_or("");
+            config.sonic_planner.runtime.worker_priority = yaml.Read<int>(
+                planner_base + ".runtime.worker_priority").value_or(0);
             config.sonic_planner.runtime.ort_spinning = yaml.Read<bool>(
                 planner_base + ".runtime.ort_spinning").value_or(false);
             config.sonic_planner.runtime.ep_dump_subgraphs = yaml.Read<bool>(
@@ -1943,8 +2031,14 @@ Config LoadConfig(const std::string &yaml_path,
                     planner_base + ".runtime.ep_profile_prefix").value_or("");
             config.sonic_planner.output_fps = yaml.Read<double>(
                 planner_base + ".output_fps").value_or(config.motion_fps);
+            config.sonic_planner.check_interval = yaml.Read<double>(
+                planner_base + ".check_interval").value_or(0.1);
             config.sonic_planner.replan_interval = yaml.Read<double>(
                 planner_base + ".replan_interval").value_or(1.0);
+            config.sonic_planner.running_replan_interval = yaml.Read<double>(
+                planner_base + ".running_replan_interval").value_or(0.1);
+            config.sonic_planner.crawling_replan_interval = yaml.Read<double>(
+                planner_base + ".crawling_replan_interval").value_or(0.2);
             config.sonic_planner.lookahead = yaml.Read<double>(
                 planner_base + ".lookahead").value_or(0.04);
             config.sonic_planner.default_height = yaml.Read<double>(
@@ -1965,7 +2059,7 @@ Config LoadConfig(const std::string &yaml_path,
                 yaml.Read<std::vector<int>>(
                     planner_base + ".allowed_pred_num_tokens")
                     .value_or(std::vector<int>{
-                        0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0});
+                        0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0});
         }
         const auto catalog = yaml.Read<std::string>(
             adapter_base + ".catalog");

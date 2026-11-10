@@ -42,7 +42,12 @@ namespace behavior_manager {
 
 class StateRL : public State {
 public:
-    ~StateRL() override { StopInference(); trace_worker_.reset(); progress_worker_.reset(); }
+    ~StateRL() override {
+        StopInference();
+        trace_worker_.reset();
+        progress_worker_.reset();
+        clamp_worker_.reset();
+    }
 
     void SetConfig(const RLConfig &cfg) {
         ValidateRLTargetPositionLimits(cfg);
@@ -52,6 +57,14 @@ public:
     void PrepareRuntime() {
         policy_adapter_.reset();
         policy_.Init(config_.policy);
+        const auto runtime = policy_.GetRuntimeInfo();
+        runtime_logging::Log(runtime_logging::Level::kInfo,
+            "RL runtime ready: policy=" + config_.policy_name +
+            ", provider=" + runtime.initialized_provider +
+            ", intra=" + std::to_string(runtime.ort_intra_threads) +
+            ", spinning=" + (runtime.ort_spinning ? "on" : "off") +
+            ", affinity=" + (runtime.affinity.empty() ? "inherit" : runtime.affinity) +
+            ", workers=" + (runtime.worker_threads.empty() ? "none" : runtime.worker_threads), false);
         if (config_.policy_adapter.Enabled()) {
             policy_adapter_ = policy_adapter::Create(
                 config_.policy_adapter, config_.policy);
@@ -105,6 +118,16 @@ public:
         last_action_published_ns_.store(0, std::memory_order_relaxed);
         entry_target_pos_ = output_ ? output_->target_pos : std::vector<double>{};
         entry_target_transition_elapsed_ = 0.0;
+        clamp_stats_ = {};
+        clamp_window_ = {};
+        clamped_actions_ = 0;
+        clamped_actions_reported_ = 0;
+        last_clamp_report_ = {};
+        clamp_worker_.reset();
+        if (!config_.target_position_lower.empty()) {
+            clamp_worker_ = std::make_unique<runtime_logging::SnapshotWorker<ClampReport, 4>>(
+                [this](const ClampReport &report) { LogClampReport(report); });
+        }
         infer_count_window_ = 0;
         time_since_last_infer_ = 0.0f;
         new_data_ready_ = false;
@@ -312,6 +335,7 @@ public:
                     target_pos, rl_dt,
                     action_sequence_ - applied_action_sequence_);
                 if (!ClampTargetPosition(target_pos)) return;
+                if (clamp_stats_.joints > 0) RecordClampedTargets(now);
                 output_->target_pos = target_pos;
                 output_->kp = cached_kp_;
                 output_->kd = cached_kd_;
@@ -334,7 +358,7 @@ public:
             NotifyRuntimeEvent(RLRuntimeEventType::ACTION_APPLIED,
                 applied_release_sequence, action_applied_time);
             RecordPolicyApplyTrace(
-                applied_timing, action_applied_time, applied_target_pos);
+                applied_timing, action_applied_time, applied_target_pos, clamp_stats_);
         }
     }
 
@@ -468,6 +492,7 @@ private:
     }
 
     bool ClampTargetPosition(std::vector<double> &target) {
+        clamp_stats_ = {};
         if (config_.target_position_lower.empty()) return true;
         if (target.size() != config_.target_position_lower.size()) {
             ReportFault(robot_base::FaultCode::INVALID_DATA,
@@ -480,11 +505,38 @@ private:
                     "RL target position is not finite at joint " + std::to_string(i));
                 return false;
             }
-            target[i] = std::clamp(target[i],
-                config_.target_position_lower[i] + config_.target_limit_margin,
-                config_.target_position_upper[i] - config_.target_limit_margin);
+            const double lower = config_.target_position_lower[i] + config_.target_limit_margin;
+            const double upper = config_.target_position_upper[i] - config_.target_limit_margin;
+            const double limit = target[i] < lower ? lower : (target[i] > upper ? upper : target[i]);
+            const double excess = std::abs(target[i] - limit);
+            if (excess > 0.0) {
+                ++clamp_stats_.joints;
+                if (excess > clamp_stats_.excess) {
+                    clamp_stats_.joint = i;
+                    clamp_stats_.excess = excess;
+                    clamp_stats_.target = target[i];
+                    clamp_stats_.limit = limit;
+                }
+            }
+            target[i] = limit;
         }
         return true;
+    }
+
+    // Control thread only. Keeps the policy running and reports at most once
+    // per second how far it asked beyond the hardware envelope. The report is
+    // handed to a background formatter: the control loop never formats text
+    // or waits for the logger.
+    void RecordClampedTargets(RLRuntimeClock::time_point now) {
+        ++clamped_actions_;
+        if (clamp_stats_.excess > clamp_window_.excess) clamp_window_ = clamp_stats_;
+        if (clamped_actions_reported_ != 0 &&
+            now - last_clamp_report_ < std::chrono::seconds(1)) return;
+        if (!clamp_worker_ || !clamp_worker_->Publish({clamp_window_, clamped_actions_,
+                clamped_actions_ - clamped_actions_reported_})) return;
+        clamped_actions_reported_ = clamped_actions_;
+        last_clamp_report_ = now;
+        clamp_window_ = {};
     }
 
     // ==================== 推理线程回调 ====================
@@ -769,6 +821,47 @@ private:
     std::vector<double> entry_target_pos_;
     double entry_target_transition_elapsed_ = 0.0;
 
+    struct TargetClampStats {
+        std::size_t joints = 0;  // joints clamped in one action
+        std::size_t joint = 0;   // joint with the largest excess
+        double excess = 0.0, target = 0.0, limit = 0.0;
+    };
+    TargetClampStats clamp_stats_;   // latest applied action
+    TargetClampStats clamp_window_;  // worst action since the last report
+    std::uint64_t clamped_actions_ = 0;
+    std::uint64_t clamped_actions_reported_ = 0;
+    RLRuntimeClock::time_point last_clamp_report_;
+    struct ClampReport {
+        TargetClampStats worst;
+        std::uint64_t clamped_actions = 0, since_last = 0;
+    };
+    std::unique_ptr<runtime_logging::SnapshotWorker<ClampReport, 4>> clamp_worker_;
+
+    // Background formatter thread only.
+    void LogClampReport(const ClampReport &report) const {
+        const auto &worst = report.worst;
+        const std::string joint = worst.joint < config_.joint_names.size()
+            ? config_.joint_names[worst.joint] : std::to_string(worst.joint);
+        std::ostringstream detail;
+        detail << std::fixed << std::setprecision(4)
+            << "RL target clamped: policy=" << config_.policy_name << ", joint=" << joint
+            << ", target=" << worst.target << ", limit=" << worst.limit
+            << ", excess=" << worst.excess << ", joints=" << worst.joints
+            << ", clamped_actions=" << report.clamped_actions << " (+" << report.since_last << ")";
+        // The event line is best effort; the CSV row is queued even under contention.
+        runtime_logging::Log(runtime_logging::Level::kWarning, detail.str(), false);
+        std::ostringstream row;
+        row << std::fixed << std::setprecision(6)
+            << std::chrono::duration<double>(
+                std::chrono::system_clock::now().time_since_epoch()).count()
+            << ',' << config_.policy_name << ',' << joint << ',' << worst.target << ','
+            << worst.limit << ',' << worst.excess << ',' << worst.joints << ','
+            << report.clamped_actions << ',' << report.since_last;
+        runtime_logging::RecordCsv("control_target_clamp",
+            "wall_time_s,policy,joint,target,limit,excess,clamped_joints,clamped_actions,since_last",
+            row.str());
+    }
+
     bool policy_trace_enabled_ = false;
     std::string policy_trace_stream_;
     std::string policy_apply_trace_stream_;
@@ -806,6 +899,9 @@ private:
         double wall = 0, device = 0, vx = 0, vy = 0, wz = 0;
         double snapshot = 0, prepare = 0, assemble = 0, infer = 0, post = 0, cpu = 0;
         uint64_t interaction_sequence = 0, request_sequence = 0;
+        uint64_t clamped_actions = 0;
+        size_t clamped_joints = 0, clamp_joint = 0;
+        double clamp_excess = 0;
         int phase = 0, operation = 0;
         char interaction[128]{}, request[128]{}, variant[128]{};
         bool apply = false, published = false;
@@ -973,6 +1069,7 @@ private:
             "action_applied_time_s,publish_to_apply_ms,release_to_apply_ms";
         for (size_t i = 0; i < config_.kp.size(); ++i)
             apply_header << ",target_pos_" << i;
+        apply_header << ",clamped_joints,clamp_joint_index,clamp_max_excess,clamped_actions";
         policy_apply_trace_header_ = apply_header.str();
         trace_worker_ = std::make_unique<
             runtime_logging::SnapshotWorker<PolicyTraceSnapshot, 16>>(
@@ -1072,10 +1169,15 @@ private:
 
     void RecordPolicyApplyTrace(const PolicyTiming &timing,
                                 RLRuntimeClock::time_point action_applied,
-                                const std::vector<double> &target_pos) const {
+                                const std::vector<double> &target_pos,
+                                const TargetClampStats &clamp) const {
         if (!policy_trace_enabled_ || !trace_worker_ || target_pos.size() > 128) return;
         PolicyTraceSnapshot sample;
         sample.apply = true;
+        sample.clamped_joints = clamp.joints;
+        sample.clamp_joint = clamp.joint;
+        sample.clamp_excess = clamp.excess;
+        sample.clamped_actions = clamped_actions_;
         sample.wall = std::chrono::duration<double>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         sample.timing = timing;
@@ -1096,6 +1198,8 @@ private:
             << "," << DurationMilliseconds(action_applied, timing.action_published)
             << "," << DurationMilliseconds(action_applied, timing.release);
         for (size_t i = 0; i < sample.target_size; ++i) row << "," << sample.target[i];
+        row << "," << sample.clamped_joints << "," << sample.clamp_joint
+            << "," << sample.clamp_excess << "," << sample.clamped_actions;
         runtime_logging::RecordCsv(policy_apply_trace_stream_,
             policy_apply_trace_header_, row.str());
     }

@@ -51,6 +51,7 @@ LB/RB 单键长按与 LB+RB 并存时，从第二键按下重新计时；组合�
 无速度日志刷屏，只记录设备、控制权、状态、组合键结果及首次变化的错误。
 
 速度限额、死区、加减速复用 `operator_service.teleop`，并与当前策略 limits 取交集。
+策略的 `command.teleop.slow_limits/fast_limits` 可覆盖全局档位；未配置则沿用全局值。
 `client_smoothing: false` 的策略已有内部平滑，客户端不叠加一次；其他策略沿用网页同样的线性斜坡。
 preset 通过公开 `Client::SetTeleopPreset` 报告成功档位，使音频观察器复用原事件。
 模型准备、手臂或舞蹈执行、故障时不发送摇杆非零速度。

@@ -77,6 +77,17 @@ const char kSonicReferenceProbeOnnx[] =
     "ZmVyZW5jZV9vYnMSDwoNCAESCQoCCAEKAwjiDVoVCgNvYnMSDgoMCAESCAoCCAEKAggDYhgK"
     "BmFjdGlvbhIOCgwIARIICgIIAQoCCB1CBAoAEA0";
 
+// Official split-model interfaces: reference -> 64 tokens; 64 + 930 -> 29 actions.
+const char kSonicEncoderProbeOnnx[] =
+    "CAg62QEKOAoIb2JzX2RpY3QKB2luZGljZXMSDmVuY29kZWRfdG9rZW5zIgZHYXRoZXIqCwoEYXhpcxgBoAECEg1l"
+    "bmNvZGVyX3Byb2JlKk8IQBAHOkAAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywt"
+    "Li8wMTIzNDU2Nzg5Ojs8PT4/QgdpbmRpY2VzWhsKCG9ic19kaWN0Eg8KDQgBEgkKAggBCgMI4g1iIAoOZW5jb2Rl"
+    "ZF90b2tlbnMSDgoMCAESCAoCCAEKAghAQgQKABAN";
+const char kSonicDecoderProbeOnnx[] =
+    "CAg6qAEKMAoIb2JzX2RpY3QKB2luZGljZXMSBmFjdGlvbiIGR2F0aGVyKgsKBGF4aXMYAaABAhINZGVjb2Rlcl9w"
+    "cm9iZSouCB0QBzofABwdP0BdhQfhBwAAAAAAAAAAAAAAAAAAAAAAAAAAAEIHaW5kaWNlc1obCghvYnNfZGljdBIPCg0I"
+    "ARIJCgIIAQoDCOIHYhgKBmFjdGlvbhIOCgwIARIICgIIAQoCCB1CBAoAEA0";
+
 // Opset 13, IR 8: repeat the four context frames to produce 64 qpos frames.
 // Declares the planner's named inputs without requiring deployment model assets.
 const char kPlannerContextRepeatOnnx[] =
@@ -885,21 +896,35 @@ void TestSonicPlannerConfig() {
         "          type: sonic\n"
         "          future_frames: 10\n"
         "          future_step: 5\n"
+        "          encoder:\n"
+        "            model_path: encoder.onnx\n"
+        "            runtime: {provider: cpu, threads: 2, ort_spinning: false, "
+        "worker_sched: fifo, worker_priority: 55}\n"
         "          planner:\n"
         "            enabled: true\n"
         "            model_path: planner.onnx\n"
+        "            check_interval: 0.2\n"
         "            lookahead: 0.8\n"
         "            replan_interval: 0.5\n"
-        "            runtime: {provider: cpu, threads: 4, ort_spinning: false}\n");
+        "            runtime: {provider: cpu, threads: 4, ort_spinning: false, "
+        "worker_sched: other, worker_priority: 0}\n");
     auto config = LoadConfig(yaml.Path().string(), "planner",
         fs::temp_directory_path().string());
     Require(config.reference_file.empty() && config.sonic_planner.Enabled(),
         "planner should not require a recorded reference");
     Require(config.sonic_planner.runtime.threads == 4 &&
         !config.sonic_planner.runtime.ort_spinning &&
-        config.sonic_planner.lookahead == 0.8 &&
+        config.sonic_planner.runtime.worker_sched == "other" &&
+        config.sonic_planner.runtime.worker_priority == 0 &&
+        config.sonic_planner.lookahead == 0.8 && config.sonic_planner.check_interval == 0.2 &&
         config.sonic_planner.replan_interval == 0.5,
         "planner runtime and timing must come from YAML");
+    Require(config.sonic_encoder.Enabled() && config.sonic_encoder.latent_dim == 64 &&
+        config.sonic_encoder.runtime.provider == "cpu" && config.sonic_encoder.runtime.threads == 2 &&
+        config.sonic_encoder.runtime.worker_sched == "fifo" &&
+        config.sonic_encoder.runtime.worker_priority == 55 &&
+        !config.sonic_encoder.runtime.ort_spinning,
+        "encoder runtime must come from YAML");
     const auto &thread = config.sonic_planner.thread;
     Require(thread.name == "motion_planner" && thread.cpu_id == -1 &&
         thread.cpu_affinity == std::vector<int>({0, 3}) && thread.sched == "fifo" &&
@@ -913,6 +938,13 @@ void TestSonicPlannerConfig() {
     const TempReference default_yaml("planner_default_thread", bare_yaml);
     const auto defaults = LoadConfig(default_yaml.Path().string(), "planner",
         fs::temp_directory_path().string());
+    Require(!defaults.sonic_encoder.Enabled() && defaults.sonic_planner.lookahead == 0.04 &&
+        defaults.sonic_planner.check_interval == 0.1 &&
+        defaults.sonic_planner.replan_interval == 1.0 &&
+        defaults.sonic_planner.running_replan_interval == 0.1 &&
+        defaults.sonic_planner.crawling_replan_interval == 0.2 &&
+        defaults.sonic_planner.allowed_pred_num_tokens == std::vector<int>({0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0}),
+        "planner defaults must preserve the deployment timing and 9-11 token range");
     Require(defaults.sonic_planner.thread.sched == "other" &&
         defaults.sonic_planner.thread.priority == 0 &&
         defaults.sonic_planner.thread.cpu_affinity ==
@@ -925,7 +957,19 @@ void TestSonicPlannerConfig() {
     Require(single.sonic_planner.thread.cpu_id == 1 &&
         single.sonic_planner.thread.cpu_affinity.empty(),
         "planner single-CPU configuration must not be overridden by defaults");
+    // Construction loads the planner, so a missing model fails during preparation.
     auto policy = MakeSonicPolicyConfig(29);
+    bool missing_rejected = false;
+    try {
+        static_cast<void>(Create(config, policy));
+    } catch (const std::runtime_error &) {
+        missing_rejected = true;
+    }
+    Require(missing_rejected, "a missing planner model must fail policy preparation");
+    config.sonic_encoder.model_path.clear();
+    const TempSonicOnnx model(kPlannerContextRepeatOnnx);
+    config.sonic_planner.model_path = model.Path().string();
+    config.sonic_planner.thread = robot_base::ThreadLoop::Background("motion_planner");
     auto adapter = Create(config, policy);
     Require(adapter && !adapter->ReadyForPolicySwitch(),
         "planner handoff must wait for a published idle trajectory");
@@ -939,17 +983,80 @@ void TestSonicPlannerConfig() {
     Require(rejected, "planner must reject a non-permutation joint mapping");
 }
 
+// Threads of this process, excluding background log formatters.
 std::set<int> NativeThreadIds() {
     std::set<int> threads;
     for (const auto &entry : fs::directory_iterator("/proc/self/task")) {
+        std::ifstream comm(entry.path() / "comm");
+        std::string name;
+        std::getline(comm, name);
+        if (name == "log_format") continue;
         threads.insert(std::stoi(entry.path().filename().string()));
     }
     return threads;
 }
 
-void TestSonicPlannerScheduling(bool explicit_affinity) {
+enum class PlannerPlacement { kInherit, kThreadAffinity, kWorkerAffinity, kIdle };
+
+void TestSonicPlannerCheckCadence() {
+    using behavior_manager::policy_adapter::SonicPlanner;
+    using behavior_manager::policy_adapter::SonicPlannerConfig;
+    const TempSonicOnnx model(kPlannerContextRepeatOnnx);
+    SonicPlannerConfig config;
+    config.enabled = true;
+    config.model_path = model.Path().string();
+    config.runtime.provider = "cpu";
+    config.runtime.threads = 1;
+    config.replan_interval = 10.0;
+    SonicPlanner planner(config, MakeSonicPolicyConfig(29));
+    auto robot = robot_base::RobotData::Create(29);
+    planner.Reset(robot);
+    auto previous = planner.Motion();
+    const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (previous->frames.size() == 100 && std::chrono::steady_clock::now() < ready_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        previous = planner.Motion();
+    }
+    Require(previous->frames.size() != 100, "planner did not publish its initial plan");
+
+    const auto start = std::chrono::steady_clock::now();
+    int updates = 0;
+    int plans = 0;
+    while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(550)) {
+        robot_base::Command command;
+        command.vx = (++updates % 2) ? 0.1F : 0.2F;
+        const double elapsed_s = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start).count();
+        planner.Update(robot, command, elapsed_s);
+        const auto motion = planner.Motion();
+        if (motion != previous) {
+            ++plans;
+            previous = motion;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    Require(updates > 20 && plans > 0 && plans <= 6,
+        "command changes bypassed the 100 ms planner check cadence: " + std::to_string(plans));
+
+    // A burst must not queue old commands: the next plan uses the final snapshot.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    do {
+        planner.Update(robot, {}, 1.0);
+        previous = planner.Motion();
+        if (previous->start_time_s >= 1.0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    } while (std::chrono::steady_clock::now() < deadline);
+    Require(previous->start_time_s >= 1.0,
+        "planner did not coalesce commands into the latest snapshot");
+    planner.Update(robot, {}, previous->start_time_s +
+        previous->frames.size() / config.output_fps + 0.1);
+    Require(planner.Idle(), "planner did not handle the latest stop command");
+    planner.RequestStop();
+}
+
+void TestSonicPlannerScheduling(PlannerPlacement placement) {
     // Alter a disposable creator thread, never the test runner's scheduling.
-    std::async(std::launch::async, [explicit_affinity] {
+    std::async(std::launch::async, [placement] {
         using behavior_manager::policy_adapter::SonicPlanner;
         using behavior_manager::policy_adapter::SonicPlannerConfig;
         const TempSonicOnnx model(kPlannerContextRepeatOnnx);
@@ -961,10 +1068,21 @@ void TestSonicPlannerScheduling(bool explicit_affinity) {
         config.runtime.ort_spinning = false;
         const auto launch_cpus = config.thread.cpu_affinity;
         Require(!launch_cpus.empty(), "cannot read launch affinity");
-        if (explicit_affinity) {
+        std::vector<int> worker_cpus;
+        if (placement == PlannerPlacement::kThreadAffinity) {
             config.thread.cpu_affinity = {launch_cpus.back()};
             if (launch_cpus.size() > 2) config.thread.cpu_affinity.push_back(launch_cpus[1]);
+        } else if (placement == PlannerPlacement::kWorkerAffinity) {
+            // Workers get their own CPU, away from the planner thread's CPU set.
+            Require(launch_cpus.size() >= 2, "worker affinity test needs two CPUs");
+            config.thread.cpu_affinity = {launch_cpus.front()};
+            worker_cpus = {launch_cpus.back()};
+            config.runtime.affinity = std::to_string(launch_cpus.back());
+        } else if (placement == PlannerPlacement::kIdle) {
+            config.thread.sched = "idle";
         }
+        if (worker_cpus.empty()) worker_cpus = config.thread.cpu_affinity;
+        const int expected_policy = placement == PlannerPlacement::kIdle ? SCHED_IDLE : SCHED_OTHER;
         robot_base::ThreadLoop creator;
         creator.name = "planner_creator";
         creator.cpu_id = launch_cpus.front();
@@ -973,10 +1091,11 @@ void TestSonicPlannerScheduling(bool explicit_affinity) {
         Require(pthread_setschedparam(pthread_self(), SCHED_BATCH, &batch) == 0,
             "cannot select unprivileged creator scheduling");
 
+        // The model is loaded and warmed up during construction, before Reset.
+        const auto before = NativeThreadIds();
         SonicPlanner planner(config, MakeSonicPolicyConfig(29));
         auto robot = robot_base::RobotData::Create(29);
         robot.joint_pos[0] = 0.125;
-        const auto before = NativeThreadIds();
         planner.Reset(robot);
         const auto wait_for_plan = [&](const auto &previous) {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
@@ -988,23 +1107,36 @@ void TestSonicPlannerScheduling(bool explicit_affinity) {
             throw std::runtime_error("planner did not publish the test trajectory");
         };
         const auto first = wait_for_plan(nullptr);
-        cpu_set_t expected;
-        CPU_ZERO(&expected);
-        for (const int cpu : config.thread.cpu_affinity) CPU_SET(cpu, &expected);
-        int new_threads = 0;
+        const auto cpu_set_of = [](const std::vector<int> &cpus) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            for (const int cpu : cpus) CPU_SET(cpu, &set);
+            return set;
+        };
+        const cpu_set_t planner_set = cpu_set_of(config.thread.cpu_affinity);
+        const cpu_set_t worker_set = cpu_set_of(worker_cpus);
+        int on_planner_cpus = 0, on_worker_cpus = 0;
         for (const int tid : NativeThreadIds()) {
             if (before.count(tid)) continue;
+            sched_param param{};
+            Require(sched_getscheduler(tid) == expected_policy &&
+                sched_getparam(tid, &param) == 0 && param.sched_priority == 0,
+                "planner or inference worker retained the creator's scheduling");
             cpu_set_t actual;
             CPU_ZERO(&actual);
-            sched_param param{};
-            Require(sched_getaffinity(tid, sizeof(actual), &actual) == 0 &&
-                CPU_EQUAL(&actual, &expected) && sched_getscheduler(tid) == SCHED_OTHER &&
-                sched_getparam(tid, &param) == 0 && param.sched_priority == 0,
-                "planner or inference worker retained the creator's CPU/scheduling");
-            ++new_threads;
+            Require(sched_getaffinity(tid, sizeof(actual), &actual) == 0, "cannot read affinity");
+            if (CPU_EQUAL(&actual, &planner_set)) {
+                ++on_planner_cpus;
+            } else {
+                Require(CPU_EQUAL(&actual, &worker_set), "planner thread or worker left its CPU set");
+                ++on_worker_cpus;
+            }
         }
-        Require(new_threads == config.runtime.threads,
-            "expected planner caller plus its two CPU inference workers");
+        // ORT leaves the calling thread alone, so only workers follow runtime.affinity.
+        const bool separate = !CPU_EQUAL(&planner_set, &worker_set);
+        Require(on_planner_cpus + on_worker_cpus == config.runtime.threads &&
+            (!separate || (on_planner_cpus == 1 && on_worker_cpus == config.runtime.threads - 1)),
+            "expected one planner thread plus its two CPU inference workers");
 
         const auto old_size = first->frames.size();
         const auto old_start = first->start_time_s;
@@ -1021,8 +1153,126 @@ void TestSonicPlannerScheduling(bool explicit_affinity) {
         planner.Update(robot, {}, stopped->start_time_s +
             stopped->frames.size() / config.output_fps + 0.1);
         Require(planner.Idle(), "a completed stop plan must allow policy handoff");
+
+        // Re-entry reuses the loaded session: a stopped planner plans again
+        // without starting new inference workers.
+        planner.RequestStop();
+        const auto before_reentry = NativeThreadIds();
+        planner.Reset(robot);
+        static_cast<void>(wait_for_plan(nullptr));
+        int new_threads = 0;
+        for (const int tid : NativeThreadIds()) new_threads += before_reentry.count(tid) ? 0 : 1;
+        Require(new_threads == 1, "re-entry must reuse the loaded planner session");
         planner.RequestStop();
     }).get();
+}
+
+// The tracker thread must not wait for a planner that is busy or starved:
+// readers retain their previous snapshot and Update skips while the planner
+// holds its state lock.
+void TestSonicPlannerTrackerDoesNotBlock() {
+    using behavior_manager::policy_adapter::SonicPlanner;
+    using behavior_manager::policy_adapter::SonicPlannerConfig;
+    const TempSonicOnnx model(kPlannerContextRepeatOnnx);
+    SonicPlannerConfig config;
+    config.enabled = true;
+    config.model_path = model.Path().string();
+    config.runtime.provider = "cpu";
+    config.runtime.threads = 1;
+    SonicPlanner planner(config, MakeSonicPolicyConfig(29));
+    auto robot = robot_base::RobotData::Create(29);
+    planner.Reset(robot);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (planner.Motion()->frames.size() == 100 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // Hammer the tracker-facing calls while commands keep the planner busy.
+    double worst_ms = 0.0;
+    for (int i = 0; i < 2000; ++i) {
+        robot_base::Command command;
+        command.vx = (i % 2) ? 0.2F : 0.0F;
+        const auto start = std::chrono::steady_clock::now();
+        planner.Update(robot, command, 0.002 * i);
+        const auto motion = planner.Motion();
+        static_cast<void>(planner.Idle());
+        worst_ms = std::max(worst_ms, std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count());
+        Require(motion && !motion->frames.empty(), "tracker read an empty plan");
+    }
+    // RequestStop runs on the control thread when the policy exits.
+    const auto stop_start = std::chrono::steady_clock::now();
+    planner.RequestStop();
+    const double stop_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - stop_start).count();
+    Require(worst_ms < 5.0, "tracker-facing planner calls blocked for " +
+        std::to_string(worst_ms) + " ms");
+    Require(stop_ms < 5.0, "RequestStop blocked for " + std::to_string(stop_ms) + " ms");
+}
+
+// One joint, 50 fps; position follows `value` so blends are easy to read back.
+behavior_manager::policy_adapter::SonicPlannerMotion ConstantMotion(
+    double start_s, int frames, float value) {
+    behavior_manager::policy_adapter::SonicPlannerMotion motion;
+    motion.start_time_s = start_s;
+    behavior_manager::policy_adapter::SonicMotionFrame frame;
+    frame.dof_pos = {value};
+    frame.dof_vel = {0.0F};
+    motion.frames.assign(frames, frame);
+    return motion;
+}
+
+void TestSonicPlannerLateBlend() {
+    using behavior_manager::policy_adapter::BlendSonicPlannerMotion;
+    constexpr double kFps = 50.0;
+    constexpr int kBlend = 8;
+    // A plan requested at t=0 with 0.8 s lookahead starts at t=0.8 and
+    // covers 1.2 s; the reference being tracked holds 0.0 until t=2.0.
+    const auto current = ConstantMotion(0.0, 101, 0.0F);
+    const auto generated = ConstantMotion(0.8, 61, 1.0F);
+
+    // On time: the crossfade starts at the plan start and keeps eight steps.
+    const auto on_time = BlendSonicPlannerMotion(current, generated, 0.5, kFps, kBlend);
+    Require(!on_time.expired && on_time.late_s == 0.0 && on_time.blend_frames == kBlend,
+        "on-time plan must keep the full crossfade");
+    Require(std::abs(on_time.blend_start_s - 0.8) < 1.0e-9, "on-time crossfade must start at the plan");
+
+    // The plan is published 0.307 s after its own start.
+    // The first published frame must still equal the
+    // tracked reference and the new pose must arrive over eight frames.
+    const auto late = BlendSonicPlannerMotion(current, generated, 1.107, kFps, kBlend);
+    Require(!late.expired && std::abs(late.late_s - 0.307) < 1.0e-9, "late plan was not measured");
+    Require(late.blend_frames == kBlend, "late plan lost part of its crossfade");
+    Require(late.motion.frames.front().dof_pos[0] == 0.0F,
+        "late plan must not jump at publication");
+    for (std::size_t i = 1; i < late.motion.frames.size(); ++i) {
+        const float step = late.motion.frames[i].dof_pos[0] - late.motion.frames[i - 1].dof_pos[0];
+        Require(step >= 0.0F && step <= 1.0F / kBlend + 1.0e-6F,
+            "late crossfade advanced faster than one blend step per frame");
+    }
+    Require(late.motion.frames.back().dof_pos[0] == 1.0F, "late plan never reached the new pose");
+
+    // A short remaining horizon must not truncate the crossfade.
+    const auto near_end = BlendSonicPlannerMotion(current, generated, 1.96, kFps, kBlend);
+    Require(!near_end.expired && near_end.motion.frames.size() >= kBlend + 1,
+        "near-expired plan truncated its crossfade");
+    Require(near_end.motion.frames.front().dof_pos[0] == 0.0F &&
+        near_end.motion.frames.back().dof_pos[0] == 1.0F,
+        "near-expired plan did not complete the handoff");
+    for (std::size_t i = 1; i < near_end.motion.frames.size(); ++i) {
+        const float step = near_end.motion.frames[i].dof_pos[0] -
+            near_end.motion.frames[i - 1].dof_pos[0];
+        Require(step >= 0.0F && step <= 1.0F / kBlend + 1.0e-6F,
+            "extended crossfade advanced faster than one blend step per frame");
+    }
+
+    // Inference longer than the whole new plan: the plan has expired and the
+    // tracked reference has already stalled; both are reported.
+    const auto stale_reference = ConstantMotion(0.0, 51, 0.0F);
+    const auto expired = BlendSonicPlannerMotion(stale_reference, generated, 2.5, kFps, kBlend);
+    Require(expired.expired && expired.stale_s > 1.4 && expired.motion.frames.empty(),
+        "expired plan must be discarded instead of replacing the current reference");
+    const auto at_end = BlendSonicPlannerMotion(current, generated, 2.0, kFps, kBlend);
+    Require(at_end.expired && at_end.motion.frames.empty(),
+        "a plan with no remaining horizon must not be published");
 }
 
 void TestSonicPrepareInputs() {
@@ -1067,6 +1317,64 @@ void TestSonicPrepareInputs() {
             "SONIC reference_obs 字段拼接顺序错误: index=" +
             std::to_string(index));
     }
+}
+
+void TestSonicSplitInference() {
+    const TempSonicReference reference(29);
+    const TempSonicOnnx encoder(kSonicEncoderProbeOnnx);
+    const TempSonicOnnx decoder(kSonicDecoderProbeOnnx);
+    Config config;
+    config.type = "sonic";
+    config.reference_file = reference.Path().string();
+    config.future_frames = 10;
+    config.future_step = 5;
+    config.sonic_encoder.model_path = encoder.Path().string();
+
+    auto policy_config = MakeSonicPolicyConfig(29);
+    policy_config.model_path = decoder.Path().string();
+    policy_config.action_scale = {1.0};
+    policy_config.strict_obs_dim_check = true;
+    policy_config.custom_array_dims = {{"sonic_latent", 64}, {"probe_history", 93}};
+    rl_policy::ModelInputBindingConfig input;
+    input.name = "obs_dict";
+    input.source = rl_policy::ModelInputSource::OBSERVATION;
+    policy_config.model_io.inputs.push_back(input);
+    rl_policy::ModelOutputBindingConfig output;
+    output.name = "action";
+    output.target = rl_policy::ModelOutputTarget::ACTION;
+    policy_config.model_io.outputs.push_back(output);
+    policy_config.obs_segments.push_back({{"sonic_latent"}, "", 0, "oldest_first", true});
+    policy_config.obs_segments.push_back({{"probe_history"}, "flat_history", 10, "oldest_first", true});
+    rl_policy::PolicyExecutor policy;
+    policy.Init(policy_config);
+    auto adapter = Create(config, policy_config);
+    robot_base::RobotData robot;
+    robot.num_dof = 29;
+    robot.base_quat = {1.0, 0.0, 0.0, 0.0};
+    robot.joint_pos.assign(29, 0.0);
+    robot.joint_vel.assign(29, 0.0);
+    adapter->Reset(robot);
+    const std::array<double, 3> zeros = {};
+    Eigen::VectorXf observation;
+    std::vector<double> action;
+    for (int sample = 1; sample <= 2; ++sample) {
+        const std::vector<float> history(93, static_cast<float>(sample));
+        policy.SetCustomArray("probe_history", history.data(), 93);
+        adapter->PrepareInputs(robot, 0.0, policy);
+        policy.AssembleObs(zeros, zeros, 0.0, 0.0, 0.0, robot.joint_pos, robot.joint_vel,
+            robot.base_quat, zeros, 0.02F, observation);
+        policy.Infer(observation, action);
+        Require(observation.size() == 994 && action.size() == 29,
+            "split SONIC interface dimensions changed");
+        Require(std::abs(action[0]) < 1e-6 && std::abs(action[1] - 0.24) < 1e-6 &&
+            std::abs(action[2] - 0.25) < 1e-6 && std::abs(action[3] - 0.02) < 1e-6,
+            "decoder did not receive current encoder tokens at its input prefix");
+        Require(action[6] == sample && action[7] == sample,
+            "decoder history tail was overwritten by tokens or failed to advance");
+    }
+    adapter->RequestInferenceTermination();
+    adapter->Reset(robot);
+    adapter->PrepareInputs(robot, 0.0, policy);
 }
 
 void TestSonicMotionCatalogPlayback() {
@@ -1565,9 +1873,15 @@ int main(int argc, char **argv) {
         TestManualReferencePlayback();
         TestSonicReferenceAndConfig();
         TestSonicPlannerConfig();
-        TestSonicPlannerScheduling(false);
-        TestSonicPlannerScheduling(true);
+        TestSonicPlannerCheckCadence();
+        TestSonicPlannerScheduling(PlannerPlacement::kInherit);
+        TestSonicPlannerScheduling(PlannerPlacement::kThreadAffinity);
+        TestSonicPlannerScheduling(PlannerPlacement::kWorkerAffinity);
+        TestSonicPlannerScheduling(PlannerPlacement::kIdle);
+        TestSonicPlannerLateBlend();
+        TestSonicPlannerTrackerDoesNotBlock();
         TestSonicPrepareInputs();
+        TestSonicSplitInference();
         TestSonicMotionCatalogPlayback();
         TestJointTrajectoryTakeover();
         TestJointTrajectoryTakeover(true);

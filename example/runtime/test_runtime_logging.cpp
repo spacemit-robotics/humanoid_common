@@ -8,14 +8,17 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 #include <yaml-cpp/yaml.h>
 
 #include "log_storage.h"
@@ -64,6 +67,10 @@ void RecordTest(const fs::path &root) {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
+        // Finalization includes background fsync; do not race it under build/test load.
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (runtime_logging::HighRateRequested() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         Require(!runtime_logging::HighRateRequested(), "recording failed to expire");
         runtime_logging::RecordCsv("oversize", "value", std::string(2 * 1024 * 1024, '1'));
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -161,6 +168,93 @@ void EarlyCaptureTest(const fs::path &root, bool fail_sync) {
     }
 }
 
+// A warning capture must not hide a later error inside the cooldown window.
+void FatalCaptureTest(const fs::path &root) {
+    const auto config = root / "fatal.yaml";
+    std::ofstream(config) << "robot_base: {name: fatal_capture}\nlogging:\n  directory: logs\n"
+        "  console: {enabled: false}\n  file: {enabled: true}\n"
+        "  telemetry: {enabled: true}\n"
+        "  blackbox: {enabled: true, pre_trigger_s: 2, post_trigger_s: 0.3, cooldown_s: 30}\n";
+    fs::path session;
+    const auto wait_for = [](bool active) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (runtime_logging::HighRateRequested() != active &&
+            std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        return runtime_logging::HighRateRequested() == active;
+    };
+    {
+        const auto yaml = robot_base::YamlFile::Load(config.string());
+        runtime_logging::Session logging(yaml, config.string(), "control", false);
+        session = runtime_logging::GetSessionDirectory();
+        for (int i = 0; i < 5; ++i)
+            runtime_logging::RecordCsv("probe", "time,value", std::to_string(i) + ",1");
+        runtime_logging::TriggerSnapshot("warning before the fault");
+        Require(wait_for(true) && wait_for(false), "warning capture did not run");
+        runtime_logging::TriggerSnapshot("second warning inside the cooldown");
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        Require(!runtime_logging::HighRateRequested(), "warning bypassed the cooldown");
+        runtime_logging::RecordCsv("probe", "time,value", "5,2");
+        runtime_logging::Log(runtime_logging::Level::kError, "injected fault inside cooldown", false);
+        Require(wait_for(true), "error inside the cooldown was not captured");
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        runtime_logging::Log(runtime_logging::Level::kError, "second fault extends the capture", false);
+        Require(wait_for(false), "extended capture did not finish");
+    }
+    std::vector<fs::path> incidents;
+    for (const auto &entry : fs::directory_iterator(session)) {
+        if (entry.is_directory() && entry.path().filename().string().rfind("incident_", 0) == 0)
+            incidents.push_back(entry.path());
+    }
+    std::sort(incidents.begin(), incidents.end());
+    Require(incidents.size() == 2, "expected one warning capture and one error capture");
+    for (const auto &incident : incidents)
+        Require(fs::exists(incident / ".complete"), "capture not finalized");
+    const auto warning = YAML::LoadFile((incidents[0] / "trigger.json").string());
+    const auto fault = YAML::LoadFile((incidents[1] / "trigger.json").string());
+    Require(warning["fatal"].as<int>() == 0 && fault["fatal"].as<int>() == 1,
+        "trigger metadata does not mark the error capture");
+    Require(fault["reason"].as<std::string>().find("injected fault inside cooldown") != std::string::npos,
+        "error capture lost its reason");
+    Require(Lines(incidents[1] / "probe.csv") == 7, "error capture lost its pre-trigger rows");
+    Require(Lines(incidents[1] / "extensions.jsonl") == 1, "second error did not extend the capture");
+}
+
+// An error must upgrade a peer warning even before this writer has joined it.
+void PeerFatalCaptureTest(const fs::path &root) {
+    const auto config = root / "peer_fatal.yaml";
+    std::ofstream(config) << "robot_base: {name: peer_fatal}\nlogging:\n  directory: logs\n"
+        "  console: {enabled: false}\n  file: {enabled: true}\n"
+        "  blackbox: {enabled: true, pre_trigger_s: 2, post_trigger_s: 10, cooldown_s: 30}\n";
+    const auto yaml = robot_base::YamlFile::Load(config.string());
+    runtime_logging::Session logging(yaml, config.string(), "driver", false);
+    const auto request = fs::path(runtime_logging::GetConfig().directory) / ".peer_fatal.capture.json";
+    std::string boot_id;
+    std::ifstream boot("/proc/sys/kernel/random/boot_id");
+    std::getline(boot, boot_id);
+    Require(!boot_id.empty(), "cannot read boot ID for peer capture test");
+    const double old_time = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() - 3.0;
+    // Older than the polling window but still inside the peer's post-trigger window.
+    std::ofstream(request) << "{\"id\":\"peer_warning\",\"boot_id\":\"" << boot_id
+        << "\",\"monotonic_s\":" << std::setprecision(17) << old_time
+        << ",\"fatal\":0,\"reason\":\"warning in peer\"}";
+    runtime_logging::Log(runtime_logging::Level::kError, "local error upgrades peer warning", false);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    YAML::Node updated;
+    while (std::chrono::steady_clock::now() < deadline) {
+        updated = YAML::LoadFile(request.string());
+        if (updated["fatal"].as<int>(0) == 1) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    Require(updated["fatal"].as<int>(0) == 1, "peer warning was not upgraded for other processes");
+    Require(updated["id"].as<std::string>() == "peer_warning", "peer incident ID was not retained");
+    Require(updated["monotonic_s"].as<double>() > old_time + 2.0,
+        "peer error retained the warning's old recording deadline");
+    Require(updated["reason"].as<std::string>().find("local error upgrades peer warning") != std::string::npos,
+        "peer error retained the warning's reason");
+}
+
 void ProducerTest() {
     std::atomic<bool> release{false};
     std::atomic<bool> entered{false};
@@ -208,8 +302,8 @@ void WriteRecoveryTest(const fs::path &root) {
 }  // namespace
 
 int main() {
-    char directory[] = "/tmp/humanoid_logging_XXXXXX";
-    const auto *created = mkdtemp(directory);
+    std::string pattern = (fs::temp_directory_path() / "humanoid_logging_XXXXXX").string();
+    const auto *created = mkdtemp(pattern.data());
     if (!created) return 1;
     const fs::path root(created);
     try {
@@ -217,6 +311,8 @@ int main() {
         RecordTest(root);
         EarlyCaptureTest(root, false);
         EarlyCaptureTest(root, true);
+        FatalCaptureTest(root);
+        PeerFatalCaptureTest(root);
         StorageTest(root);
         WriteRecoveryTest(root);
         fs::remove_all(root);

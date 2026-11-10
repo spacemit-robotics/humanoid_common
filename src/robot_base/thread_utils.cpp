@@ -70,6 +70,10 @@ int SchedPolicyFromString(const std::string &sched) {
         return SCHED_FIFO;
     if (sched == "rr")
         return SCHED_RR;
+    if (sched == "batch")
+        return SCHED_BATCH;
+    if (sched == "idle")
+        return SCHED_IDLE;
     return SCHED_OTHER;
 }
 
@@ -104,7 +108,8 @@ void SetCpuAffinity(const std::string &name, const std::vector<int> &cpu_ids) {
 void SetSchedParam(const std::string &name, const std::string &sched, int priority) {
     int policy = SchedPolicyFromString(sched);
     struct sched_param param;
-    param.sched_priority = policy == SCHED_OTHER ? 0 : priority;
+    const bool realtime = policy == SCHED_FIFO || policy == SCHED_RR;
+    param.sched_priority = realtime ? priority : 0;
     int ret = pthread_setschedparam(pthread_self(), policy, &param);
     if (ret != 0) {
         std::cerr << "[ThreadUtils] " << name << " 调度策略设置失败 (sched=" << sched
@@ -169,7 +174,8 @@ void ThreadLoop::Apply() const {
         return;
     }
     const char *actual_sched = actual_policy == SCHED_FIFO ? "fifo" :
-        (actual_policy == SCHED_RR ? "rr" : (actual_policy == SCHED_OTHER ? "other" : "other-policy"));
+        actual_policy == SCHED_RR ? "rr" : actual_policy == SCHED_BATCH ? "batch" :
+        actual_policy == SCHED_IDLE ? "idle" : actual_policy == SCHED_OTHER ? "other" : "other-policy";
     std::cout << "[ThreadLoop] " << name << " requested(cpu=" << cpu_config
         << ",sched=" << sched << ",priority=" << priority << ") actual(cpus="
         << FormatCpuAffinity(CurrentCpuAffinity()) << ",sched=" << actual_sched

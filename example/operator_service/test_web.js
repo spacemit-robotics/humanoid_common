@@ -70,6 +70,14 @@ motion.configure({...stand, client_smoothing: false}, config);
 assert.deepEqual(motion.step({vx: 1, vy: 1, wz: 1}, 0.05), {vx: 0, vy: 0, wz: 0});
 motion.configure(walk, config);
 close(motion.step({vx: 1}, 0.05).vx, 0.05); // Switching back restores default client ramps.
+motion.configure({...walk, teleop: {slow_limits: {vx: 0.7, vy: 0.4, wz: 1},
+    fast_limits: {vx: 0.7, vy: 0.4, wz: 1}}}, config);
+close(motion.limits("vx").max, 0.7);
+assert.equal(motion.hasSpeedModes, false);
+assert.deepEqual(motion.config.acceleration, config.acceleration);
+motion.configure(walk, config);
+assert.equal(motion.hasSpeedModes, true);
+close(motion.limits("vx", "slow").max, 0.6);
 
 // Exercise the actual app lifecycle, without browser/network/robot dependencies.
 const elements = new Map(), intervals = new Map(), events = new Map(), captured = [];

@@ -7,6 +7,7 @@
 #ifndef OPERATOR_TYPES_H
 #define OPERATOR_TYPES_H
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 namespace operator_service {
@@ -28,6 +29,8 @@ struct Policy {
     bool client_smoothing = true;  // Web/WebView velocity ramps; false delegates smoothing to the policy.
     std::string switch_group;  // Explicitly compatible live-switch policies; empty disables it.
     std::string display_name;
+    std::optional<Velocity> slow_limits;
+    std::optional<Velocity> fast_limits;
 };
 struct Fault {
     bool active = false;

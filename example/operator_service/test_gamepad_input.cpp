@@ -158,6 +158,7 @@ int main() {
     using operator_gamepad::Normalize;
     using operator_gamepad::Chords;
     using operator_gamepad::Scale;
+    using operator_gamepad::SpeedCaps;
     using operator_gamepad::Advance;
     using operator_gamepad::Neutral;
     const auto ds4 = MakeLayout("ds4_generic"), xbox = MakeLayout("xbox");
@@ -189,6 +190,12 @@ int main() {
     operator_service::Policy policy;
     policy.minimum = {-1, -0.3, -1};
     policy.maximum = {2, 0.4, 1};
+    const std::array<double, 3> fallback{0.6, 0.6, 1};
+    assert(SpeedCaps(policy, false, fallback) == fallback);
+    policy.slow_limits = operator_service::Velocity{0.7, 0.4, 1};
+    policy.fast_limits = policy.slow_limits;
+    assert(SpeedCaps(policy, false, fallback)[0] == 0.7);
+    assert(SpeedCaps(policy, false, fallback) == SpeedCaps(policy, true, fallback));
     const auto v = Scale({1, -1, 0.5}, policy, {0.6, 0.6, 1.0});
     assert(v.vx == 0.6 && v.vy == -0.3 && v.wz == 0.5);
     assert(Scale({-1, 0, 0}, policy, {1.5, 0.6, 1}).vx == -1);

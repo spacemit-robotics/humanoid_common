@@ -6,6 +6,8 @@
  * @brief Verify rejected inference diagnostics without publishing late actions
  */
 
+#include <sched.h>
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -85,11 +87,13 @@ public:
 
     const fs::path &Directory() const { return directory_; }
 
-    fs::path WriteConfig(bool debug) const {
+    fs::path WriteConfig(bool debug, bool limited = false,
+        const std::string &runtime = "{provider: cpu}") const {
         const auto path = directory_ / "config.yaml";
         std::ofstream yaml(path);
         yaml << "robot_base:\n"
             "  name: inference_logging_test\n"
+            "  joint_names: [joint_a, joint_b, joint_c]\n"
             "logging:\n"
             "  level: " << (debug ? "debug" : "info") << "\n"
             "  directory: logs\n"
@@ -103,7 +107,7 @@ public:
             "    policies:\n"
             "      probe:\n"
             "        model_path: identity.onnx\n"
-            "        runtime: {provider: cpu}\n"
+            "        runtime: " << runtime << "\n"
             "        model_io:\n"
             "          inputs: [{name: obs, source: observation}]\n"
             "          outputs: [{name: action, target: action}]\n"
@@ -113,6 +117,10 @@ public:
             "        kd: [0.1, 0.1, 0.1]\n"
             "        observation:\n"
             "          segment_0_terms: [ang_vel]\n";
+        if (limited) {
+            yaml << "        target_position_lower: [-0.05, -0.05, -0.05]\n"
+                "        target_position_upper: [0.1, 0.1, 0.1]\n";
+        }
         Require(yaml.good(), "cannot write test config");
         return path;
     }
@@ -332,6 +340,96 @@ void TestDelayedInferenceRecovery() {
     fsm.ForceSwitch(StateName::POWER_OFF, "bounded recovery test complete");
 }
 
+// Policy YAML controls ORT worker spinning and CPU placement, and the
+// prepared runtime reports where the workers actually run.
+void TestRuntimePlacement() {
+    cpu_set_t launch;
+    CPU_ZERO(&launch);
+    Require(sched_getaffinity(0, sizeof(launch), &launch) == 0, "cannot read launch affinity");
+    int cpu = -1;
+    for (int i = 0; i < CPU_SETSIZE; ++i) if (CPU_ISSET(i, &launch)) cpu = i;
+    const Fixture fixture;
+    const auto yaml_path = fixture.WriteConfig(false, false,
+        "{provider: cpu, threads: 2, ort_spinning: false, affinity: \"" + std::to_string(cpu) + "\"}");
+    const auto config = behavior_manager::LoadRLStateConfig(
+        yaml_path.string(), "probe", fixture.Directory().string());
+    Require(!config.policy.runtime.ort_spinning && config.policy.runtime.affinity == std::to_string(cpu),
+        "runtime.ort_spinning and runtime.affinity were not loaded from YAML");
+    fs::path log_directory;
+    {
+        const auto yaml = robot_base::YamlFile::Load(yaml_path.string());
+        runtime_logging::Session logging(yaml, yaml_path.string(), "control", false);
+        log_directory = runtime_logging::GetSessionDirectory();
+        static_cast<void>(behavior_manager::CreatePreparedStateRl(config));
+    }
+    const auto events = ReadText(log_directory / "events.log");
+    Require(events.find("RL runtime ready: policy=probe, provider=cpu, intra=2, spinning=off, affinity=" +
+        std::to_string(cpu) + ", workers=") != std::string::npos,
+        "prepared runtime was not reported");
+    Require(events.find("@" + std::to_string(cpu) + "/other") != std::string::npos,
+        "ORT worker did not move to the configured CPU");
+}
+
+void TestClampedTargetReport() {
+    const Fixture fixture;
+    const auto yaml_path = fixture.WriteConfig(true, true);
+    auto config = behavior_manager::LoadRLStateConfig(
+        yaml_path.string(), "probe", fixture.Directory().string());
+    config.first_action_timeout_s = config.max_action_age_s = 0.2;
+    Observer observer;
+    config.runtime_observer = &observer;
+    fs::path log_directory;
+    std::vector<double> applied;
+    {
+        const auto yaml = robot_base::YamlFile::Load(yaml_path.string());
+        runtime_logging::Session logging(yaml, yaml_path.string(), "control", false);
+        log_directory = runtime_logging::GetSessionDirectory();
+        auto sensor = robot_base::RobotData::Create(3);
+        sensor.base_quat = {1.0, 0.0, 0.0, 0.0};
+        // The identity probe turns the gyro into targets beyond [-0.05, 0.1].
+        sensor.gyro = {0.2, -0.1, 0.3};
+        robot_base::Command command;
+        behavior_manager::ControlOutput output;
+        behavior_manager::FSM fsm;
+        auto state = behavior_manager::CreateStateRl(config);
+        auto *rl_state = state.get();
+        fsm.AddState(StateName::POWER_OFF, behavior_manager::CreateStatePowerOff());
+        fsm.AddState(StateName::RL, std::move(state));
+        fsm.SetDataPointers(&sensor, &command, &output);
+        fsm.Init();
+        fsm.ForceSwitch(StateName::RL, "target clamp report regression");
+        rl_state->Run(0.02F, 0.02F);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (observer.published.load() == 0 && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        rl_state->Run(0.001F, 0.02F);
+        Require(!rl_state->CurrentFault().latched && output.enable,
+            "clamped targets must be applied, not rejected");
+        applied = output.target_pos;
+        fsm.ForceSwitch(StateName::POWER_OFF, "target clamp report regression complete");
+    }
+    const std::vector<double> expected = {0.1, -0.05, 0.1};
+    Require(applied.size() == expected.size(), "clamped target dimensions changed");
+    for (std::size_t i = 0; i < expected.size(); ++i)
+        Require(std::abs(applied[i] - expected[i]) < 1.0e-9, "target was not clamped to its limit");
+
+    // The events line is best effort under logger contention; the CSV row is not.
+    const auto report = ReadText(log_directory / "control_target_clamp.csv");
+    Require(report.find("probe,joint_c,0.300000,0.100000,0.200000,3,1,1") != std::string::npos,
+        "clamp report must name the worst joint and its excess:\n" + report);
+    std::ifstream input(log_directory / "control_policy_apply_probe.csv");
+    std::string header, row;
+    Require(std::getline(input, header) && std::getline(input, row), "apply trace is missing");
+    const auto names = ParseCsvRow(header);
+    const auto values = ParseCsvRow(row);
+    Require(names.size() == values.size(), "apply trace column count mismatch");
+    std::map<std::string, std::string> fields;
+    for (std::size_t i = 0; i < names.size(); ++i) fields.emplace(names[i], values[i]);
+    Require(fields.at("clamped_joints") == "3" && fields.at("clamp_joint_index") == "2" &&
+        std::abs(std::stod(fields.at("clamp_max_excess")) - 0.2) < 1.0e-6 &&
+        fields.at("clamped_actions") == "1", "apply trace lacks the clamp summary");
+}
+
 }  // namespace
 
 int main() {
@@ -341,6 +439,8 @@ int main() {
         TestLogging(true, false);
         TestLogging(true, true, true);
         TestDelayedInferenceRecovery();
+        TestClampedTargetReport();
+        TestRuntimePlacement();
         std::cout << "StateRL inference logging regression passed\n";
         return 0;
     } catch (const std::exception &error) {

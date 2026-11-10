@@ -116,6 +116,11 @@ inline double Advance(double value, double target, double accel, double decel, d
     const double rate = std::abs(target) > std::abs(value) ? accel : decel;
     return value + std::clamp(target - value, -rate * dt, rate * dt);
 }
+inline std::array<double, 3> SpeedCaps(const operator_service::Policy &policy, bool fast,
+    const std::array<double, 3> &fallback) {
+    const auto &limits = fast ? policy.fast_limits : policy.slow_limits;
+    return limits ? std::array<double, 3>{limits->vx, limits->vy, limits->wz} : fallback;
+}
 inline operator_service::Velocity Scale(const operator_service::Velocity &input,
     const operator_service::Policy &policy, const std::array<double, 3> &caps) {
     const auto scale = [](double x, double low, double high, double cap) {

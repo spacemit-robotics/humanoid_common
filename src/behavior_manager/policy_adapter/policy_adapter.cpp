@@ -214,6 +214,7 @@ double SmoothStep01(double value) {
 
 constexpr std::size_t kFrames = 10;
 constexpr double kPeriod = 0.02;
+constexpr double kPi = 3.14159265358979323846;
 
 void Require(bool condition, const char *message) {
     if (!condition) throw std::runtime_error(std::string("[supermimic] ") + message);
@@ -286,7 +287,13 @@ public:
         sample_.resize(3 * joints_ + 6, 0.0F);
         history_.resize(sample_.size() * kFrames, 0.0F);
         goal_.resize((2 * joints_ + 10) * kFrames, 0.0F);
-        if (config_.reference_file.empty()) {
+        for (auto *frame : {&frame_, &target_, &transition_source_, &cancel_frame_}) {
+            frame->joint_pos.resize(joints_);
+            frame->joint_vel.resize(joints_);
+        }
+        if (config_.reference_motion_catalog.Enabled()) {
+            LoadCatalog();
+        } else if (config_.reference_file.empty()) {
             const float height = CheckedFloat(config.supermimic.reference_height);
             Require(height > 0.0F, "reference_height must be positive");
             Require(!config_.manual_start, "manual start requires a reference_file");
@@ -296,18 +303,35 @@ public:
                 goal_[start + 2 * joints_ + 9] = height;
             }
         } else {
-            LoadReference();
+            ReferenceMotionConfig reference;
+            reference.file = config_.reference_file;
+            reference.motion_fps = config_.motion_fps;
+            reference.playback_speed = config_.playback_speed;
+            reference.loop = config_.loop;
+            reference.loop_pause = config_.loop_pause;
+            reference_ = LoadReference(reference);
         }
     }
 
     const char *Type() const override { return "supermimic"; }
     bool ReadyForPolicySwitch() const override {
+        if (interactive_) {
+            return !transition_active_ && (!playback_active_ || status_.phase == Phase::FINISHED);
+        }
         return reference_.empty() || handoff_.Ready();
     }
-    bool PlaybackFinished() const override { return handoff_.Finished(); }
+    bool PlaybackFinished() const override {
+        return interactive_ ? playback_active_ && status_.phase == Phase::FINISHED : handoff_.Finished();
+    }
 
     void PreparePolicySwitch(bool requested, double elapsed_s) override {
-        if (!reference_.empty()) {
+        if (interactive_) {
+            // Return to the default reference before another policy takes over.
+            UpdateInteractionStatus(elapsed_s);
+            if (requested && !canceling_ && (playback_active_ || transition_active_)) {
+                BeginTransition(default_clip_, elapsed_s, false, true);
+            }
+        } else if (!reference_.empty()) {
             handoff_.Request(requested, elapsed_s - playback_start_elapsed_,
                 static_cast<int>(reference_.size()), config_);
         }
@@ -328,6 +352,15 @@ public:
         handoff_.Reset();
         playback_started_ = !config_.manual_start;
         playback_start_elapsed_ = 0.0;
+        active_clip_ = default_clip_;
+        playback_active_ = false;
+        transition_active_ = false;
+        canceling_ = false;
+        cancel_follows_playback_ = false;
+        transition_start_elapsed_ = 0.0;
+        transition_duration_ = 0.0;
+        last_request_sequence_ = 0;
+        status_ = {};
     }
 
     void PrepareInputs(const robot_base::RobotData &robot, double elapsed_s,
@@ -379,7 +412,45 @@ public:
             [](double value) { return static_cast<float>(value); });
     }
 
+    // Catalog actions replace the reference in place; history and the last action are kept.
+    void HandleInteractionRequest(const robot_base::InteractionRequest &request,
+        double elapsed_s) override {
+        using Operation = robot_base::InteractionRequest::Operation;
+        if (!interactive_ || request.operation == Operation::NONE || request.sequence == 0 ||
+            request.sequence <= last_request_sequence_) return;
+        last_request_sequence_ = request.sequence;
+        UpdateInteractionStatus(elapsed_s);
+        const bool busy = status_.phase == Phase::BLEND_IN || status_.phase == Phase::PLAYING ||
+            status_.phase == Phase::HOLDING || status_.phase == Phase::BLEND_OUT;
+        status_.sequence = request.sequence;
+        if (request.operation == Operation::CANCEL) {
+            status_.request_accepted = busy;
+            if (!busy) {
+                status_.phase = Phase::REJECTED;
+                status_.progress = 0.0F;
+                if (status_.action.empty()) status_.action = "cancel";
+                return;
+            }
+            if (!canceling_) BeginTransition(default_clip_, elapsed_s, false, true);
+            return;
+        }
+        const auto clip = clips_by_name_.find(request.action);
+        status_.request_accepted = !busy && clip != clips_by_name_.end();
+        if (busy) return;
+        status_.progress = 0.0F;
+        status_.action = request.action;
+        if (clip == clips_by_name_.end()) {
+            status_.phase = Phase::REJECTED;
+            return;
+        }
+        BeginTransition(clip->second, elapsed_s, true, false);
+    }
+
+    robot_base::InteractionStatus GetInteractionStatus() const override { return status_; }
+
 private:
+    using Phase = robot_base::InteractionStatus::Phase;
+
     struct ReferenceFrame {
         std::vector<float> joint_pos;
         std::vector<float> joint_vel;
@@ -389,17 +460,33 @@ private:
         float height = 0.0F;
     };
 
-    void LoadReference() {
-        Require(std::isfinite(config_.motion_fps) && config_.motion_fps > 0.0 &&
-            std::isfinite(config_.playback_speed) && config_.playback_speed > 0.0 &&
-            std::isfinite(config_.loop_pause) && config_.loop_pause >= 0.0,
+    // One goal frame: absolute joint targets, root-frame gravity and angular velocity,
+    // heading-frame linear velocity and root height.
+    struct GoalFrame {
+        std::vector<double> joint_pos;
+        std::vector<double> joint_vel;
+        Eigen::Vector3d gravity = Eigen::Vector3d::Zero();
+        Eigen::Vector3d angular_velocity = Eigen::Vector3d::Zero();
+        Eigen::Vector3d linear_velocity = Eigen::Vector3d::Zero();
+        double height = 0.0;
+    };
+
+    struct Clip {
+        ReferenceMotionConfig config;
+        std::vector<ReferenceFrame> frames;
+    };
+
+    std::vector<ReferenceFrame> LoadReference(const ReferenceMotionConfig &reference) const {
+        Require(std::isfinite(reference.motion_fps) && reference.motion_fps > 0.0 &&
+            std::isfinite(reference.playback_speed) && reference.playback_speed > 0.0 &&
+            std::isfinite(reference.loop_pause) && reference.loop_pause >= 0.0,
             "invalid reference playback timing");
-        const auto positions = cnpy::npz_load(config_.reference_file, "joint_pos");
-        const auto velocities = cnpy::npz_load(config_.reference_file, "joint_vel");
-        const auto body_positions = cnpy::npz_load(config_.reference_file, "body_pos_w");
-        const auto orientations = cnpy::npz_load(config_.reference_file, "body_quat_w");
-        const auto linear = cnpy::npz_load(config_.reference_file, "body_lin_vel_w");
-        const auto angular = cnpy::npz_load(config_.reference_file, "body_ang_vel_w");
+        const auto positions = cnpy::npz_load(reference.file, "joint_pos");
+        const auto velocities = cnpy::npz_load(reference.file, "joint_vel");
+        const auto body_positions = cnpy::npz_load(reference.file, "body_pos_w");
+        const auto orientations = cnpy::npz_load(reference.file, "body_quat_w");
+        const auto linear = cnpy::npz_load(reference.file, "body_lin_vel_w");
+        const auto angular = cnpy::npz_load(reference.file, "body_ang_vel_w");
         for (const auto *array : {&positions, &velocities, &body_positions,
                 &orientations, &linear, &angular}) {
             Require(array->word_size == sizeof(float) && !array->fortran_order,
@@ -420,9 +507,9 @@ private:
         Require(config_.anchor_body_index >= 0 &&
             static_cast<std::size_t>(config_.anchor_body_index) < bodies,
             "anchor_body_index must select the reference root body");
-        reference_.resize(frames);
+        std::vector<ReferenceFrame> motion(frames);
         for (std::size_t frame = 0; frame < frames; ++frame) {
-            auto &out = reference_[frame];
+            auto &out = motion[frame];
             out.joint_pos.resize(joints_);
             out.joint_vel.resize(joints_);
             for (std::size_t joint = 0; joint < joints_; ++joint) {
@@ -442,9 +529,185 @@ private:
                 out.angular_velocity[axis] = CheckedFloat(angular.data<float>()[body * 3 + axis]);
             }
         }
+        return motion;
+    }
+
+    void LoadCatalog() {
+        const auto &catalog = config_.reference_motion_catalog;
+        Require(!config_.manual_start, "catalog actions start on interaction requests");
+        Require(std::isfinite(catalog.transition_duration) && catalog.transition_duration >= 0.0,
+            "transition_duration must be finite and non-negative");
+        for (const auto &action : catalog.actions) {
+            Require(!action.name.empty() && clips_by_name_.count(action.name) == 0,
+                "catalog action names must be non-empty and unique");
+            Require(!action.cancel_transition_duration ||
+                (std::isfinite(*action.cancel_transition_duration) &&
+                    *action.cancel_transition_duration >= 0.0),
+                "cancel_transition_duration must be finite and non-negative");
+            clips_by_name_.emplace(action.name, clips_.size());
+            clips_.push_back({action, LoadReference(action)});
+        }
+        const auto standby = clips_by_name_.find(catalog.default_action);
+        Require(standby != clips_by_name_.end(), "default_action must name a catalog action");
+        default_clip_ = active_clip_ = standby->second;
+        interactive_ = true;
+    }
+
+    // Reference at a fractional frame; rates are scaled by the playback speed.
+    void Interpolate(const std::vector<ReferenceFrame> &frames, double position, double speed,
+        GoalFrame &out) const {
+        const std::size_t first = static_cast<std::size_t>(std::floor(position));
+        const std::size_t second = std::min(first + 1, frames.size() - 1);
+        const float alpha = static_cast<float>(position - first);
+        const auto &a = frames[first];
+        const auto &b = frames[second];
+        for (std::size_t joint = 0; joint < joints_; ++joint) {
+            out.joint_pos[joint] = (1.0 - alpha) * a.joint_pos[joint] + alpha * b.joint_pos[joint];
+            out.joint_vel[joint] = speed *
+                ((1.0 - alpha) * a.joint_vel[joint] + alpha * b.joint_vel[joint]);
+        }
+        const auto orientation = a.orientation.slerp(alpha, b.orientation).normalized();
+        const Eigen::Vector3f gravity = orientation.conjugate() * -Eigen::Vector3f::UnitZ();
+        const Eigen::Vector3f gyro = orientation.conjugate() *
+            ((1.0F - alpha) * a.angular_velocity + alpha * b.angular_velocity);
+        const Eigen::Vector3f velocity = YawQuaternion(QuaternionYaw(orientation)).conjugate() *
+            ((1.0F - alpha) * a.linear_velocity + alpha * b.linear_velocity);
+        out.gravity = gravity.cast<double>();
+        out.angular_velocity = speed * gyro.cast<double>();
+        out.linear_velocity = speed * velocity.cast<double>();
+        out.height = (1.0F - alpha) * a.height + alpha * b.height;
+    }
+
+    // A playing action continues underneath its fade-out, retaining its position/velocity
+    // relationship instead of freezing a moving limb before returning to standby.
+    void Blend(const GoalFrame &to, double phase, GoalFrame &out) const {
+        const auto &from = cancel_follows_playback_ ? cancel_frame_ : transition_source_;
+        const double duration = transition_duration_;
+        const double u = std::clamp(phase, 0.0, 1.0);
+        const double weight = 0.5 - 0.5 * std::cos(kPi * u);
+        const double rate = 0.5 * kPi * std::sin(kPi * u) / duration;
+        for (std::size_t joint = 0; joint < joints_; ++joint) {
+            const double delta = to.joint_pos[joint] - from.joint_pos[joint];
+            out.joint_pos[joint] = from.joint_pos[joint] + weight * delta;
+            out.joint_vel[joint] = rate * delta + weight * to.joint_vel[joint] +
+                (cancel_follows_playback_ ? (1.0 - weight) * from.joint_vel[joint] : 0.0);
+        }
+        const Eigen::Vector3d gravity = from.gravity + weight * (to.gravity - from.gravity);
+        out.gravity = gravity.norm() > 1.0e-9 ? gravity.normalized() : to.gravity;
+        out.angular_velocity = (1.0 - weight) * from.angular_velocity + weight * to.angular_velocity;
+        out.linear_velocity = (1.0 - weight) * from.linear_velocity + weight * to.linear_velocity;
+        out.height = from.height + weight * (to.height - from.height);
+    }
+
+    void PlaybackFrame(const Clip &clip, double time, double origin, GoalFrame &out) const {
+        const auto sample = SamplePlayback(origin,
+            static_cast<int>(clip.frames.size()), clip.config.motion_fps,
+            clip.config.playback_speed, clip.config.loop, clip.config.loop_pause);
+        const double speed = sample.hold_last_frame ? 0.0 : clip.config.playback_speed;
+        const double position = std::min(sample.frame0 + static_cast<double>(sample.alpha) +
+            (time - origin) * clip.config.motion_fps * speed, clip.frames.size() - 1.0);
+        Interpolate(clip.frames, position, speed, out);
+    }
+
+    // Catalog reference at a wall time: transition, playback, or the held first frame.
+    void CatalogFrame(double time, GoalFrame &out, double horizon_origin = -1.0) {
+        const Clip &clip = clips_[active_clip_];
+        const double duration = transition_duration_;
+        if (transition_active_ && time < transition_start_elapsed_ + duration) {
+            if (cancel_follows_playback_) {
+                const double origin = horizon_origin < 0.0 ? time : horizon_origin;
+                PlaybackFrame(clips_[cancel_source_clip_], time - cancel_playback_start_elapsed_,
+                    origin - cancel_playback_start_elapsed_, cancel_frame_);
+            }
+            Interpolate(clip.frames, 0.0, playback_active_ ? clip.config.playback_speed : 0.0, target_);
+            Blend(target_, (time - transition_start_elapsed_) / duration, out);
+        } else if (!playback_active_) {
+            Interpolate(clip.frames, 0.0, 0.0, out);
+        } else {
+            const double origin = horizon_origin < 0.0 ? time :
+                std::max(horizon_origin, playback_start_elapsed_);
+            PlaybackFrame(clip, time - playback_start_elapsed_, origin - playback_start_elapsed_, out);
+        }
+    }
+
+    void BeginTransition(std::size_t clip, double elapsed_s, bool start_playback, bool canceling) {
+        CatalogFrame(elapsed_s, frame_);
+        transition_source_ = frame_;
+        cancel_follows_playback_ = canceling && playback_active_ && !transition_active_;
+        cancel_source_clip_ = active_clip_;
+        cancel_playback_start_elapsed_ = playback_start_elapsed_;
+        const double duration = canceling ? clips_[active_clip_].config.cancel_transition_duration
+            .value_or(config_.reference_motion_catalog.transition_duration) :
+            config_.reference_motion_catalog.transition_duration;
+        transition_duration_ = duration;
+        active_clip_ = clip;
+        transition_start_elapsed_ = elapsed_s;
+        playback_start_elapsed_ = elapsed_s + duration;
+        transition_active_ = duration > 0.0;
+        playback_active_ = start_playback;
+        canceling_ = canceling;
+        status_.phase = canceling ? Phase::BLEND_OUT :
+            (transition_active_ ? Phase::BLEND_IN : Phase::PLAYING);
+        if (!transition_active_ && canceling_) {
+            playback_active_ = false;
+            canceling_ = false;
+            status_.phase = Phase::FINISHED;
+            status_.progress = 1.0F;
+        }
+    }
+
+    void UpdateInteractionStatus(double elapsed_s) {
+        if (transition_active_) {
+            status_.progress = 0.0F;
+            if (elapsed_s < transition_start_elapsed_ + transition_duration_) return;
+            transition_active_ = false;
+            if (canceling_) {
+                canceling_ = false;
+                playback_active_ = false;
+                status_.phase = Phase::FINISHED;
+                status_.progress = 1.0F;
+                return;
+            }
+            status_.phase = Phase::PLAYING;
+        }
+        if (!playback_active_) return;
+        const auto &clip = clips_[active_clip_];
+        const double active = clip.frames.size() /
+            (clip.config.motion_fps * clip.config.playback_speed);
+        const double elapsed = std::max(0.0, elapsed_s - playback_start_elapsed_);
+        double progress = elapsed;
+        if (clip.config.loop) {
+            progress = std::fmod(elapsed, active + clip.config.loop_pause);
+            status_.phase = progress >= active ? Phase::HOLDING : Phase::PLAYING;
+        } else {
+            status_.phase = elapsed >= active ? Phase::FINISHED : Phase::PLAYING;
+        }
+        status_.progress = static_cast<float>(std::clamp(progress / active, 0.0, 1.0));
+    }
+
+    void WriteGoal(std::size_t future, const GoalFrame &frame) {
+        float *out = goal_.data() + future * (2 * joints_ + 10);
+        for (std::size_t joint = 0; joint < joints_; ++joint) {
+            out[joint] = CheckedFloat(frame.joint_pos[joint] - defaults_[joint]);
+            out[joints_ + joint] = CheckedFloat(frame.joint_vel[joint]);
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            out[2 * joints_ + axis] = CheckedFloat(frame.gravity[axis]);
+            out[2 * joints_ + 3 + axis] = CheckedFloat(frame.angular_velocity[axis]);
+            out[2 * joints_ + 6 + axis] = CheckedFloat(frame.linear_velocity[axis]);
+        }
+        out[2 * joints_ + 9] = CheckedFloat(frame.height);
     }
 
     void PrepareGoal(double elapsed_s) {
+        if (interactive_) {
+            UpdateInteractionStatus(elapsed_s);
+            for (std::size_t future = 0; future < kFrames; ++future) {
+                CatalogFrame(elapsed_s + (future + 1) * kPeriod, frame_, elapsed_s);
+                WriteGoal(future, frame_);
+            }
+            return;
+        }
         if (reference_.empty()) return;
         const bool waiting = !playback_started_;
         const auto sample = handoff_.Sample(elapsed_s - playback_start_elapsed_,
@@ -452,33 +715,11 @@ private:
         const bool held = waiting || sample.hold_last_frame;
         const double speed = held ? 0.0 : config_.playback_speed;
         for (std::size_t future = 0; future < kFrames; ++future) {
-            // Match the model's 20 ms horizon; future samples clamp at this clip's end.
+            // The first goal is one policy step ahead; held references do not advance.
             const double position = std::min(sample.frame0 + static_cast<double>(sample.alpha) +
-                future * kPeriod * config_.motion_fps * speed, reference_.size() - 1.0);
-            const std::size_t first = static_cast<std::size_t>(std::floor(position));
-            const std::size_t second = std::min(first + 1, reference_.size() - 1);
-            const float alpha = static_cast<float>(position - first);
-            const auto &a = reference_[first];
-            const auto &b = reference_[second];
-            float *out = goal_.data() + future * (2 * joints_ + 10);
-            for (std::size_t joint = 0; joint < joints_; ++joint) {
-                out[joint] = CheckedFloat((1.0 - alpha) * a.joint_pos[joint] +
-                    alpha * b.joint_pos[joint] - defaults_[joint]);
-                out[joints_ + joint] = CheckedFloat(speed *
-                    ((1.0 - alpha) * a.joint_vel[joint] + alpha * b.joint_vel[joint]));
-            }
-            const auto orientation = a.orientation.slerp(alpha, b.orientation).normalized();
-            const Eigen::Vector3f gravity = orientation.conjugate() * -Eigen::Vector3f::UnitZ();
-            const Eigen::Vector3f gyro = orientation.conjugate() *
-                ((1.0F - alpha) * a.angular_velocity + alpha * b.angular_velocity);
-            const Eigen::Vector3f velocity = YawQuaternion(QuaternionYaw(orientation)).conjugate() *
-                ((1.0F - alpha) * a.linear_velocity + alpha * b.linear_velocity);
-            for (int axis = 0; axis < 3; ++axis) {
-                out[2 * joints_ + axis] = gravity[axis];
-                out[2 * joints_ + 3 + axis] = CheckedFloat(speed * gyro[axis]);
-                out[2 * joints_ + 6 + axis] = CheckedFloat(speed * velocity[axis]);
-            }
-            out[2 * joints_ + 9] = (1.0F - alpha) * a.height + alpha * b.height;
+                (future + 1) * kPeriod * config_.motion_fps * speed, reference_.size() - 1.0);
+            Interpolate(reference_, position, speed, frame_);
+            WriteGoal(future, frame_);
         }
     }
 
@@ -494,6 +735,25 @@ private:
     ReferenceHandoff handoff_;
     bool playback_started_ = true;
     double playback_start_elapsed_ = 0.0;
+    std::vector<Clip> clips_;
+    std::unordered_map<std::string, std::size_t> clips_by_name_;
+    std::size_t default_clip_ = 0;
+    std::size_t active_clip_ = 0;
+    bool interactive_ = false;
+    bool playback_active_ = false;
+    bool transition_active_ = false;
+    bool canceling_ = false;
+    bool cancel_follows_playback_ = false;
+    std::size_t cancel_source_clip_ = 0;
+    double cancel_playback_start_elapsed_ = 0.0;
+    double transition_start_elapsed_ = 0.0;
+    double transition_duration_ = 0.0;
+    uint64_t last_request_sequence_ = 0;
+    robot_base::InteractionStatus status_;
+    GoalFrame frame_;
+    GoalFrame target_;
+    GoalFrame transition_source_;
+    GoalFrame cancel_frame_;
 };
 
 Config::SupermimicConfig LoadSupermimicConfig(
@@ -501,7 +761,7 @@ Config::SupermimicConfig LoadSupermimicConfig(
     const YAML::Node root = YAML::LoadFile(yaml_path);
     const YAML::Node adapter = AtPath(root, base);
     Config::SupermimicConfig settings;
-    if (!adapter["reference_file"]) {
+    if (!adapter["reference_file"] && !adapter["catalog"]) {
         settings.reference_height = adapter["reference_height"].as<double>();
         Require(CheckedFloat(settings.reference_height) > 0.0F,
             "reference_height must be a finite positive float");
@@ -2063,7 +2323,8 @@ Config LoadConfig(const std::string &yaml_path,
         }
         const auto catalog = yaml.Read<std::string>(
             adapter_base + ".catalog");
-        if (config.type == "sonic" && catalog && !catalog->empty()) {
+        if ((config.type == "sonic" || config.type == "supermimic") &&
+            catalog && !catalog->empty()) {
             const std::string catalog_base = *catalog;
             auto &motion_catalog = config.reference_motion_catalog;
             motion_catalog.transition_duration = yaml.Read<double>(
@@ -2085,7 +2346,7 @@ Config LoadConfig(const std::string &yaml_path,
                     .value_or(std::vector<std::string>{});
             if (action_names.empty()) {
                 throw std::runtime_error(
-                    "[policy_adapter] SONIC 动作目录不能为空: " +
+                    "[policy_adapter] 动作目录不能为空: " +
                     catalog_base);
             }
             motion_catalog.default_action = yaml.Read<std::string>(
@@ -2114,6 +2375,8 @@ Config LoadConfig(const std::string &yaml_path,
                 action.loop_pause = yaml.Read<double>(
                     action_base + ".loop_pause").value_or(
                         default_loop_pause);
+                action.cancel_transition_duration = yaml.Read<double>(
+                    action_base + ".cancel_transition_duration");
                 if (action.name == motion_catalog.default_action) {
                     config.reference_file = action.file;
                 }
@@ -2121,7 +2384,7 @@ Config LoadConfig(const std::string &yaml_path,
             }
             if (config.reference_file.empty()) {
                 throw std::runtime_error(
-                    "[policy_adapter] SONIC default_action 不在动作目录中: " +
+                    "[policy_adapter] default_action 不在动作目录中: " +
                     motion_catalog.default_action);
             }
         } else if (!config.sonic_planner.Enabled() &&

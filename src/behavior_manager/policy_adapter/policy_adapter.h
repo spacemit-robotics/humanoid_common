@@ -11,6 +11,7 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,8 @@ struct ReferenceMotionConfig {
     double playback_speed = 1.0;
     bool loop = false;
     double loop_pause = 0.0;
+    // SuperMimic: return-to-standby duration; absent uses the catalog transition duration.
+    std::optional<double> cancel_transition_duration;
 };
 
 /**

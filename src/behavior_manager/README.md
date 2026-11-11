@@ -125,7 +125,8 @@ cd ~/spacemit_robot
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter`（可选）：参考动作、特殊模型输入或 RL 内关节轨迹接管；支持 `mjlab`、`protomotions`、`sonic`、`supermimic`、`joint_trajectory`
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.start_mode`（MJLab / SuperMimic 参考播放可选）：`auto`（默认）或 `manual`；手动模式进入 RL 后保持参考首帧，按 `G` 开始
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.reference_action`（MJLab 可选）：指定采用参考动作与残差合成的关节
-- `rl_policy.onnx_infer.policies.<name>.policy_adapter.catalog`（SONIC 可选）：为同一全身策略注册多个参考动作；HMI 选择动作后仅切换 `reference_obs`，不覆盖模型 action
+- `rl_policy.onnx_infer.policies.<name>.policy_adapter.catalog`（SONIC / SuperMimic 可选）：为同一全身策略注册多个参考动作；选择动作只切换参考输入，保留模型实例、观测历史和上一帧 action。默认动作作为待命参考。
+- SuperMimic 动作目录的 `actions.<动作>.cancel_transition_duration` 可单独设置取消及模式交接时返回待命的时长；省略时使用目录的 `transition_duration`，不改变该动作的入场时长。播放中的取消保留原参考的推进，逐渐减小其权重并回到待命，关节速度包含原参考速度与过渡曲线导数。播放参考时，目标窗口从下一拍开始取未来 10 拍；静态待命不推进参考。
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.encoder`（SONIC 可选）：配置独立 encoder 的 `model_path`、`runtime`、`latent_dim` 和 `observation_term`。每拍先编码参考，再将 latent 写入 decoder 的同名自定义观测项；decoder 的第一段放当前 latent，第二段放本体历史，不将 latent 混入历史。encoder 的接口为 `obs_dict` → `encoded_tokens`，decoder 仍由普通 `PolicyExecutor` 执行。未配置 encoder 时兼容合并模型。
 - encoder、planner 的 `runtime` 与策略执行器共用推理配置。CPU ONNX 可用 `worker_sched`、`worker_priority` 显式指定模型工作线程的调度，`affinity` 指定工作线程核心；调用线程仍由 `robot_base.threads` 配置。后台加载模型时，工作线程不会自动继承后来启动的 RL 调用线程的优先级。
 - SONIC planner 时序：按 `check_interval`（默认 0.1 s）检查是否需要规划，期间的指令变化合并为最新值；推理超时跳过错过的检查拍，不补跑积压请求。`lookahead` 默认 0.04 s；指令不变时，行走按 `replan_interval`（默认 1 s）重规划，跑步按 `running_replan_interval`（0.1 s），爬行按 `crawling_replan_interval`（0.2 s），静止不定时重规划。这些间隔不是单次推理耗时。`allowed_pred_num_tokens` 默认开放 9–11 个 token。

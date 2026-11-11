@@ -555,6 +555,7 @@ policy_adapter:
 - SuperMimic：`reference_file` 指向 NPZ，支持 `motion_fps`、`playback_speed`、
   `loop`、`loop_pause` 和 `start_mode`；不配置参考文件时，使用
   `rl_default_pos` 与必填的 `reference_height` 生成静止直立目标。
+  多动作配置用 `catalog`，目录格式与 SONIC 相同，每个 `file` 指向一个 NPZ。
 
 SuperMimic 使用 `obs_hist` 和 `goal` 两个模型输入。观测为十帧 term-major 历史：
 关节角减默认值、关节速度、机体角速度、机体重力、上一帧原始 action；首次观测填满历史。
@@ -585,7 +586,34 @@ policy_adapter:
 ```
 
 模型、关节参数、参考文件及其首帧对应的 `zero_target_pos` 均由机型仓库配置。
-多个动作可以沿用 `policy_actions` 选择各自的策略配置，不需要在 common 中写动作名称。
+
+配置 `catalog` 后，同一策略实例负责待命和全部动作：进入 RL 后跟踪 `default_action`
+的首帧，动作请求只替换参考，观测历史和上一帧 action 保持不变。开始动作、取消动作和
+运行中切换策略时，参考按 `transition_duration` 做余弦过渡。取消播放中的动作时，原参考继续推进并
+逐渐减权，关节速度包含原参考速度和过渡曲线导数；动作可用 `cancel_transition_duration` 单独覆盖返回时长。
+非循环动作播完后保持末帧并报告 FINISHED；取消或切换策略时回到 `default_action`。
+目录模式由交互请求开始动作，不使用 `start_mode: manual`。播放目标取未来第 1–10 拍，待命目标保持静态。
+
+```yaml
+supermimic_actions:
+  default_action: standby
+  transition_duration: 1.0
+  action_names: [standby, gesture_a]
+  actions:
+    standby: {file: policy/example/standby.npz, display_name: "待命"}
+    gesture_a: {file: policy/example/gesture_a.npz, display_name: "动作 A"}
+
+rl_policy:
+  onnx_infer:
+    policies:
+      supermimic_mode:
+        policy_adapter:
+          type: supermimic
+          catalog: supermimic_actions
+          anchor_body_index: 0
+```
+
+需要不同模型或增益的动作，仍可用 `policy_actions` 选择各自的策略配置，不需要在 common 中写动作名称。
 
 SONIC 多动作模式复用 HMI 的交互动作页，但与 `joint_trajectory` 的局部关节
 接管不同：切换动作只更新策略的 `reference_obs`，ONNX 输出仍控制全部策略关节。

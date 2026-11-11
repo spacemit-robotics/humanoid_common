@@ -110,12 +110,12 @@ public:
         Require(output.good(), "cannot write configuration");
     }
 
-    std::string WriteMotion(std::size_t joint_count = 28) const {
+    std::string WriteMotion(std::size_t joint_count = 28, std::size_t frames = 4) const {
         const std::string path = (directory_ / "motion.npz").string();
-        std::vector<float> joints(4 * joint_count, 0.1F), velocities(4 * joint_count, 1.0F);
-        std::vector<float> positions(4 * 2 * 3, 0.0F), quaternions(4 * 2 * 4, 0.0F);
+        std::vector<float> joints(frames * joint_count, 0.1F), velocities(frames * joint_count, 1.0F);
+        std::vector<float> positions(frames * 2 * 3, 0.0F), quaternions(frames * 2 * 4, 0.0F);
         std::vector<float> linear(positions.size(), 0.0F), angular(positions.size(), 0.0F);
-        for (int frame = 0; frame < 4; ++frame) {
+        for (std::size_t frame = 0; frame < frames; ++frame) {
             joints[frame * joint_count] += 0.04F * frame;
             const std::size_t body = frame * 2 + 1;
             positions[body * 3 + 2] = 1.0F + 0.02F * frame;
@@ -130,12 +130,30 @@ public:
             linear[body * 3] = 1;
             angular[body * 3 + 1] = 1;
         }
-        cnpy::npz_save(path, "joint_pos", joints.data(), {4, joint_count}, "w");
-        cnpy::npz_save(path, "joint_vel", velocities.data(), {4, joint_count}, "a");
-        cnpy::npz_save(path, "body_pos_w", positions.data(), {4, 2, 3}, "a");
-        cnpy::npz_save(path, "body_quat_w", quaternions.data(), {4, 2, 4}, "a");
-        cnpy::npz_save(path, "body_lin_vel_w", linear.data(), {4, 2, 3}, "a");
-        cnpy::npz_save(path, "body_ang_vel_w", angular.data(), {4, 2, 3}, "a");
+        cnpy::npz_save(path, "joint_pos", joints.data(), {frames, joint_count}, "w");
+        cnpy::npz_save(path, "joint_vel", velocities.data(), {frames, joint_count}, "a");
+        cnpy::npz_save(path, "body_pos_w", positions.data(), {frames, 2, 3}, "a");
+        cnpy::npz_save(path, "body_quat_w", quaternions.data(), {frames, 2, 4}, "a");
+        cnpy::npz_save(path, "body_lin_vel_w", linear.data(), {frames, 2, 3}, "a");
+        cnpy::npz_save(path, "body_ang_vel_w", angular.data(), {frames, 2, 3}, "a");
+        return path;
+    }
+
+    std::string WriteStill(const std::string &name, float joint, float height) const {
+        const std::string path = (directory_ / name).string();
+        std::vector<float> joints(2 * 28, joint), velocities(2 * 28, 0.0F);
+        std::vector<float> positions(2 * 2 * 3, 0.0F), quaternions(2 * 2 * 4, 0.0F);
+        std::vector<float> rates(positions.size(), 0.0F);
+        for (int body = 0; body < 4; ++body) {
+            positions[body * 3 + 2] = height;
+            quaternions[body * 4] = 1.0F;
+        }
+        cnpy::npz_save(path, "joint_pos", joints.data(), {2, 28}, "w");
+        cnpy::npz_save(path, "joint_vel", velocities.data(), {2, 28}, "a");
+        cnpy::npz_save(path, "body_pos_w", positions.data(), {2, 2, 3}, "a");
+        cnpy::npz_save(path, "body_quat_w", quaternions.data(), {2, 2, 4}, "a");
+        cnpy::npz_save(path, "body_lin_vel_w", rates.data(), {2, 2, 3}, "a");
+        cnpy::npz_save(path, "body_ang_vel_w", rates.data(), {2, 2, 3}, "a");
         return path;
     }
 
@@ -401,14 +419,15 @@ void TestReferencePlayback(const Fixture &fixture) {
     Near(goal[28], 1, "reference joint velocity");
     Near(goal[59], 1, "world angular velocity rotated by full root orientation");
     Near(goal[63], -1, "world linear velocity rotated by root heading only");
-    Near(goal[66], 0.02, "20 ms future sampling at 25 fps");
-    Near(goal[66 + 57], -std::sqrt(0.5), "quaternion interpolation gravity y");
-    Near(goal[66 + 58], -std::sqrt(0.5), "quaternion interpolation gravity z");
-    Near(goal[66 + 65], 1.01, "interpolated reference height");
+    Near(goal[0], 0.02, "first goal is 20 ms ahead at 25 fps");
+    Near(goal[57], -std::sqrt(0.5), "quaternion interpolation gravity y");
+    Near(goal[58], -std::sqrt(0.5), "quaternion interpolation gravity z");
+    Near(goal[65], 1.01, "interpolated reference height");
+    Near(goal[66], 0.04, "second goal is 40 ms ahead");
     Near(goal[9 * 66], 0.12, "future window repeats final position");
     Near(goal[9 * 66 + 28], 1, "future padding retains the final reference velocity");
     goal = tick(45.04);
-    Near(goal[0], 0.04, "current reference advances from manual start");
+    Near(goal[0], 0.06, "current reference advances from manual start plus lookahead");
     goal = tick(45.2);
     Require(adapter->PlaybackFinished() && adapter->ReadyForPolicySwitch(), "finite clip ends");
     Near(goal[0], 0.12, "end holds last position");
@@ -428,7 +447,7 @@ void TestReferencePlayback(const Fixture &fixture) {
     adapter = Create(loop, policy);
     adapter->Reset(robot);
     goal = tick(0);
-    Near(goal[66], 0.01, "slow playback changes future sampling");
+    Near(goal[0], 0.01, "slow playback changes first future sampling");
     Near(goal[28], 0.5, "slow playback scales joint velocity");
     Near(goal[59], 0.5, "slow playback scales root angular velocity");
     Near(goal[63], -0.5, "slow playback scales root linear velocity");
@@ -437,7 +456,7 @@ void TestReferencePlayback(const Fixture &fixture) {
     Near(goal[28], 0, "loop pause stops velocity");
     Require(!adapter->PlaybackFinished(), "loop is not finite");
     goal = tick(0.44);
-    Near(goal[0], 0.01, "next cycle begins after pause");
+    Near(goal[0], 0.02, "next cycle begins after pause with lookahead");
     adapter->PreparePolicySwitch(true, 0.44);
     goal = tick(0.85);
     Near(goal[0], 0.12, "handoff holds final reference across loop boundary");
@@ -446,6 +465,18 @@ void TestReferencePlayback(const Fixture &fixture) {
     goal = tick(0.9);
     Near(goal[0], 0.12, "cancelled handoff does not jump back to a running clock");
 
+    // At 50 Hz, a robot initialized on frame 0 receives frames 1..10.
+    fixture.WriteMotion(28, 12);
+    auto fifty_hz = config;
+    fifty_hz.motion_fps = 50;
+    fifty_hz.manual_start = false;
+    adapter = Create(fifty_hz, policy);
+    adapter->Reset(robot);
+    goal = tick(0);
+    for (int future = 0; future < 10; ++future) {
+        Near(goal[future * 66], 0.04 * (future + 1), "reset goal uses frames 1 through 10");
+        Near(goal[future * 66 + 65], 1.0 + 0.02 * (future + 1), "future frame height");
+    }
     auto bad = config;
     bad.anchor_body_index = 2;
     Reject([&] { Create(bad, policy); }, "reference body index must be valid");
@@ -456,6 +487,208 @@ void TestReferencePlayback(const Fixture &fixture) {
     Reject([&] { Create(config, policy); }, "reference joint shapes must match policy");
 }
 
+void TestCatalog(const Fixture &fixture) {
+    fixture.WriteMotion();
+    fixture.WriteStill("standby.npz", 0.3F, 0.8F);
+    auto write = [&](const std::string &extra, const std::string &actions,
+        const std::string &cancel_duration = "") {
+        std::ofstream output(fixture.yaml);
+        output << "rl_policy:\n  rl_dt: 0.02\n  onnx_infer:\n    policies:\n      probe:\n"
+            "        infer_decimation: 1\n        policy_adapter:\n          type: supermimic\n"
+            "          catalog: probe_actions\n          anchor_body_index: 1\n" << extra <<
+            "probe_actions:\n  default_action: standby\n  transition_duration: 0.1\n"
+            "  motion_fps: 25\n  action_names: " << actions << "\n  actions:\n"
+            "    standby: {file: standby.npz}\n    move: {file: motion.npz";
+        if (!cancel_duration.empty()) output << ", cancel_transition_duration: " << cancel_duration;
+        output << "}\n";
+        Require(output.good(), "cannot write catalog configuration");
+    };
+    const std::string directory = std::filesystem::path(fixture.yaml).parent_path().string();
+    write("", "[standby, move]");
+    const auto config = LoadConfig(fixture.yaml, "probe", directory);
+    const auto &catalog = config.reference_motion_catalog;
+    Require(catalog.Enabled() && catalog.actions.size() == 2 && catalog.default_action == "standby" &&
+        catalog.transition_duration == 0.1 && catalog.actions[1].motion_fps == 25 &&
+        catalog.actions[1].file ==
+            std::filesystem::weakly_canonical(directory + "/motion.npz").string(),
+        "catalog settings and resource paths");
+    auto policy = Policy(fixture.model);
+    auto adapter = Create(config, policy);
+    rl_policy::PolicyExecutor executor;
+    executor.Init(policy);
+    auto robot = robot_base::RobotData::Create(28);
+    robot.base_quat = {1, 0, 0, 0};
+    robot.joint_pos.assign(28, 0.1);
+    auto tick = [&](double time) {
+        robot.joint_pos[0] = time;
+        adapter->PrepareInputs(robot, time, executor);
+        Eigen::VectorXf observation;
+        std::vector<double> action;
+        executor.AssembleObs(robot.gyro, robot.rpy, 0, 0, 0,
+            robot.joint_pos, robot.joint_vel, robot.base_quat, {}, 0.02, observation);
+        executor.Infer(observation, action);
+        adapter->OnAction(action);
+        return executor.GetModelOutput("seen_goal");
+    };
+    uint64_t sequence = 0;
+    auto request = [&](robot_base::InteractionRequest::Operation operation,
+        const std::string &name, double time) {
+        adapter->HandleInteractionRequest({++sequence, operation, name}, time);
+        return adapter->GetInteractionStatus();
+    };
+    using Operation = robot_base::InteractionRequest::Operation;
+    using Phase = robot_base::InteractionStatus::Phase;
+    adapter->Reset(robot);
+    auto goal = tick(0.98);
+    Require(adapter->ReadyForPolicySwitch() && !adapter->PlaybackFinished() &&
+        adapter->GetInteractionStatus().phase == Phase::IDLE, "catalog starts on the default action");
+    for (int frame = 0; frame < 10; ++frame) {
+        Near(goal[frame * 66], 0.2, "default action holds its first frame");
+        Near(goal[frame * 66 + 28], 0, "held default joint velocity");
+        Near(goal[frame * 66 + 58], -1, "default reference gravity");
+        Near(goal[frame * 66 + 65], 0.8, "default reference height");
+    }
+
+    auto status = request(Operation::START, "move", 1.0);
+    Require(status.request_accepted && status.phase == Phase::BLEND_IN && status.action == "move" &&
+        !adapter->ReadyForPolicySwitch(), "start blends towards the action");
+    goal = tick(1.0);
+    const auto &history = executor.GetModelOutput("seen_observation");
+    Near(history[224], 0.88, "action start keeps observation history");
+    Near(history[252], 0.9, "newest observation after the action start");
+    Near(history[872], 0.88, "action start keeps the previous raw action");
+    const double pi = std::acos(-1.0);
+    for (int frame = 0; frame < 4; ++frame) {
+        const double phase = 0.2 * (frame + 1);
+        const double weight = 0.5 - 0.5 * std::cos(pi * phase);
+        const double rate = 0.5 * pi * std::sin(pi * phase) / 0.1;
+        Near(goal[frame * 66], 0.2 - 0.2 * weight, "future blend position");
+        Near(goal[frame * 66 + 28], -0.2 * rate + weight, "blend derivative plus target velocity");
+        const double norm = std::hypot(weight, 1.0 - weight);
+        Near(goal[frame * 66 + 57], -weight / norm, "normalized gravity blend y");
+        Near(goal[frame * 66 + 58], -(1.0 - weight) / norm, "normalized gravity blend z");
+        Near(goal[frame * 66 + 59], weight, "root angular velocity fades in");
+        Near(goal[frame * 66 + 63], -weight, "root linear velocity fades in");
+        Near(goal[frame * 66 + 65], 0.8 + 0.2 * weight, "height blend");
+    }
+    Near(goal[4 * 66], 0, "playback follows the blend inside the window");
+    Near(goal[4 * 66 + 28], 1, "playback velocity after the blend");
+    Near(goal[5 * 66], 0.02, "20 ms playback after the blend at 25 fps");
+
+    status = request(Operation::START, "standby", 1.05);
+    Require(!status.request_accepted && status.phase == Phase::BLEND_IN, "busy catalog rejects a start");
+    goal = tick(1.1);
+    status = adapter->GetInteractionStatus();
+    Require(status.phase == Phase::PLAYING && status.progress == 0.0F, "blend completes into playback");
+    Near(goal[0], 0.02, "action goal begins one policy step ahead");
+    Near(goal[66], 0.04, "playback horizon");
+    goal = tick(1.18);
+    Near(goal[0], 0.10, "action time follows the wall clock plus lookahead");
+    Near(goal[9 * 66], 0.12, "catalog horizon clamps to the last frame");
+    Near(goal[9 * 66 + 28], 1, "catalog padding keeps reference velocity until playback ends");
+    Near(adapter->GetInteractionStatus().progress, 0.5, "action progress");
+    goal = tick(1.28);
+    Require(adapter->GetInteractionStatus().phase == Phase::FINISHED && adapter->PlaybackFinished() &&
+        adapter->ReadyForPolicySwitch(), "finite action finishes");
+    Near(goal[0], 0.12, "finished action holds its last frame");
+    Near(goal[28], 0, "held last frame stops joint velocity");
+    Near(goal[59], 0, "held last frame stops root rotation");
+
+    status = request(Operation::START, "missing", 1.3);
+    Require(!status.request_accepted && status.phase == Phase::REJECTED, "unknown action is rejected");
+    status = request(Operation::CANCEL, "", 1.3);
+    Require(!status.request_accepted, "cancel needs an active action");
+    status = request(Operation::START, "move", 1.3);
+    Require(status.request_accepted && status.phase == Phase::BLEND_IN, "next action after finishing");
+    goal = tick(1.3);
+    Near(goal[0], 0.12 - 0.12 * (0.5 - 0.5 * std::cos(0.2 * pi)), "blend back to the first frame");
+    goal = tick(1.44);
+    status = request(Operation::CANCEL, "", 1.44);
+    Require(status.request_accepted && status.phase == Phase::BLEND_OUT &&
+        !adapter->ReadyForPolicySwitch(), "cancel blends to the default action");
+    goal = tick(1.44);
+    const double cancel_weight = 0.5 - 0.5 * std::cos(0.2 * pi);
+    Near(goal[0], 0.06 + 0.14 * cancel_weight, "cancel blends from the continuing reference");
+    Near(goal[28], 0.14 * 0.5 * pi * std::sin(0.2 * pi) / 0.1 + 1 - cancel_weight,
+        "cancel velocity includes the moving reference and the blend derivative");
+    Near(goal[59], 1 - cancel_weight, "cancel fades root rotation");
+    Near(goal[5 * 66], 0.2, "cancel ends on the default action");
+    Near(goal[5 * 66 + 59], 0, "default action is held still");
+    goal = tick(1.56);
+    status = adapter->GetInteractionStatus();
+    Require(status.phase == Phase::FINISHED && adapter->ReadyForPolicySwitch() &&
+        !adapter->PlaybackFinished(), "cancel finishes on the default action");
+    Near(goal[0], 0.2, "default action after cancel");
+
+    request(Operation::START, "move", 2.0);
+    tick(2.2);
+    Require(!adapter->ReadyForPolicySwitch(), "playing action blocks a policy switch");
+    adapter->PreparePolicySwitch(true, 2.2);
+    Require(adapter->GetInteractionStatus().phase == Phase::BLEND_OUT, "policy switch returns to default");
+    adapter->PreparePolicySwitch(true, 2.26);
+    tick(2.26);
+    Require(!adapter->ReadyForPolicySwitch(), "policy switch waits for the blend");
+    adapter->PreparePolicySwitch(true, 2.32);
+    goal = tick(2.32);
+    Require(adapter->ReadyForPolicySwitch(), "default action allows the policy switch");
+    Near(goal[0], 0.2, "policy switch leaves the default action held");
+
+    request(Operation::START, "move", 3.0);
+    adapter->Reset(robot);
+    goal = tick(4.0);
+    Require(adapter->GetInteractionStatus().phase == Phase::IDLE && adapter->ReadyForPolicySwitch(),
+        "reset returns to the default action");
+    Near(goal[0], 0.2, "reset holds the default action");
+    status = request(Operation::START, "move", 4.0);
+    Require(status.request_accepted && status.sequence == sequence, "reset accepts new request sequences");
+
+    write("", "[standby, move]", "0.2");
+    const auto custom = LoadConfig(fixture.yaml, "probe", directory);
+    Require(!custom.reference_motion_catalog.actions[0].cancel_transition_duration &&
+        custom.reference_motion_catalog.actions[1].cancel_transition_duration == 0.2,
+        "cancel duration belongs to its action, not the whole catalog");
+    adapter = Create(custom, policy);
+    adapter->Reset(robot);
+    request(Operation::START, "move", 5.0);
+    tick(5.1);
+    Require(adapter->GetInteractionStatus().phase == Phase::PLAYING,
+        "cancel duration does not change entry timing");
+    request(Operation::CANCEL, "", 5.14);
+    tick(5.24);
+    Require(!adapter->ReadyForPolicySwitch(), "per-action cancellation uses its longer duration");
+    request(Operation::CANCEL, "", 5.25);
+    adapter->PreparePolicySwitch(true, 5.26);
+    tick(5.35);
+    Require(adapter->ReadyForPolicySwitch() &&
+        adapter->GetInteractionStatus().phase == Phase::FINISHED,
+        "repeated cancellation and handoff do not restart the return transition");
+    request(Operation::START, "move", 6.0);
+    tick(6.14);
+    adapter->PreparePolicySwitch(true, 6.14);
+    tick(6.25);
+    Require(!adapter->ReadyForPolicySwitch(), "policy switch uses the active action return duration");
+    tick(6.35);
+    Require(adapter->ReadyForPolicySwitch(), "policy switch completes after the custom duration");
+
+    write("", "[standby, move]", "-1");
+    Reject([&] { Create(LoadConfig(fixture.yaml, "probe", directory), policy); },
+        "negative action cancel duration must fail");
+    write("", "[standby, move]", ".nan");
+    Reject([&] { Create(LoadConfig(fixture.yaml, "probe", directory), policy); },
+        "non-finite action cancel duration must fail");
+    write("", "[move]");
+    Reject([&] { LoadConfig(fixture.yaml, "probe", directory); }, "default action must be in the catalog");
+    write("          start_mode: manual\n", "[standby, move]");
+    Reject([&] { Create(LoadConfig(fixture.yaml, "probe", directory), policy); },
+        "catalog actions do not use manual start");
+    write("          transition_duration: -1\n", "[standby, move]");
+    Reject([&] { Create(LoadConfig(fixture.yaml, "probe", directory), policy); },
+        "negative transition must fail");
+    write("", "[standby, move, move]");
+    Reject([&] { Create(LoadConfig(fixture.yaml, "probe", directory), policy); },
+        "duplicate catalog action must fail");
+}
+
 }  // namespace
 
 int main() {
@@ -464,7 +697,8 @@ int main() {
         TestContract(fixture);
         TestInvalidConfiguration(fixture);
         TestReferencePlayback(fixture);
-        std::cout << "SuperMimic history, reference playback and static goal tests passed\n";
+        TestCatalog(fixture);
+        std::cout << "SuperMimic history, reference playback, catalog and static goal tests passed\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "SuperMimic test failed: " << error.what() << '\n';

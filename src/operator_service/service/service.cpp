@@ -242,7 +242,8 @@ Config LoadConfig(const std::string &path) {
         const auto configured = yaml.Read<std::string>(adapter +
             (type == "stance_motion" ? ".joint_trajectory.catalog" : ".catalog"));
         if (type == "joint_trajectory" ||
-            ((type == "sonic" || type == "stance_motion" || type == "history_actor") &&
+            ((type == "sonic" || type == "supermimic" || type == "stance_motion" ||
+                type == "history_actor") &&
                 configured && !configured->empty())) {
             const std::string catalog = configured.value_or(adapter);
             p.actions = LoadActions(yaml, catalog);

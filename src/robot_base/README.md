@@ -17,7 +17,7 @@
 | `Read<T>` | `const std::string &path` | `std::optional<T>` | 模板方法，根据层级路径（如 `a.b[0].c`）读取配置。路径不存在时返回 nullopt |
 | `ToAbsPath` | `const std::string &path` | `std::string` | 将相对路径转换为基于当前 YAML 文件所在目录的绝对路径 |
 
-`Read<T>` 支持的模板类型：`int`、`double`、`bool`、`std::string`、`std::vector<int>`、`std::vector<double>`、`std::vector<std::string>`
+`Read<T>` 支持的模板类型：`int`、`double`、`bool`、`std::string`、`std::vector<int>`、`std::vector<double>`、`std::vector<std::string>`、`std::map<std::string, std::string>`
 
 ### 1.2 `RobotData` (机器人核心状态)
 

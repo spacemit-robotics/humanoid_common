@@ -2258,6 +2258,8 @@ Config LoadConfig(const std::string &yaml_path,
                 encoder_base + ".runtime.ep_dump_subgraphs").value_or(false);
             encoder.runtime.ep_profile_prefix = yaml.Read<std::string>(
                 encoder_base + ".runtime.ep_profile_prefix").value_or("");
+            encoder.runtime.ep_options = yaml.Read<std::map<std::string, std::string>>(
+                encoder_base + ".runtime.ep_options").value_or(std::map<std::string, std::string>{});
         }
         const std::string planner_base = adapter_base + ".planner";
         const auto planner_model =
@@ -2300,6 +2302,8 @@ Config LoadConfig(const std::string &yaml_path,
             config.sonic_planner.runtime.ep_profile_prefix =
                 yaml.Read<std::string>(
                     planner_base + ".runtime.ep_profile_prefix").value_or("");
+            config.sonic_planner.runtime.ep_options = yaml.Read<std::map<std::string, std::string>>(
+                planner_base + ".runtime.ep_options").value_or(std::map<std::string, std::string>{});
             config.sonic_planner.output_fps = yaml.Read<double>(
                 planner_base + ".output_fps").value_or(config.motion_fps);
             config.sonic_planner.check_interval = yaml.Read<double>(

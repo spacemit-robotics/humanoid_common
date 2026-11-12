@@ -904,7 +904,7 @@ void TestSonicPlannerConfig() {
         "          encoder:\n"
         "            model_path: encoder.onnx\n"
         "            runtime: {provider: cpu, threads: 2, ort_spinning: false, "
-        "worker_sched: fifo, worker_priority: 55}\n"
+        "worker_sched: fifo, worker_priority: 55, ep_options: {SPACEMIT_EP_DENSE_ACCURACY_LEVEL: '2'}}\n"
         "          planner:\n"
         "            enabled: true\n"
         "            model_path: planner.onnx\n"
@@ -912,7 +912,7 @@ void TestSonicPlannerConfig() {
         "            lookahead: 0.8\n"
         "            replan_interval: 0.5\n"
         "            runtime: {provider: cpu, threads: 4, ort_spinning: false, "
-        "worker_sched: other, worker_priority: 0}\n");
+        "worker_sched: other, worker_priority: 0, ep_options: {SPACEMIT_EP_DISABLE_OP_TYPE_FILTER: Softmax}}\n");
     auto config = LoadConfig(yaml.Path().string(), "planner",
         fs::temp_directory_path().string());
     Require(config.reference_file.empty() && config.sonic_planner.Enabled(),
@@ -930,6 +930,9 @@ void TestSonicPlannerConfig() {
         config.sonic_encoder.runtime.worker_priority == 55 &&
         !config.sonic_encoder.runtime.ort_spinning,
         "encoder runtime must come from YAML");
+    Require(config.sonic_planner.runtime.ep_options.at("SPACEMIT_EP_DISABLE_OP_TYPE_FILTER") == "Softmax" &&
+        config.sonic_encoder.runtime.ep_options.at("SPACEMIT_EP_DENSE_ACCURACY_LEVEL") == "2",
+        "nested model EP options must come from YAML");
     const auto &thread = config.sonic_planner.thread;
     Require(thread.name == "motion_planner" && thread.cpu_id == -1 &&
         thread.cpu_affinity == std::vector<int>({0, 3}) && thread.sched == "fifo" &&

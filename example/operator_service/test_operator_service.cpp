@@ -6,6 +6,7 @@
  */
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem> // NOLINT(build/c++17): isolated configuration fixtures.
@@ -16,6 +17,96 @@
 #include "service.h"
 
 namespace {
+void TestTeleop() {
+    using namespace operator_service;  // NOLINT(build/namespaces)
+    Config config;
+    config.token = "teleop-test";
+    config.status_timeout = 5;
+    config.lease_ms = 5000;
+    config.teleop.slow_limits = Velocity{0.6, 0.5, 1};
+    config.teleop.fast_limits = Velocity{1.5, 0.5, 1};
+    config.policies.push_back({"walk", false, {-0.3, -0.5, -1}, {1.5, 0.5, 1}, {}});
+    Service service(config);
+    robot_base::ControlStatus status;
+    status.mode = robot_base::ControlMode::RL;
+    status.active_policy = "walk";
+    status.hmi_connected = true;
+    service.UpdateStatus(status, {});
+    service.UpdateStatus(status, {});
+    auto session = service.Open();
+    uint64_t id = 0;
+    const auto call = [&](const std::string &op, const Json &args = Json::object()) {
+        return service.Handle(session, {{"v", 1}, {"id", ++id}, {"op", op}, {"args", args}});
+    };
+    assert(call("hello", {{"token", config.token}}).at("ok"));
+    assert(call("acquire").at("ok"));
+    const auto input = [&](double vx, int ttl = 300) {
+        return call("teleop", {{"vx", vx}, {"vy", 0}, {"wz", 0}, {"valid_for_ms", ttl}});
+    };
+    const auto tick = [&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        service.UpdateStatus(status, {});
+        service.Tick();
+    };
+    assert(input(1).at("data").at("target_velocity").at("vx") == 0.6);
+    tick();
+    const auto first = service.Command().vx;
+    assert(first > 0 && first <= 0.1);
+    assert(call("preset", {{"name", "fast"}}).at("ok"));
+    assert(input(1).at("data").at("target_velocity").at("vx") == 1.5);
+    assert(input(-1).at("data").at("target_velocity").at("vx") == -0.3);
+    tick();
+    assert(service.Command().vx < first);  // Reversal brakes before accelerating.
+    assert(input(1).at("ok"));
+    for (int i = 0; i < 4; ++i) tick();
+    const auto before_release = service.Command().vx;
+    assert(before_release > 0);
+    assert(call("release").at("ok"));
+    assert(!service.Snapshot(session).owns_control);
+    assert(service.Command().vx > 0 && service.Snapshot().target_velocity.vx == 0);
+    for (int i = 0; i < 10; ++i) tick();
+    assert(service.Command().vx == 0 && service.Snapshot().target_velocity.vx == 0);
+    assert(call("acquire").at("ok"));
+    assert(service.Command().vx == 0);  // New ownership cannot replay expired input.
+    assert(input(1, 50).at("ok"));
+    tick();
+    assert(service.Command().vx > 0);
+    for (int i = 0; i < 8; ++i) tick();
+    assert(service.Command().vx == 0 && service.Snapshot(session).owns_control);
+    assert(input(1).at("ok"));
+    tick();
+    assert(call("stop").at("ok") && service.Command().vx == 0);
+    assert(call("acquire").at("ok"));
+    assert(input(1).at("ok"));
+    tick();
+    robot_base::FaultStatus fault;
+    fault.latched = true;
+    service.UpdateStatus(status, fault);
+    service.Tick();
+    assert(service.Command().vx == 0);
+    assert(!input(1).at("ok"));
+    service.UpdateStatus(status, {});
+    service.Tick();
+    assert(service.Command().vx == 0);
+    assert(DecodeStatus(Encode(service.Snapshot())).command_velocity.vx == 0);
+
+    config.policies[0].client_smoothing = false;
+    Service delegated(config);
+    delegated.UpdateStatus(status, {});
+    delegated.UpdateStatus(status, {});
+    const auto owner = delegated.Open();
+    id = 0;
+    const auto send = [&](const std::string &op, Json args) {
+        return delegated.Handle(owner, {{"v", 1}, {"id", ++id}, {"op", op}, {"args", args}});
+    };
+    assert(send("hello", {{"token", config.token}}).at("ok"));
+    assert(send("acquire", Json::object()).at("ok"));
+    assert(send("teleop", {{"vx", 1}, {"vy", 0}, {"wz", 0}}).at("ok"));
+    assert(std::abs(delegated.Command().vx - 0.6) < 1e-6);
+    assert(send("teleop", {{"vx", 0}, {"vy", 0}, {"wz", 0}}).at("ok"));
+    assert(delegated.Command().vx == 0);
+}
+
 void TestAdministrator() {
     using namespace operator_service;  // NOLINT(build/namespaces)
     Config config;
@@ -194,6 +285,7 @@ void TestTrajectory() {
 } // namespace
 
 int main(int argc, char **argv) {
+    TestTeleop();
     TestAdministrator();
     TestTrajectory();
     using operator_service::Config;
@@ -223,9 +315,10 @@ int main(int argc, char **argv) {
         assert(operator_service::DecodePolicy(labelled).display_name == policy.at("name"));
         auto legacy = policy;
         legacy.erase("client_smoothing");
+        legacy.erase("service_smoothing");
         assert(operator_service::DecodePolicy(legacy).client_smoothing);
         auto presets = operator_service::DecodePolicy(policy);
-        assert(!presets.slow_limits && !presets.fast_limits);
+        assert(presets.slow_limits->vx == 0.05 && presets.fast_limits->vx == 0.1);
         presets.slow_limits = operator_service::Velocity{0.7, 0.4, 1};
         presets.fast_limits = presets.slow_limits;
         const auto decoded = operator_service::DecodePolicy(Encode(presets));
@@ -240,6 +333,7 @@ int main(int argc, char **argv) {
     config.status_timeout = 0.08;
     config.request_timeout = 0.08;
     config.policies.push_back({"test_policy", true, {-0.1, -0.2, -0.3}, {0.1, 0.2, 0.3}, {{"wave", "Wave"}}});
+    config.policies.back().client_smoothing = false;
     {
         Service offline(config);
         const auto spectator = offline.Open();
@@ -256,7 +350,7 @@ int main(int argc, char **argv) {
     }
     Service service(config);
     assert(!service.Catalog().at("teleop").contains("slow_limits"));
-    assert(service.Catalog().at("policies").at(0).at("client_smoothing").get<bool>());
+    assert(!service.Catalog().at("policies").at(0).at("client_smoothing").get<bool>());
     const auto alice = service.Open(), bob = service.Open();
     uint64_t alice_id = 0, bob_id = 0;
     const auto call = [&](uint64_t session, uint64_t *id, const std::string &op, const Json &args = Json::object()) {

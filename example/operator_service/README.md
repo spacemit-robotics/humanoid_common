@@ -29,8 +29,9 @@ source build/envsetup.sh
 run_linglong.sh --sim
 ```
 
-仿真仅支持 TUI，不提供网页、App、二维码或局域网监听。Ctrl+C 退出本次启动的全部
-进程。要分别观察启动日志，也可依次执行：
+仿真复用 TUI、网页、App 和手柄。默认只监听回环地址，本机浏览器可访问操作服务；
+手机接入时为 HMI 配置 `--listen` 和可达的 `--public-url`。
+Ctrl+C 退出本次启动的全部进程。要分别观察启动日志，也可依次执行：
 
 | 终端 | 命令 |
 | --- | --- |
@@ -49,7 +50,8 @@ run_hmi_tui_linglong.sh
 
 `L` 申请控制权，右箭头依次 DAMP/HOME/ZERO，等待 ZERO 到位后再次右箭头进入 RL。
 `p` 在掉电或阻尼状态选择策略，`A` 选择交互动作，`G` 开始手动参考动作。
-速度页 `v` 保留 `Q/W/E`、`A/S/D`；空格清零速度，`U` 释放控制权，`Ctrl+C` 退出。
+速度页 `v` 保留 `Q/W/E`、`A/S/D`，按当前档位持续运动；`B` 切换快慢档。
+终端没有松键事件，须按空格减速停止；`U` 释放控制权，`Ctrl+C` 退出。
 
 ## 实机固定二维码与手机
 
@@ -125,8 +127,8 @@ ctest --test-dir output/build/cmake/pkgs/application_native_humanoid_common --ou
 独立模拟 UDP 控制端验证认证、控制权、有效期、断连、动作、持久二维码，以及本机
 配对接口的 Host/Origin 检查。它不驱动电机。
 
-`operator_terminal_only` 复用同一测试，验证仿真 TUI 可以完成状态切换，但网页、
-配对和二维码接口不可用。实机网页服务的离线协议回归不代表 PC 仿真提供手机入口。
+`operator_simulation` 在仿真模式验证同一 WebSocket、网页和配对入口。
+`operator_real_terminal_only` 验证显式 `--terminal-only` 保留本机客户端且关闭网页、配对和二维码。
 
 `prepare_simulation.py` 只供自动化测试隔离 SHM/日志，日常启动不需要它。
 

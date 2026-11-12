@@ -33,15 +33,13 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
     operator_gamepad::Chords chords(config.bindings);
     operator_gamepad::SuccessFeedback feedback;
     operator_gamepad::Rumble rumble;
-    bool armed = false, fast = false, owned = false;
-    Velocity output{};
+    bool armed = false, owned = false;
     std::string previous_error, previous_policy, previous_state, previous_fault;
     auto next_device = Clock::now(), next_connection = next_device, last_renew = next_device;
     auto last_send = next_device;
     const auto clear = [&] {
         armed = false;
-        output = {};
-        if (!dry_run && client.Connected() && owned) client.SetVelocity({});
+        if (!dry_run && client.Connected() && owned) client.PostTeleopInput({});
     };
     const auto release = [&] {
         feedback.Clear();
@@ -74,7 +72,6 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
         if (!dry_run && !client.Connected() && now >= next_connection) {
             owned = false;
             armed = false;
-            output = {};
             try {
                 auto connection = Client::ReadConnectionFile(connection_path);
                 connection.name = "gamepad";
@@ -111,11 +108,9 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
             owned = status.owns_control;
             if (!status.online || !owned) {
                 armed = false;
-                output = {};
             }
             if (status.policy != previous_policy || status.state != previous_state) {
                 armed = false;
-                output = {};
                 previous_policy = status.policy;
                 previous_state = status.state;
                 std::printf("[gamepad] state=%s policy=%s\n", status.state.c_str(), status.policy.c_str());
@@ -137,7 +132,6 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
             // ownership. Match the service's existing safety-request contract.
             if (client.Connected() && operator_gamepad::IsPowerOffRequest(command)) {
                 armed = false;
-                output = {};
                 const auto reply = client.RequestState("POWER_OFF");
                 Report(label, reply);
                 feedback.Track(command.operation, command.value, status, reply);
@@ -155,7 +149,6 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
                     const auto reply = client.AcquireControl();
                     Report("acquire", reply);
                     owned = reply.ok;
-                    fast = status.teleop_preset == "fast";
                     armed = false;
                 } else std::printf("[gamepad] center sticks before takeover\n");
                 continue;
@@ -170,7 +163,6 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
                 if (next_fast != (status.teleop_preset == "fast")) {
                     const auto reply = client.SetTeleopPreset(next_fast ? "fast" : "slow");
                     Report(label, reply);
-                    if (reply.ok) fast = next_fast;
                 }
                 continue;
             }
@@ -203,7 +195,6 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
         } else if (client.Connected()) {
             status = client.LatestStatus();
             owned = status.owns_control;
-            fast = status.teleop_preset == "fast";
             if (owned && now - last_renew >= std::chrono::milliseconds(250)) {
                 const auto reply = client.RenewControl();
                 if (!reply.ok) error_once("renew: " + reply.code);
@@ -215,34 +206,17 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
                 status.interaction_phase == "REJECTED");
             if (!ready) {
                 armed = false;
-                output = {};
             } else if (operator_gamepad::Neutral(input)) armed = true;
             if (owned && status.online && status.state == "RL" &&
                 now - last_send >= std::chrono::milliseconds(20)) {
-                const auto policies = client.Policies();
-                const auto it = std::find_if(policies.begin(), policies.end(),
-                    [&](const auto &p) { return p.name == status.policy; });
                 Velocity target{};
-                const double dt = std::clamp(std::chrono::duration<double>(now - last_send).count(), 0.0, 0.1);
-                if (ready && armed && it != policies.end()) {
-                    const auto caps = operator_gamepad::SpeedCaps(*it, fast, fast ? config.fast : config.slow);
-                    target = operator_gamepad::Scale(input, *it, caps);
-                    if (it->client_smoothing) {
-                        target = {
-                            operator_gamepad::Advance(output.vx, target.vx, config.acceleration[0],
-                                config.deceleration[0], dt),
-                            operator_gamepad::Advance(output.vy, target.vy, config.acceleration[1],
-                                config.deceleration[1], dt),
-                            operator_gamepad::Advance(output.wz, target.wz, config.acceleration[2],
-                                config.deceleration[2], dt)};
-                    }
-                }
-                const auto reply = client.SetVelocity(target, 300);
-                if (reply.ok) output = target;
-                else {
+                if (ready && armed) target = input;
+                auto reply = client.LatestVelocityReply();
+                if (reply.ok) reply = client.PostTeleopInput(target, 300);
+                if (!reply.ok) {
                     armed = false;
-                    output = {};
                     error_once("velocity: " + reply.code + " " + reply.message);
+                    client.PostTeleopInput({});
                 }
                 last_send = Clock::now();
             }

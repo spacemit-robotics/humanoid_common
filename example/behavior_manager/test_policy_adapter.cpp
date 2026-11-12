@@ -736,18 +736,23 @@ void TestManualReferencePlayback() {
     adapter->Reset(robot);
     check_position(0.0, 0.1);
     check_position(100.0, 0.1);
+    Require(adapter->GetInteractionStatus().progress == 0.0F, "standby advanced playback progress");
     Require(adapter->ReadyForPolicySwitch() && !adapter->PlaybackFinished(),
         "manual standby must permit handoff without reporting motion completion");
     Require(!adapter->StartPlayback(-1.0), "接受了负开始时间");
     Require(adapter->StartPlayback(100.0), "首次开始失败");
     Require(!adapter->StartPlayback(101.0), "重复开始重置了参考时钟");
     check_position(100.01, 0.15);
+    Require(std::abs(adapter->GetInteractionStatus().progress - 0.5F) < 1.0e-5F,
+        "reference playback progress did not follow the sampled frames");
     Require(!adapter->ReadyForPolicySwitch(), "active reference handed off before completion");
     check_position(101.0, 0.2);
+    Require(adapter->GetInteractionStatus().progress == 1.0F, "completed reference progress is not one");
     Require(adapter->ReadyForPolicySwitch() && adapter->PlaybackFinished(),
         "finished manual reference did not permit handoff");
     adapter->Reset(robot);
     check_position(200.0, 0.1);
+    Require(adapter->GetInteractionStatus().progress == 0.0F, "reset retained old playback progress");
 
     config.manual_start = false;
     adapter = Create(config, policy_config);

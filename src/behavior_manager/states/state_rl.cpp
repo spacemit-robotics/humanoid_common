@@ -721,6 +721,12 @@ private:
             finished = config_.policy.motion_length > 0.0 &&
                 infer_elapsed_ >= config_.policy.motion_length;
             adapter_ready = finished;
+            if (config_.policy.motion_length > 0.0) {
+                diagnostics.interaction.progress = static_cast<float>(std::clamp(
+                    infer_elapsed_ / config_.policy.motion_length, 0.0, 1.0));
+                std::lock_guard<std::mutex> lock(mutex_interaction_status_);
+                interaction_status_ = diagnostics.interaction;
+            }
         }
         motion_finished_.store(finished, std::memory_order_release);
         switch_ready_.store(switching && (adapter_ready ||

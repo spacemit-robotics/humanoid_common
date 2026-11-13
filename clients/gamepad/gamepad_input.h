@@ -106,30 +106,6 @@ private:
     size_t pending_;
     Clock::time_point pressed_at_{};
 };
-inline double Advance(double value, double target, double accel, double decel, double dt) {
-    if (value * target < 0) {
-        const double braking = std::abs(value) / decel;
-        if (dt <= braking) return value - std::copysign(decel * dt, value);
-        dt -= braking;
-        value = 0;
-    }
-    const double rate = std::abs(target) > std::abs(value) ? accel : decel;
-    return value + std::clamp(target - value, -rate * dt, rate * dt);
-}
-inline std::array<double, 3> SpeedCaps(const operator_service::Policy &policy, bool fast,
-    const std::array<double, 3> &fallback) {
-    const auto &limits = fast ? policy.fast_limits : policy.slow_limits;
-    return limits ? std::array<double, 3>{limits->vx, limits->vy, limits->wz} : fallback;
-}
-inline operator_service::Velocity Scale(const operator_service::Velocity &input,
-    const operator_service::Policy &policy, const std::array<double, 3> &caps) {
-    const auto scale = [](double x, double low, double high, double cap) {
-        return x * std::min(cap, x >= 0 ? std::max(0.0, high) : std::max(0.0, -low));
-    };
-    return {scale(input.vx, policy.minimum.vx, policy.maximum.vx, caps[0]),
-            scale(input.vy, policy.minimum.vy, policy.maximum.vy, caps[1]),
-            scale(input.wz, policy.minimum.wz, policy.maximum.wz, caps[2])};
-}
 inline bool Neutral(const operator_service::Velocity &value) {
     return value.vx == 0 && value.vy == 0 && value.wz == 0;
 }

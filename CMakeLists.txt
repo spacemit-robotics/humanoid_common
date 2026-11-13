@@ -505,16 +505,16 @@ if(BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml)
     add_test(NAME operator_network COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --real)
-    add_test(NAME operator_terminal_only COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
+    add_test(NAME operator_simulation COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --sim)
     add_test(NAME operator_trajectory COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --trajectory)
-    add_test(NAME operator_trajectory_terminal COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
+    add_test(NAME operator_trajectory_simulation COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --trajectory --sim)
     add_test(NAME operator_administrator COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --trajectory --admin)
-    set_tests_properties(operator_network operator_terminal_only operator_trajectory
-        operator_trajectory_terminal operator_administrator PROPERTIES RUN_SERIAL TRUE TIMEOUT 20)
+    set_tests_properties(operator_network operator_simulation operator_trajectory
+        operator_trajectory_simulation operator_administrator PROPERTIES RUN_SERIAL TRUE TIMEOUT 20)
 
     add_executable(test_operator_mcp_protocol
         example/operator_service/test_operator_mcp_protocol.cpp
@@ -546,7 +546,7 @@ if(BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --terminal-only)
     add_test(NAME operator_paired_actions COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --paired)
-    set_tests_properties(operator_terminal_only operator_real_terminal_only operator_network
+    set_tests_properties(operator_simulation operator_real_terminal_only operator_network
         operator_paired_actions
         PROPERTIES RUN_SERIAL TRUE TIMEOUT 20)
     add_executable(test_hmi_policy_switch example/runtime/test_hmi_policy_switch.cpp)

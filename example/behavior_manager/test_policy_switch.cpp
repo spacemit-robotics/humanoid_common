@@ -326,9 +326,15 @@ void TestPolicyActions() {
     Require(!probe.manager.CurrentInteractionStatus().request_accepted, "unknown action accepted");
     action("motion", 2);
     wait_policy("clip");
+    for (int i = 0; i < 1000 && probe.manager.CurrentInteractionStatus().progress == 0.0F; ++i)
+        probe.Tick(1);
+    const float progress = probe.manager.CurrentInteractionStatus().progress;
+    Require(progress > 0.0F && progress < 1.0F, "action catalog did not forward motion progress");
     action("unknown", 20);
     Require(!probe.manager.CurrentInteractionStatus().request_accepted &&
         probe.manager.CurrentInteractionStatus().action == "motion", "rejected request replaced active action");
+    Require(probe.manager.CurrentInteractionStatus().progress >= progress,
+        "rejected request reset active motion progress");
     wait_policy("catalog");
     Require(probe.manager.CurrentInteractionStatus().phase == ActionPhase::FINISHED,
         "finite action did not return to idle");

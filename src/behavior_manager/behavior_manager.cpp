@@ -1112,6 +1112,10 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
 
     // 前置策略链调度：仅在 RL 状态累计时长，到期后设置 pending_policy = final_target
     StateName cur = impl_->fsm.CurrentState();
+    if (cur == StateName::RL && !impl_->action_owner.empty() &&
+        impl_->active_policy == impl_->action_target && !impl_->action_returning) {
+        impl_->policy_action_status.progress = impl_->fsm.CurrentInteractionStatus().progress;
+    }
     if (impl_->prev_fsm_state == StateName::RL && cur != StateName::RL) {
         impl_->policy_runtime_ready = false;
         impl_->policy_prepare_failed = false;

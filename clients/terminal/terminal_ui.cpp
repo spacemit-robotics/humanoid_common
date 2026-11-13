@@ -569,7 +569,11 @@ void RenderVelocityPage(const UiState &state) {
     SetBold();
     printf("%s", ModeName(state.status.state));
     ResetAttr();
-    printf("    策略: %s    RL: %.1f Hz", Fit(policy, layout.width - 43).c_str(), state.status.rl_hz);
+    const auto active = std::find_if(state.policies.begin(), state.policies.end(),
+        [&](const auto &p) { return p.name == state.status.policy; });
+    const bool speed_modes = active != state.policies.end() && active->HasSpeedModes();
+    printf("    策略: %s    %s    RL: %.1f Hz", Fit(policy, layout.width - 50).c_str(),
+        speed_modes ? (state.status.teleop_preset == "fast" ? "快速" : "慢速") : "单档", state.status.rl_hz);
     MoveTo(6, layout.content_left);
     printf("目标  vx=%+.2f   vy=%+.2f   wz=%+.2f", state.target_command.vx, state.target_command.vy,
         state.target_command.wz);
@@ -582,7 +586,7 @@ void RenderVelocityPage(const UiState &state) {
     DrawBox(9, layout.left, layout.width, 9);
     MoveTo(10, layout.content_left);
     SetDim();
-    printf("每次按键按配置步长加减，速度范围按当前策略限制");
+    printf("按键持续移动，SPACE 减速停车%s", speed_modes ? "，B 切换快慢档" : "");
     ResetAttr();
     PrintKey(12, layout.content_left + 2, "Q", "左转", state.highlighted_key == 'q');
     PrintKey(12, layout.content_left + 21, "W", "前进", state.highlighted_key == 'w');
@@ -600,7 +604,7 @@ void RenderVelocityPage(const UiState &state) {
     ResetAttr();
     MoveTo(20, layout.content_left);
     SetDim();
-    printf("离开 RL、HMI 退出或心跳超时，Control 均会将速度清零");
+    printf("终端不提供松键事件；松开按键不会停，需按 SPACE 停止");
     ResetAttr();
 
     PrintLastAction(layout, 22, state.last_action);

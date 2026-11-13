@@ -80,7 +80,11 @@ private:
     Json ReplyTo(uint64_t id, bool ok, const std::string &code, const std::string &message,
         const Json &data = Json::object()) const;
     bool Online() const;
-    void ClearInput(const std::string &reason);
+    void ClearInput(const std::string &reason, bool immediate = false);
+    void ClearVelocity(bool immediate);
+    void AdvanceVelocity(double now);
+    Velocity TeleopTarget(const Policy &policy) const;
+    bool SelectPreset(uint64_t session, const std::string &preset);
     void Finish(const std::string &phase, const std::string &message);
     const Policy *ActivePolicy() const;
     Config config_;
@@ -89,6 +93,10 @@ private:
     uint64_t owner_ = 0;
     double lease_until_ = 0;
     double velocity_until_ = 0;
+    double velocity_at_ = 0;
+    Velocity velocity_input_;
+    Velocity target_velocity_;
+    bool normalized_input_ = false;
     double status_at_ = -1;
     int status_samples_ = 0;
     double request_until_ = 0;
@@ -99,7 +107,7 @@ private:
     uint64_t acknowledge_sequence_ = 0;
     uint64_t policy_sequence_ = 0;
     bool command_sent_ = false;
-    std::string teleop_preset_;
+    std::string teleop_preset_ = "slow";
     uint64_t teleop_preset_sequence_ = 0;
     RequestResult result_;
     std::string pending_target_;

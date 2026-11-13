@@ -736,18 +736,23 @@ void TestManualReferencePlayback() {
     adapter->Reset(robot);
     check_position(0.0, 0.1);
     check_position(100.0, 0.1);
+    Require(adapter->GetInteractionStatus().progress == 0.0F, "standby advanced playback progress");
     Require(adapter->ReadyForPolicySwitch() && !adapter->PlaybackFinished(),
         "manual standby must permit handoff without reporting motion completion");
     Require(!adapter->StartPlayback(-1.0), "接受了负开始时间");
     Require(adapter->StartPlayback(100.0), "首次开始失败");
     Require(!adapter->StartPlayback(101.0), "重复开始重置了参考时钟");
     check_position(100.01, 0.15);
+    Require(std::abs(adapter->GetInteractionStatus().progress - 0.5F) < 1.0e-5F,
+        "reference playback progress did not follow the sampled frames");
     Require(!adapter->ReadyForPolicySwitch(), "active reference handed off before completion");
     check_position(101.0, 0.2);
+    Require(adapter->GetInteractionStatus().progress == 1.0F, "completed reference progress is not one");
     Require(adapter->ReadyForPolicySwitch() && adapter->PlaybackFinished(),
         "finished manual reference did not permit handoff");
     adapter->Reset(robot);
     check_position(200.0, 0.1);
+    Require(adapter->GetInteractionStatus().progress == 0.0F, "reset retained old playback progress");
 
     config.manual_start = false;
     adapter = Create(config, policy_config);
@@ -899,7 +904,7 @@ void TestSonicPlannerConfig() {
         "          encoder:\n"
         "            model_path: encoder.onnx\n"
         "            runtime: {provider: cpu, threads: 2, ort_spinning: false, "
-        "worker_sched: fifo, worker_priority: 55}\n"
+        "worker_sched: fifo, worker_priority: 55, ep_options: {SPACEMIT_EP_DENSE_ACCURACY_LEVEL: '2'}}\n"
         "          planner:\n"
         "            enabled: true\n"
         "            model_path: planner.onnx\n"
@@ -907,7 +912,7 @@ void TestSonicPlannerConfig() {
         "            lookahead: 0.8\n"
         "            replan_interval: 0.5\n"
         "            runtime: {provider: cpu, threads: 4, ort_spinning: false, "
-        "worker_sched: other, worker_priority: 0}\n");
+        "worker_sched: other, worker_priority: 0, ep_options: {SPACEMIT_EP_DISABLE_OP_TYPE_FILTER: Softmax}}\n");
     auto config = LoadConfig(yaml.Path().string(), "planner",
         fs::temp_directory_path().string());
     Require(config.reference_file.empty() && config.sonic_planner.Enabled(),
@@ -925,6 +930,9 @@ void TestSonicPlannerConfig() {
         config.sonic_encoder.runtime.worker_priority == 55 &&
         !config.sonic_encoder.runtime.ort_spinning,
         "encoder runtime must come from YAML");
+    Require(config.sonic_planner.runtime.ep_options.at("SPACEMIT_EP_DISABLE_OP_TYPE_FILTER") == "Softmax" &&
+        config.sonic_encoder.runtime.ep_options.at("SPACEMIT_EP_DENSE_ACCURACY_LEVEL") == "2",
+        "nested model EP options must come from YAML");
     const auto &thread = config.sonic_planner.thread;
     Require(thread.name == "motion_planner" && thread.cpu_id == -1 &&
         thread.cpu_affinity == std::vector<int>({0, 3}) && thread.sched == "fifo" &&

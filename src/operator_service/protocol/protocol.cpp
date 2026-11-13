@@ -18,7 +18,8 @@ Json Encode(const Policy &p) {
     for (const auto &a : p.actions)
         actions.push_back({{"key", a.key}, {"display_name", a.display_name}});
     Json result = {{"name", p.name}, {"manual_reference", p.manual_reference}, {"minimum", Encode(p.minimum)},
-        {"maximum", Encode(p.maximum)}, {"actions", actions}, {"client_smoothing", p.client_smoothing},
+        {"maximum", Encode(p.maximum)}, {"actions", actions}, {"client_smoothing", false},
+        {"service_smoothing", p.client_smoothing},
         {"switch_group", p.switch_group}, {"display_name", p.display_name.empty() ? p.name : p.display_name}};
     if (p.slow_limits) result["teleop"]["slow_limits"] = Encode(*p.slow_limits);
     if (p.fast_limits) result["teleop"]["fast_limits"] = Encode(*p.fast_limits);
@@ -32,6 +33,7 @@ Json Encode(const Status &s) {
     return {{"online", s.online}, {"hmi_connected", s.hmi_connected}, {"zero_ready", s.zero_ready}, {"state", s.state},
         {"trajectory_enabled", s.trajectory_enabled},
         {"policy", s.policy}, {"age_ms", s.age_ms}, {"rl_hz", s.rl_hz}, {"velocity", Encode(s.velocity)},
+        {"target_velocity", Encode(s.target_velocity)}, {"command_velocity", Encode(s.command_velocity)},
         {"owner", s.owner}, {"owns_control", s.owns_control}, {"lease_remaining_ms", s.lease_remaining_ms},
         {"interaction",
             {{"phase", s.interaction_phase}, {"action", s.interaction_action}, {"progress", s.interaction_progress},
@@ -53,6 +55,8 @@ Status DecodeStatus(const Json &v) {
     s.age_ms = v.at("age_ms");
     s.rl_hz = v.at("rl_hz");
     s.velocity = ReadVelocity(v.at("velocity"));
+    s.target_velocity = ReadVelocity(v.value("target_velocity", v.at("velocity")));
+    s.command_velocity = ReadVelocity(v.value("command_velocity", v.at("velocity")));
     s.owner = v.at("owner");
     s.owns_control = v.at("owns_control");
     s.lease_remaining_ms = v.at("lease_remaining_ms");
@@ -75,7 +79,7 @@ Policy DecodePolicy(const Json &v) {
     p.name = v.at("name");
     p.display_name = v.value("display_name", p.name);
     p.manual_reference = v.at("manual_reference");
-    p.client_smoothing = v.value("client_smoothing", true);
+    p.client_smoothing = v.value("service_smoothing", v.value("client_smoothing", true));
     p.switch_group = v.value("switch_group", "");
     p.minimum = ReadVelocity(v.at("minimum"));
     p.maximum = ReadVelocity(v.at("maximum"));

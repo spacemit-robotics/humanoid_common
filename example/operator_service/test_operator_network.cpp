@@ -64,10 +64,12 @@ int main(int argc, char *argv[]) {
     bool simulation = false;
     bool trajectory = false;
     bool administrator = false;
+    bool shm = false;
     for (int i = 3; i < argc; ++i) {
         simulation = simulation || std::string(argv[i]) == "--sim";
         trajectory = trajectory || std::string(argv[i]) == "--trajectory";
         administrator = administrator || std::string(argv[i]) == "--admin";
+        shm = shm || std::string(argv[i]) == "--shm";
     }
     const auto active_state = trajectory ? "TRAJECTORY" : "RL";
     assert(setenv("XDG_RUNTIME_DIR", "/tmp", 1) == 0);
@@ -81,6 +83,10 @@ int main(int argc, char *argv[]) {
     const std::string apk_data = "PK" + std::string(65536, 'x');
     std::ofstream(apk_path, std::ios::binary) << apk_data;
     auto yaml = YAML::LoadFile(argv[2]);
+    if (shm) {
+        yaml["transport"]["type"] = "shm";
+        yaml["transport"]["shm"]["prefix"] = "operator_network_" + std::to_string(getpid());
+    }
     if (administrator) yaml["operator_service"]["admin_password_hash"] =
         "pbkdf2-sha256:100000:00112233445566778899aabbccddeeff:"
         "ce640bcfa4ac6c9479894ecb9990fe597e6f6e4f6878e84ebbcce384bbb4f7b2";
@@ -107,14 +113,32 @@ int main(int argc, char *argv[]) {
     std::ofstream(config_path) << yaml;
     auto control = transport::CreateV2(config_path);
     assert(control->Init(config_path, transport::Role::CONTROL));
+    auto driver = transport::CreateV2(config_path);
+    assert(driver->Init(config_path, transport::Role::DRIVER));
     std::atomic<bool> running{true};
+    std::atomic<bool> publish_status{true};
+    std::atomic<bool> publish_feedback{true};
+    std::atomic<bool> restart_driver{false};
     std::thread producer([&] {
         robot_base::ControlStatus status;
         status.active_policy = trajectory ? "" : "test_policy";
         status.zero_ready = true;
         status.rl_frequency_hz = trajectory ? 0 : 50;
         status.hmi_connected = true;
+        auto state = robot_base::RobotData::Create(2);
+        state.has_joint_feedback = true;
+        state.has_joint_effort = state.has_acceleration = state.has_base_imu = true;
+        state.joint_pos[1] = -0.25;
+        state.joint_vel[1] = 0.1;
+        state.joint_torque[1] = 0.2;
+        state.acceleration[2] = 9.81;
         while (running) {
+            if (restart_driver.exchange(false)) {
+                driver.reset();
+                driver = transport::CreateV2(config_path);
+                assert(driver->Init(config_path, transport::Role::DRIVER));
+                state.time = 0;
+            }
             robot_base::Command command;
             uint64_t acknowledge = 0;
             while (control->RecvCommandV2(command, acknowledge)) {
@@ -137,7 +161,11 @@ int main(int argc, char *argv[]) {
                     status.interaction.action = command.interaction.action;
                 }
             }
-            control->SendStatusV2(status, {});
+            if (publish_feedback) {
+                state.time += 0.02;
+                assert(driver->SendStateV2(state, {}));
+            }
+            if (publish_status) control->SendStatusV2(status, {});
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
     });
@@ -185,6 +213,18 @@ int main(int argc, char *argv[]) {
         }
         assert(alice.AcquireControl().ok);
         assert(!bob.AcquireControl().ok);
+        assert(!alice.LatestRobotFeedback().available && !bob.LatestRobotFeedback().available);
+        assert(bob.SubscribeRobotFeedback().ok);
+        assert(Wait([&] { return bob.LatestRobotFeedback().fresh; }));
+        const auto feedback = bob.LatestRobotFeedback();
+        assert(feedback.available && feedback.sequence > 0 && feedback.source_time_s > 0);
+        assert(feedback.received_at_unix_s > 1700000000);
+        assert(feedback.joint_names == std::vector<std::string>({"joint_a", "joint_b"}));
+        assert(feedback.joint_positions[1] == -0.25 && feedback.joint_velocities[1] == 0.1);
+        assert(feedback.joint_efforts[1] == 0.2 && feedback.acceleration[2] == 9.81);
+        assert(!alice.LatestRobotFeedback().available);
+        assert(Wait([&] { return alice.LatestStatus().owns_control; }));
+        assert(!bob.LatestStatus().owns_control);
         assert(!bob.SetTeleopPreset("fast").ok);
         assert(!alice.SetTeleopPreset("invalid").ok);
         assert(alice.SetTeleopPreset("fast").ok);
@@ -246,6 +286,8 @@ int main(int argc, char *argv[]) {
                 public_connection.token = pairing.token;
                 assert(public_client.Connect(public_connection, &error));
                 assert(public_client.AcquireControl().code == "admin_required");
+                assert(public_client.SubscribeRobotFeedback().ok);
+                assert(Wait([&] { return public_client.LatestRobotFeedback().fresh; }));
                 assert(public_client.RequestState("POWER_OFF").code == "admin_required");
                 assert(public_client.Stop().code == "admin_required");
             }
@@ -278,6 +320,34 @@ int main(int argc, char *argv[]) {
         assert(Wait([&] { return bob.LatestStatus().interaction_phase == "IDLE"; }));
         assert(bob.Stop().ok);
         assert(Wait([&] { return !bob.LatestStatus().owns_control; }));
+        if (shm || (argc == 4 && std::string(argv[3]) == "--real")) {
+            const auto previous = bob.LatestRobotFeedback().stream_id;
+            assert(previous != 0);
+            publish_feedback = false;
+            assert(Wait([&] { return !bob.LatestRobotFeedback().fresh; }));
+            assert(bob.LatestStatus().online && bob.LatestRobotFeedback().available);
+            restart_driver = true;
+            publish_feedback = true;
+            assert(Wait([&] {
+                const auto feedback = bob.LatestRobotFeedback();
+                return feedback.fresh && feedback.stream_id != previous;
+            }));
+        }
+        publish_status = false;
+        assert(Wait([&] { return !bob.LatestRobotFeedback().fresh; }));
+        assert(bob.LatestRobotFeedback().available);
+        assert(Wait([&] { return !bob.LatestStatus().online; }));
+        publish_status = true;
+        assert(Wait([&] { return bob.LatestRobotFeedback().fresh; }));
+        assert(bob.SubscribeRobotFeedback(false).ok && !bob.LatestRobotFeedback().fresh);
+        assert(!bob.LatestRobotFeedback().available);
+        bob.Disconnect();
+        assert(!bob.LatestRobotFeedback().fresh);
+        assert(bob.Connect(connection, &error));
+        assert(Wait([&] { return bob.LatestStatus().online; }));
+        assert(!bob.LatestRobotFeedback().available);
+        assert(bob.SubscribeRobotFeedback().ok);
+        assert(Wait([&] { return bob.LatestRobotFeedback().fresh; }));
         bob.Disconnect();
         connection.token = "wrong";
         assert(!alice.Connect(connection, &error));

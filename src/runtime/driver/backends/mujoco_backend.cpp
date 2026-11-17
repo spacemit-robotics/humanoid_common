@@ -19,6 +19,8 @@
 #include "mujoco_depth_publisher.h"
 #endif
 #include "mujoco_sim.h"
+
+#include <algorithm>
 #include "robot_base.h"
 #include "runtime_logger.h"
 
@@ -69,8 +71,12 @@ public:
                 state.num_dof = sim_state.num_dof;
                 state.joint_pos = sim_state.joint_pos;
                 state.joint_vel = sim_state.joint_vel;
+                state.has_joint_feedback = true;
                 state.base_pos = sim_state.base_pos;
-                state.base_quat = sim_state.base_quat;
+                // SimState leaves its quaternion zero when the model has no floating base.
+                state.has_base_imu = std::any_of(sim_state.base_quat.begin(),
+                    sim_state.base_quat.end(), [](double v) { return v != 0.0; });
+                if (state.has_base_imu) state.base_quat = sim_state.base_quat;
                 state.base_vel = sim_state.base_vel;
                 state.gyro = sim_state.gyro;
                 state.rpy = sim_state.rpy;

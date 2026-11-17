@@ -12,7 +12,7 @@
 #include <string>
 
 #include "transport_executor.h"
-#include "transport_packet.h"
+#include "feedback_sampler.h"
 #include "udp_transport.h"
 namespace transport {
 
@@ -55,6 +55,8 @@ public:
     bool RecvStatusV2(robot_base::ControlStatus &status,
         robot_base::FaultStatus &fault) override;
 
+    bool RecvFeedback(robot_base::RobotFeedback &feedback) override;
+
 private:
     // ==================== 成员变量 ====================
 
@@ -72,6 +74,8 @@ private:
     std::unique_ptr<transport_udp::Udp> status_sender_;
     std::unique_ptr<transport_udp::Udp> status_receiver_;
 
+    std::unique_ptr<transport_udp::Udp> feedback_channel_;
+    FeedbackSampler feedback_sampler_;
     uint32_t state_seq_ = 0;
     uint32_t control_seq_ = 0;
     uint32_t hmi_seq_ = 0;

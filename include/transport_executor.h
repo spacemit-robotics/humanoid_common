@@ -128,6 +128,9 @@ public:
         const robot_base::FaultStatus &fault) = 0;
     virtual bool RecvStatusV2(robot_base::ControlStatus &status,
         robot_base::FaultStatus &fault) = 0;
+
+    // Independent driver telemetry. Does not consume the state or status channel.
+    virtual bool RecvFeedback(robot_base::RobotFeedback &) { return false; }
 };
 
 /**

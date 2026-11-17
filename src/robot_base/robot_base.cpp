@@ -262,6 +262,8 @@ void RobotData::UpdateImuData() {
 }
 
 void RobotData::Reset() {
+    has_base_imu = has_acceleration = has_joint_effort = false;
+    has_joint_feedback = false;
     // 重置基座状态
     base_pos = {0, 0, 0};
     base_quat = {1, 0, 0, 0};

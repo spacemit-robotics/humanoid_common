@@ -8,11 +8,12 @@
 #ifndef TRANSPORT_SHM_IMPL_H
 #define TRANSPORT_SHM_IMPL_H
 
+#include <chrono>
 #include <memory>
 #include <string>
 
 #include "transport_executor.h"
-#include "transport_packet.h"
+#include "feedback_sampler.h"
 #include "shm_transport.h"
 namespace transport {
 
@@ -55,6 +56,8 @@ public:
     bool RecvStatusV2(robot_base::ControlStatus &status,
         robot_base::FaultStatus &fault) override;
 
+    bool RecvFeedback(robot_base::RobotFeedback &feedback) override;
+
 private:
     // ==================== 成员变量 ====================
 
@@ -72,6 +75,10 @@ private:
     std::unique_ptr<transport_shm::Shm> status_writer_;
     std::unique_ptr<transport_shm::Shm> status_reader_;
 
+    std::unique_ptr<transport_shm::Shm> feedback_channel_;
+    transport_shm::ShmConfig feedback_reader_config_;
+    std::chrono::steady_clock::time_point feedback_link_check_{};
+    FeedbackSampler feedback_sampler_;
     uint32_t state_seq_ = 0;
     uint32_t control_seq_ = 0;
     uint32_t hmi_seq_ = 0;

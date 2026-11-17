@@ -133,6 +133,9 @@ struct RobotData {
     // ==================== 基础信息 ====================
     std::string name;  // 机器人名称（如 "g1", "qinglong"）
     int num_dof = 0;   // 控制自由度数量
+    // Optional measurement groups supplied by the active driver, never inferred from zero values.
+    bool has_base_imu = false, has_acceleration = false, has_joint_effort = false;
+    bool has_joint_feedback = false;
 
     // ==================== 基座状态 ====================
     std::array<double, 3> base_pos = {0, 0, 0};      // 世界坐标系位置 (m)
@@ -311,6 +314,27 @@ struct PolicySwitchStatus {
     Phase phase = Phase::IDLE;
     std::string policy;    ///< 请求的策略；有前置链时可不同于 active_policy
     std::string detail;    ///< 失败原因；传输时可能截断，完整信息写入 Control 日志
+};
+
+/** @brief Bounded read-only driver feedback on a separate telemetry channel. */
+struct RobotFeedback {
+    static constexpr std::size_t kMaxJoints = 64;
+    bool has_base_imu = false, has_acceleration = false, has_joint_effort = false;
+    bool available = false;
+    bool fresh = false;
+    uint64_t stream_id = 0;
+    uint32_t packet_sequence = 0;
+    uint64_t sequence = 0;
+    int num_dof = 0;
+    double source_time_s = 0.0;  ///< Original driver clock, not Unix time.
+    double received_at_unix_s = 0.0;  ///< Driver receipt time on the system clock.
+    double age_s = 0.0;
+    std::array<double, kMaxJoints> joint_pos{};
+    std::array<double, kMaxJoints> joint_vel{};
+    std::array<double, kMaxJoints> joint_torque{};
+    std::array<double, 4> orientation{1, 0, 0, 0};  ///< Base orientation, wxyz.
+    std::array<double, 3> angular_velocity{};
+    std::array<double, 3> acceleration{};
 };
 
 /**

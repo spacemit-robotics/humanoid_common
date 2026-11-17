@@ -222,10 +222,10 @@ bool TestPacketValidation() {
     status.policy_switch.sequence = 41;
     if (transport::ValidControlStatusPacket(status)) return false;
     status.policy_switch = {};
-    status.header.version = 6;
+    status.header.version = transport::kVersion - 1;
     if (transport::ValidControlStatusPacket(status)) return false;
 
-    std::cout << "[test] V7 packet validation: PASS\n";
+    std::cout << "[test] V" << transport::kVersion << " packet validation: PASS\n";
     return true;
 }
 
@@ -535,6 +535,16 @@ int main(int argc, char *argv[]) {
         robot_base::InteractionStatus::Phase::PLAYING;
     status.interaction.progress = 0.4F;
     status.interaction.action = "wave";
+    state.time = 2.5;
+    state.has_joint_feedback = true;
+    state.has_base_imu = true;
+    state.has_joint_effort = false;
+    state.joint_torque.clear();
+    state.joint_pos[1] = -0.4;
+    state.joint_vel[1] = 0.6;
+    state.gyro[0] = 0.15;
+    std::this_thread::sleep_for(std::chrono::milliseconds(55));
+    if (!driver->SendStateV2(state, {})) return 1;
     robot_base::FaultStatus status_fault;
     status_fault.latched = true;
     status_fault.source = robot_base::FaultSource::POLICY;
@@ -554,7 +564,20 @@ int main(int argc, char *argv[]) {
         std::cerr << "[test] Control 状态接收失败\n";
         return 1;
     }
+    robot_base::RobotFeedback latest{}, sample{};
+    while (hmi->RecvFeedback(sample)) latest = sample;
+    const auto yaml = robot_base::YamlFile::Load(yaml_path);
+    const bool expect_feedback = yaml.Read<std::string>("transport.type").value_or("shm") == "shm" ||
+        yaml.Read<int>("transport.udp.feedback_port").value_or(0) > 0;
+    const bool feedback_ok = expect_feedback
+        ? latest.available && latest.fresh && latest.stream_id != 0 &&
+            latest.sequence > 0 && latest.num_dof == state.num_dof &&
+            latest.source_time_s == state.time && latest.received_at_unix_s > 0 &&
+            latest.joint_pos[1] == -0.4 && latest.joint_vel[1] == 0.6 &&
+            !latest.has_joint_effort && latest.has_base_imu && latest.angular_velocity[0] == 0.15
+        : !latest.available;
     const bool status_ok = recv_status.mode == robot_base::ControlMode::RL &&
+        feedback_ok &&
         recv_status.hmi_connected &&
         std::abs(recv_status.vx - status.vx) < 1e-4f &&
         recv_status.active_policy == status.active_policy &&
@@ -580,6 +603,12 @@ int main(int argc, char *argv[]) {
     std::cout << "[test] 状态回传验证: "
         << (status_ok ? "通过" : "失败") << "\n";
     all_ok = all_ok && status_ok;
+
+    // The core fault heartbeat remains usable without a new driver sample.
+    if (!control->SendStatusV2(status, status_fault)) return 1;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (!hmi->RecvStatusV2(recv_status, recv_status_fault) ||
+        recv_status.mode != status.mode || recv_status_fault.code != status_fault.code) return 1;
 
     robot_base::ControlStatus trajectory_status;
     trajectory_status.mode = robot_base::ControlMode::TRAJECTORY;

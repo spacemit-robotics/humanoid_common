@@ -37,6 +37,23 @@ bool TransportShmImpl::Init(const std::string& yaml_path, Role role) {
     slot_size =
         static_cast<uint32_t>(yaml_file.Read<int>(shm_prefix + ".slot_size").value_or(slot_size));
 
+    if (role == Role::DRIVER || role == Role::HMI) {
+        transport_shm::ShmConfig cfg;
+        cfg.role = role == Role::DRIVER ? transport_shm::Role::WRITER : transport_shm::Role::READER;
+        cfg.channel_name = "/hmrs_" + prefix + "_feedback";
+        cfg.capacity = capacity;
+        cfg.slot_size = sizeof(RobotFeedbackPacket);
+        cfg.create_if_not_exist = true;
+        if (role == Role::HMI) feedback_reader_config_ = cfg;
+        feedback_channel_ = std::make_unique<transport_shm::Shm>();
+        if (!feedback_channel_->Init(cfg)) {
+            feedback_channel_.reset();
+            std::cerr << "[transport_shm] optional robot feedback unavailable\n";
+        }
+    }
+    if (role == Role::DRIVER && feedback_channel_)
+        feedback_sampler_.SetRate(yaml_file.Read<double>("hmi.status_hz").value_or(20));
+
     if (role == Role::DRIVER) {
         // Driver: 写状态
         state_writer_ = std::make_unique<transport_shm::Shm>();
@@ -182,6 +199,11 @@ bool TransportShmImpl::SendStateV2(const robot_base::RobotData &state,
     if (!ValidRobotStatePacket(p)) return false;
     if (!state_writer_->Write(&p, sizeof(p))) return false;
     state_seq_ = p.header.seq;
+    if (feedback_channel_) {
+        feedback_sampler_.Observe(state, !fault.active, [this](const RobotFeedbackPacket &packet) {
+            (void)feedback_channel_->Write(&packet, sizeof(packet));
+        });
+    }
     return true;
 }
 
@@ -428,6 +450,25 @@ bool TransportShmImpl::RecvStatusV2(robot_base::ControlStatus &status,
     status.interaction.action = DecodeText(p.interaction_action);
     DecodePolicySwitch(p.policy_switch, &status.policy_switch);
     return DecodeFault(p.fault, &fault);
+}
+
+bool TransportShmImpl::RecvFeedback(robot_base::RobotFeedback &feedback) {
+    if (role_ != Role::HMI) return false;
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= feedback_link_check_) {
+        feedback_link_check_ = now + std::chrono::milliseconds(250);
+        if (!feedback_channel_ || !feedback_channel_->IsLinked()) {
+            feedback_channel_.reset();
+            auto channel = std::make_unique<transport_shm::Shm>();
+            if (channel->Init(feedback_reader_config_)) feedback_channel_ = std::move(channel);
+        }
+    }
+    if (!feedback_channel_) return false;
+    RobotFeedbackPacket packet{};
+    std::size_t length = 0;
+    if (!feedback_channel_->Read(&packet, sizeof(packet), length) || length != sizeof(packet)) return false;
+    feedback = DecodeFeedback(packet);
+    return true;
 }
 
 }  // namespace transport

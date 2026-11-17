@@ -1,5 +1,6 @@
 robot_base:
   name: operator_test
+  joint_names: [joint_a, joint_b]
 driver:
   backend: whole_body
 operator_service:
@@ -21,6 +22,7 @@ transport:
     control_port: 18861
     hmi_port: 18862
     status_port: 18863
+    feedback_port: 18864
 rl_policy:
   onnx_infer:
     policy_names: [test_policy]

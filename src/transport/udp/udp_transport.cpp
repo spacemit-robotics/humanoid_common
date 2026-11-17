@@ -67,9 +67,10 @@ bool Udp::Init(const UdpConfig &cfg) {
     timeout.tv_usec = (cfg.timeout_ms % 1000) * 1000;
     ::setsockopt(impl_->sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 
-    // 允许端口复用
-    int reuse = 1;
-    ::setsockopt(impl_->sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    if (cfg.reuse_address) {
+        int reuse = 1;
+        ::setsockopt(impl_->sockfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    }
 
     if (cfg.role == Role::SERVER) {
         // 服务端：绑定本地端口

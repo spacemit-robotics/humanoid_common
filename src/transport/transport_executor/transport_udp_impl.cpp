@@ -50,6 +50,24 @@ bool TransportUdpImpl::Init(const std::string& yaml_path, Role role) {
     hmi_port = yaml_file.Read<int>(udp_prefix + ".hmi_port").value_or(control_port + 1);
     status_port = yaml_file.Read<int>(udp_prefix + ".status_port").value_or(hmi_port + 1);
 
+    if (role == Role::DRIVER || role == Role::HMI) {
+        const int port = yaml_file.Read<int>(udp_prefix + ".feedback_port").value_or(0);
+        if (port > 0 && port <= 65535 && port != control_port && port != state_port &&
+            port != hmi_port && port != status_port) {
+            transport_udp::UdpConfig cfg;
+            cfg.role = role == Role::DRIVER ? transport_udp::Role::CLIENT : transport_udp::Role::SERVER;
+            cfg.remote_ip = hmi_ip;
+            cfg.remote_port = cfg.local_port = port;
+            cfg.reuse_address = false;
+            feedback_channel_ = std::make_unique<transport_udp::Udp>();
+            if (!feedback_channel_->Init(cfg)) feedback_channel_.reset();
+        }
+        if (port != 0 && !feedback_channel_)
+            std::cerr << "[transport_udp] optional robot feedback unavailable on port " << port << "\n";
+    }
+    if (role == Role::DRIVER && feedback_channel_)
+        feedback_sampler_.SetRate(yaml_file.Read<double>("hmi.status_hz").value_or(20));
+
     if (role == Role::DRIVER) {
         // Driver: 发送状态 → control_ip:state_port
         state_sender_ = std::make_unique<transport_udp::Udp>();
@@ -191,6 +209,11 @@ bool TransportUdpImpl::SendStateV2(const robot_base::RobotData &state,
     if (!ValidRobotStatePacket(p)) return false;
     if (state_sender_->Send(&p, sizeof(p)) != static_cast<int>(sizeof(p))) return false;
     state_seq_ = p.header.seq;
+    if (feedback_channel_) {
+        feedback_sampler_.Observe(state, !fault.active, [this](const RobotFeedbackPacket &packet) {
+            (void)feedback_channel_->Send(&packet, FeedbackPacketSize(packet.num_dof));
+        });
+    }
     return true;
 }
 
@@ -428,6 +451,21 @@ bool TransportUdpImpl::RecvStatusV2(robot_base::ControlStatus &status,
     status.interaction.action = DecodeText(p.interaction_action);
     DecodePolicySwitch(p.policy_switch, &status.policy_switch);
     return DecodeFault(p.fault, &fault);
+}
+
+bool TransportUdpImpl::RecvFeedback(robot_base::RobotFeedback &feedback) {
+    if (role_ != Role::HMI || !feedback_channel_) return false;
+    struct {
+        RobotFeedbackPacket packet{};
+        uint8_t overflow = 0;
+    } buffer;
+    const int size = feedback_channel_->Recv(&buffer, sizeof(buffer));
+    if (size <= 0) return false;
+    if (static_cast<std::size_t>(size) == FeedbackPacketSize(buffer.packet.num_dof))
+        feedback = DecodeFeedback(buffer.packet);
+    else
+        feedback = {};
+    return true;
 }
 
 }  // namespace transport

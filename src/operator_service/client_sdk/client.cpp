@@ -55,6 +55,9 @@ struct Client::Impl {
     uint64_t next_id = 0;
     uint64_t waiting_id = 0;
     Status status;
+    RobotFeedback feedback;
+    bool feedback_subscribed = false;
+    std::chrono::steady_clock::time_point last_feedback{};
     std::vector<Policy> policies;
     std::vector<Action> actions;
     std::string robot;
@@ -84,6 +87,26 @@ struct Client::Impl {
                 if (message.value("event", "") == "status") {
                     status = DecodeStatus(message.at("data"));
                     last_status = std::chrono::steady_clock::now();
+                } else if (message.value("event", "") == "robot_feedback") {
+                    if (feedback_subscribed) {
+                        try {
+                            auto sample = DecodeRobotFeedback(message.at("data"));
+                            const auto now = std::chrono::steady_clock::now();
+                            if (sample.available) {
+                                if (feedback.available && sample.stream_id == feedback.stream_id &&
+                                    sample.sequence == feedback.sequence) {
+                                    const double age = feedback.age_ms + std::chrono::duration<double, std::milli>(
+                                        now - last_feedback).count();
+                                    sample.age_ms = std::max(sample.age_ms, age);
+                                }
+                                AccountForTransit(&sample);
+                            }
+                            feedback = std::move(sample);
+                            last_feedback = now;
+                        } catch (const Json::exception &) {
+                            feedback = {};
+                        }
+                    }
                 } else if (message.contains("id") && message.at("id") == waiting_id) {
                     replies[waiting_id] = message;
                     condition.notify_all();
@@ -166,6 +189,10 @@ struct Client::Impl {
             return {{"ok", false}, {"code", "timeout"}, {"message", "result unknown; inspect status before retrying"}};
         Json reply = std::move(it->second);
         replies.erase(it);
+        if (op == "subscribe_robot_feedback" && reply.value("ok", false)) {
+            feedback_subscribed = args.value("enabled", true);
+            if (!feedback_subscribed) feedback = {};
+        }
         return reply;
     }
     void Start() {
@@ -285,6 +312,21 @@ Status Client::LatestStatus() const {
         s.owns_control = false;
     }
     return s;
+}
+Reply Client::SubscribeRobotFeedback(bool enabled) {
+    return DecodeReply(impl_->Call("subscribe_robot_feedback", {{"enabled", enabled}}));
+}
+RobotFeedback Client::LatestRobotFeedback() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto result = impl_->feedback;
+    if (result.available) {
+        AccountForTransit(&result);
+        result.age_ms = std::max(result.age_ms, impl_->feedback.age_ms + std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - impl_->last_feedback).count());
+    }
+    if (!impl_->connected || !impl_->feedback_subscribed || result.age_ms > result.stale_after_ms)
+        result.fresh = false;
+    return result;
 }
 std::vector<Policy> Client::Policies() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);

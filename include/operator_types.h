@@ -7,6 +7,7 @@
 #ifndef OPERATOR_TYPES_H
 #define OPERATOR_TYPES_H
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -88,6 +89,26 @@ struct Reply {
     std::string code;
     std::string message;
     RequestResult request;
+};
+/** @brief Read-only joint and base-IMU feedback; no world position or odometry. */
+struct RobotFeedback {
+    bool has_base_imu = false, has_acceleration = false;
+    bool available = false;
+    bool fresh = false;
+    uint64_t stream_id = 0;  // Changes when the driver stream restarts.
+    uint64_t sequence = 0;
+    double source_time_s = 0;  // Driver clock, not Unix time.
+    double received_at_unix_s = 0;  // Driver receipt time, not hardware capture time.
+    double age_ms = 0;  // Requires synchronized system clocks across hosts.
+    double stale_after_ms = 0;
+    std::string frame_id;  // Configured base frame; empty when unspecified.
+    std::vector<std::string> joint_names;
+    std::vector<double> joint_positions;  // rad
+    std::vector<double> joint_velocities;  // rad/s
+    std::vector<double> joint_efforts;  // Nm
+    std::array<double, 4> orientation{1, 0, 0, 0};  // wxyz; expressed in the driver's base convention.
+    std::array<double, 3> angular_velocity{};
+    std::array<double, 3> acceleration{};
 };
 struct Connection {
     std::string endpoint;

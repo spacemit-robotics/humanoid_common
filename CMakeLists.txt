@@ -535,6 +535,8 @@ if(BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml)
     add_test(NAME operator_network COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --real)
+    add_test(NAME operator_network_shm COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --real --shm)
     add_test(NAME operator_simulation COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --sim)
     add_test(NAME operator_trajectory COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
@@ -543,7 +545,7 @@ if(BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --trajectory --sim)
     add_test(NAME operator_administrator COMMAND test_operator_network $<TARGET_FILE:hmi_runtime>
         ${CMAKE_CURRENT_SOURCE_DIR}/example/operator_service/network.yaml --trajectory --admin)
-    set_tests_properties(operator_network operator_simulation operator_trajectory
+    set_tests_properties(operator_network operator_network_shm operator_simulation operator_trajectory
         operator_trajectory_simulation operator_administrator PROPERTIES RUN_SERIAL TRUE TIMEOUT 20)
 
     add_executable(test_operator_mcp_protocol

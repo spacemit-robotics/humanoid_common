@@ -15,6 +15,9 @@
 #include <vector>
 
 #include "driver_backend.h"
+#ifdef HAS_HIKING_SIM_DEPTH
+#include "mujoco_depth_publisher.h"
+#endif
 #include "mujoco_sim.h"
 #include "robot_base.h"
 #include "runtime_logger.h"
@@ -42,6 +45,18 @@ public:
             yaml_file.Read<std::vector<double>>("robot_base.kd").value_or(std::vector<double>{});
         simulator_ = std::make_unique<mujoco_sim::Simulator>(yaml_path, robot_name, num_dof,
             scene_path, default_joint_pos, kp, kd, true);
+        if (yaml_file.Read<bool>("perception.depth.publish_sim").value_or(false)) {
+#ifdef HAS_HIKING_SIM_DEPTH
+            depth_ = std::make_unique<perception::MujocoDepthPublisher>(
+                yaml_file.Read<std::string>("simulation.mujoco.depth_endpoint").value_or(
+                    yaml_file.Read<std::string>("perception.depth.endpoint").value_or("tcp://127.0.0.1:5560")));
+            simulator_->SetObserveCallback([this](const auto &state, const auto &frame) {
+                depth_->Observe(state.time, frame.model, frame.data);
+            });
+#else
+            throw std::runtime_error("this build has no simulation depth publisher");
+#endif
+        }
     }
 
     int Run(const PublishStateCallback &publish_state,
@@ -103,6 +118,9 @@ public:
 
 private:
     std::unique_ptr<mujoco_sim::Simulator> simulator_;
+#ifdef HAS_HIKING_SIM_DEPTH
+    std::unique_ptr<perception::MujocoDepthPublisher> depth_;
+#endif
 };
 
 }  // namespace

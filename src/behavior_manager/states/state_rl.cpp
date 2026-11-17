@@ -72,6 +72,9 @@ public:
         runtime_prepared_ = true;
     }
 
+    std::string EntryError(const robot_base::RobotData &sensor) const override {
+        return policy_adapter_ ? policy_adapter_->EntryError(sensor) : std::string{};
+    }
     void OnEnter() override {
         entry_kp_ = output_ ? output_->kp : std::vector<double>{};
         entry_kd_ = output_ ? output_->kd : std::vector<double>{};
@@ -185,7 +188,10 @@ public:
         // 可选策略适配器已随策略运行时创建；进入状态时只重置时序数据。
         if (config_.policy_adapter.Enabled() && sensor_) {
             try {
-                policy_adapter_->Reset(*sensor_);
+                if (live_handoff_)
+                    policy_adapter_->ResetForHandoff(*sensor_, entry_target_pos_);
+                else
+                    policy_adapter_->Reset(*sensor_);
                 t_enter_ = std::chrono::steady_clock::now();
                 runtime_logging::Log(runtime_logging::Level::kInfo,
                     std::string("[StateRL] policy_adapter 启用: type=") + policy_adapter_->Type() +
@@ -619,6 +625,7 @@ private:
                 if (!switching) policy_adapter_->HandleInteractionRequest(diagnostics.request, elapsed);
                 policy_adapter_->PreparePolicySwitch(switching, elapsed);
                 auto &snapshot = infer_snapshot_;
+                snapshot.time = device_time;
                 snapshot.num_dof = static_cast<int>(joint_pos.size());
                 snapshot.base_pos = base_pos;
                 snapshot.base_quat = base_quat;

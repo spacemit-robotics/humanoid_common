@@ -34,10 +34,21 @@ endif()
 # ============================================================================
 
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 find_package(Eigen3 REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(Boost 1.70 REQUIRED)
 find_package(nlohmann_json 3.7 REQUIRED)
+option(HUMANOID_ENABLE_PERCEPTION "Build ZMQ perceptive locomotion" ON)
+if(HUMANOID_ENABLE_PERCEPTION)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(ZMQ REQUIRED IMPORTED_TARGET libzmq)
+    add_library(humanoid_depth SHARED src/perception/depth_stream.cpp)
+    target_include_directories(humanoid_depth PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/perception>)
+    target_link_libraries(humanoid_depth PUBLIC nlohmann_json::nlohmann_json Threads::Threads PRIVATE PkgConfig::ZMQ)
+    install(TARGETS humanoid_depth LIBRARY DESTINATION lib)
+endif()
+
 
 set(HUMANOID_COMMON_GIT_COMMIT "unknown")
 set(HUMANOID_COMMON_GIT_DIRTY 0)
@@ -73,6 +84,12 @@ find_path(RL_INCLUDE_DIR NAMES rl_service.h
 if(RL_LIB AND RL_INCLUDE_DIR)
     set(BUILD_RL ON)
     message(STATUS "rl: ${RL_LIB}")
+    # Staging installs preserve source timestamps. A changed RL header may therefore
+    # be older than cached objects, leaving incompatible C++ struct layouts linked
+    # together. SDK builds configure each package: hash the API into compiler flags
+    # so every consumer is rebuilt when its contents change, regardless of mtime.
+    file(SHA256 "${RL_INCLUDE_DIR}/rl_service.h" HUMANOID_RL_API_SHA256)
+    add_compile_definitions(HUMANOID_RL_API_SHA256="${HUMANOID_RL_API_SHA256}")
 else()
     set(BUILD_RL OFF)
     message(STATUS "rl not found in ${CMAKE_INSTALL_PREFIX}, skipping RL-dependent targets (behavior_manager, control_runtime, control_sim2sim_runtime)")
@@ -192,6 +209,11 @@ if(BUILD_RL)
         src/behavior_manager/states/state_safety.cpp
     )
 
+    if(HUMANOID_ENABLE_PERCEPTION)
+        target_sources(behavior_manager PRIVATE src/behavior_manager/policy_adapter/hiking_policy_adapter.cpp)
+        target_link_libraries(behavior_manager PRIVATE humanoid_depth OpenSSL::Crypto)
+        target_compile_definitions(behavior_manager PRIVATE HAS_HIKING_POLICY)
+    endif()
     target_include_directories(behavior_manager
         PUBLIC
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -258,7 +280,6 @@ if(BUILD_RL)
 endif()
 
 # Operator protocol and client SDK have no robot, RL or hardware dependencies.
-find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 add_library(operator_protocol STATIC src/operator_service/protocol/protocol.cpp)
 target_include_directories(operator_protocol PUBLIC include src/operator_service/protocol)
 target_link_libraries(operator_protocol PUBLIC nlohmann_json::nlohmann_json)
@@ -356,6 +377,15 @@ if(BUILD_MUJOCO_BACKEND OR BUILD_WHOLE_BODY_BACKEND)
     endif()
 
     add_executable(driver_runtime ${DRIVER_RUNTIME_SOURCES})
+    if(HUMANOID_ENABLE_PERCEPTION AND BUILD_MUJOCO_BACKEND AND _x86)
+        pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/../../../components/simulation/mujoco/cmake/FindMuJoCo.cmake)
+        target_sources(driver_runtime PRIVATE src/perception/mujoco_depth_publisher.cpp)
+        target_include_directories(driver_runtime PRIVATE ${MUJOCO_INCLUDE_DIR})
+        target_link_libraries(driver_runtime PRIVATE humanoid_depth PkgConfig::EGL PkgConfig::ZMQ ${MUJOCO_LIB})
+        target_compile_definitions(driver_runtime PRIVATE HAS_HIKING_SIM_DEPTH)
+    endif()
+
     target_include_directories(driver_runtime PRIVATE
         ${DRIVER_RUNTIME_INCLUDE_DIRS}
     )

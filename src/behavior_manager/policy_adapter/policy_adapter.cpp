@@ -7,6 +7,7 @@
  */
 
 #include "policy_adapter.h"
+#include "hiking_policy_adapter.h"
 #include "sonic_planner.h"
 
 #include "joint_trajectory_policy_adapter.h"
@@ -2146,6 +2147,21 @@ Config LoadConfig(const std::string &yaml_path,
     }
     if (type) {
         config.type = *type;
+        if (config.type == "hiking") {
+            const double rl_dt = yaml.Read<double>("rl_policy.rl_dt").value_or(.02);
+            const int decimation = yaml.Read<int>(policy_base + ".infer_decimation").value_or(1);
+            if (!std::isfinite(rl_dt) || decimation < 1 || std::abs(rl_dt * decimation - .02) > 1e-8)
+                throw std::runtime_error("Hiking requires a 50 Hz inference rate");
+            config.hiking.encoder = ResolvePath(robot_dir, yaml.Read<std::string>(adapter_base + ".encoder_path").value()).string();
+            config.hiking.encoder_sha256 = yaml.Read<std::string>(adapter_base + ".encoder_sha256").value();
+            config.hiking.actor_sha256 = yaml.Read<std::string>(adapter_base + ".actor_sha256").value();
+            const auto signs = yaml.Read<std::vector<double>>(adapter_base + ".joint_signs").value();
+            config.hiking.joint_signs.assign(signs.begin(), signs.end());
+            config.hiking.endpoint = yaml.Read<std::string>("perception.depth.endpoint").value_or("tcp://127.0.0.1:5560");
+            config.hiking.clock = yaml.Read<std::string>("perception.depth.clock").value_or("sim");
+            config.hiking.timeout_s = yaml.Read<double>("perception.depth.timeout_s").value_or(.2);
+            return config;
+        }
         if (config.type == "supermimic") {
             config.supermimic = LoadSupermimicConfig(yaml_path, adapter_base);
         }
@@ -2475,6 +2491,13 @@ std::unique_ptr<PolicyAdapter> Create(
     const rl_policy::PolicyExecutorConfig &policy_config) {
     if (!config.Enabled()) {
         return nullptr;
+    }
+    if (config.type == "hiking") {
+#ifdef HAS_HIKING_POLICY
+        return CreateHikingPolicyAdapter(config, policy_config);
+#else
+        throw std::runtime_error("perceptive locomotion disabled in this build");
+#endif
     }
     if (config.type == "supermimic") {
         return std::make_unique<SupermimicPolicyAdapter>(config, policy_config);

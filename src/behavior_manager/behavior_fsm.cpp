@@ -138,7 +138,9 @@ StateName FSM::CurrentState() const {
 }
 
 bool FSM::ReadyForRl() const {
-    return current_ && current_->ReadyForRl();
+    auto target = states_.find(StateName::RL);
+    return current_ && current_->ReadyForRl() &&
+        (target == states_.end() || !sensor_ || target->second->EntryError(*sensor_).empty());
 }
 
 robot_base::FaultStatus FSM::CurrentFault() const {
@@ -156,6 +158,13 @@ void FSM::SwitchTo(StateName target) {
         std::cerr << "[FSM] 目标状态未注册: " << StateNameStr(target) << std::endl;
         runtime_logging::Log(runtime_logging::Level::kError,
             std::string("unregistered FSM target: ") + StateNameStr(target), false);
+        return;
+    }
+
+    const auto entry_error = sensor_ ? it->second->EntryError(*sensor_) : std::string{};
+    if (!entry_error.empty()) {
+        runtime_logging::Log(runtime_logging::Level::kWarning, "state entry refused: " + entry_error, false);
+        if (command_) command_->key = 0;
         return;
     }
 

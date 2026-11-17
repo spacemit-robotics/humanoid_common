@@ -439,6 +439,9 @@ void Service::UpdateStatus(const robot_base::ControlStatus &status, const robot_
             Finish("failed", status.policy_switch.detail);
         else if (status.policy_switch.phase == Phase::REJECTED)
             Finish("rejected", status.policy_switch.detail);
+        else if (status.policy_switch.phase == Phase::PREPARING &&
+            !status.policy_switch.detail.empty())
+            result_.message = status.policy_switch.detail;
     } else if ((result_.operation == "interaction" || result_.operation == "cancel") &&
         command_.interaction.sequence == status.interaction.sequence) {
         Finish(status.interaction.request_accepted ? "completed" : "rejected", "control handled action request");

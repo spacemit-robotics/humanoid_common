@@ -208,6 +208,14 @@ struct Config {
         int interaction_release_frames = 0;
     } stance_motion;
 
+    struct HikingConfig {
+        std::string encoder;
+        std::string encoder_sha256, actor_sha256;
+        std::vector<float> joint_signs;
+        std::string endpoint = "tcp://127.0.0.1:5560";
+        std::string clock = "sim";
+        double timeout_s = .2;
+    } hiking;
     bool Enabled() const { return !type.empty(); }
 };
 
@@ -227,6 +235,13 @@ public:
 
     /** @brief 每次进入 RL 状态时重置参考时间轴和模型侧状态 */
     virtual void Reset(const robot_base::RobotData &robot) = 0;
+    /** @brief Initialize from SDK-order applied joint targets during an RL handoff. */
+    virtual void ResetForHandoff(const robot_base::RobotData &robot,
+                                const std::vector<double> &targets) {
+        (void)targets;
+        Reset(robot);
+    }
+    virtual std::string EntryError(const robot_base::RobotData &) const { return {}; }
 
     /** @brief Select a preloaded executor without leaving RL or resetting history. */
     virtual rl_policy::PolicyExecutor &SelectExecutor(

@@ -416,11 +416,23 @@ public:
                 return;
             }
             if (hot_switch_requested && fsm.CurrentState() == StateName::RL &&
-                !fault.latched && !fsm.ReadyForPolicySwitch()) {
-                if (policy_switch_status.phase == robot_base::PolicySwitchStatus::Phase::PREPARING)
-                    policy_switch_status.detail = "waiting for current policy to finish its handoff";
-                return;
+                !fault.latched) {
+                // Prepared states have no FSM sensor pointer yet. Check the target
+                // against the live sensor clock before releasing the current RL.
+                const auto entry_error = prepared_policy->rl->EntryError(sensor);
+                if (!entry_error.empty()) {
+                    if (policy_switch_status.phase == robot_base::PolicySwitchStatus::Phase::PREPARING)
+                        policy_switch_status.detail = "waiting for target policy: " + entry_error;
+                    return;
+                }
+                if (!fsm.ReadyForPolicySwitch()) {
+                    if (policy_switch_status.phase == robot_base::PolicySwitchStatus::Phase::PREPARING)
+                        policy_switch_status.detail = "waiting for current policy to finish its handoff";
+                    return;
+                }
             }
+            if (policy_switch_status.phase == robot_base::PolicySwitchStatus::Phase::PREPARING)
+                policy_switch_status.detail.clear();
             InstallPreparedPolicy(std::move(*prepared_policy));
             prepared_policy.reset();
             return;
@@ -982,9 +994,10 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
     impl_->ResolveObservedFaults();
     const bool running_switch = impl_->hot_switch_requested &&
         impl_->fsm.CurrentState() == StateName::RL;
+    const bool switch_timed_out = running_switch &&
+        MonotonicTimeSeconds() - impl_->switch_started_s > impl_->switch_timeout_s;
     if (running_switch && (impl_->fault.latched || impl_->command.key == -1 ||
-        impl_->command.key == 1 || MonotonicTimeSeconds() - impl_->switch_started_s >
-            impl_->switch_timeout_s)) {
+        impl_->command.key == 1 || switch_timed_out)) {
         if (impl_->pending_policy == impl_->action_target ||
             impl_->pending_policy == impl_->action_owner) impl_->FinishPolicyAction(false);
         impl_->pending_policy = impl_->active_policy;
@@ -993,7 +1006,12 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
         impl_->final_target_policy.clear();
         if (impl_->policy_switch_status.phase == robot_base::PolicySwitchStatus::Phase::PREPARING) {
             impl_->policy_switch_status.phase = robot_base::PolicySwitchStatus::Phase::REJECTED;
-            impl_->policy_switch_status.detail = "policy handoff cancelled or timed out; current policy retained";
+            const auto waiting_reason = impl_->policy_switch_status.detail;
+            impl_->policy_switch_status.detail = switch_timed_out
+                ? "policy handoff timed out; current policy retained"
+                : "policy handoff cancelled; current policy retained";
+            if (switch_timed_out && !waiting_reason.empty())
+                impl_->policy_switch_status.detail += ": " + waiting_reason;
         }
     }
     impl_->fsm.RequestPolicySwitch(impl_->hot_switch_requested && impl_->prepared_policy &&

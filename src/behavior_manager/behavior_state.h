@@ -24,6 +24,7 @@ public:
 
     // 进入状态
     virtual void OnEnter() = 0;
+    virtual std::string EntryError(const robot_base::RobotData &) const { return {}; }
     // 状态执行（每控制周期调用）
     virtual void Run(float control_dt, float rl_dt) = 0;
     // 检查状态切换条件

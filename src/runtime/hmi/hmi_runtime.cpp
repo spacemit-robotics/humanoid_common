@@ -33,7 +33,6 @@ int main(int argc, char *argv[]) {
             }
             if (option == "--sim" || option == "--real") {
                 if (selected_mode) throw std::runtime_error("specify only one of --sim or --real");
-                config.terminal_only = option == "--sim";
                 selected_mode = true;
                 continue;
             }

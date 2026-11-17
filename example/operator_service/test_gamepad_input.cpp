@@ -157,9 +157,6 @@ int main() {
     using operator_gamepad::MakeLayout;
     using operator_gamepad::Normalize;
     using operator_gamepad::Chords;
-    using operator_gamepad::Scale;
-    using operator_gamepad::SpeedCaps;
-    using operator_gamepad::Advance;
     using operator_gamepad::Neutral;
     const auto ds4 = MakeLayout("ds4_generic"), xbox = MakeLayout("xbox");
     assert(ds4.buttons.at(305) == "A" && ds4.buttons.at(304) == "X");
@@ -187,29 +184,7 @@ int main() {
     assert(chords.Update({"RB", "Y"}).size() == 1);  // Either button may come first.
     chords.Reset({"RB", "Y"});  // SYN_DROPPED snapshot must not replay a chord.
     assert(chords.Update({"RB", "Y"}).empty());
-    operator_service::Policy policy;
-    policy.minimum = {-1, -0.3, -1};
-    policy.maximum = {2, 0.4, 1};
-    const std::array<double, 3> fallback{0.6, 0.6, 1};
-    assert(SpeedCaps(policy, false, fallback) == fallback);
-    policy.slow_limits = operator_service::Velocity{0.7, 0.4, 1};
-    policy.fast_limits = policy.slow_limits;
-    assert(SpeedCaps(policy, false, fallback)[0] == 0.7);
-    assert(SpeedCaps(policy, false, fallback) == SpeedCaps(policy, true, fallback));
-    const auto v = Scale({1, -1, 0.5}, policy, {0.6, 0.6, 1.0});
-    assert(v.vx == 0.6 && v.vy == -0.3 && v.wz == 0.5);
-    assert(Scale({-1, 0, 0}, policy, {1.5, 0.6, 1}).vx == -1);
-    policy.minimum.vx = -0.6;
-    assert(Scale({1, 0, 0}, policy, {0.6, 0.6, 1}).vx == 0.6);
-    assert(Scale({1, 0, 0}, policy, {1.5, 0.6, 1}).vx == 1.5);
-    assert(Scale({-1, 0, 0}, policy, {0.6, 0.6, 1}).vx == -0.6);
-    assert(Scale({-1, 0, 0}, policy, {1.5, 0.6, 1}).vx == -0.6);
-    assert(Scale({-0.5, 0, 0}, policy, {1.5, 0.6, 1}).vx == -0.3);
-    assert(Advance(0, 1, 1, 2.5, 0.02) == 0.02);
-    assert(std::abs(Advance(1, 0, 1, 2.5, 0.02) - 0.95) < 1e-12);
-    assert(Advance(0.1, -1, 1, 2, 0.1) < 0);
-    policy.minimum = {};
-    policy.maximum = {};
-    assert(Neutral(Scale({1, 1, 1}, policy, {1, 1, 1})));  // Dance stays stationary.
-    std::puts("gamepad input: layout, deadzone, chord edges/holds, reconnect, scaling and ramps passed");
+    assert(Neutral({}));
+    assert(!Neutral({0.1, 0, 0}));
+    std::puts("gamepad input: layout, deadzone, chord edges/holds and reconnect passed");
 }

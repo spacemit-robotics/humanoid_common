@@ -6,6 +6,7 @@
  */
 #ifndef OPERATOR_TYPES_H
 #define OPERATOR_TYPES_H
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -26,11 +27,21 @@ struct Policy {
     Velocity minimum;
     Velocity maximum;
     std::vector<Action> actions;
-    bool client_smoothing = true;  // Web/WebView velocity ramps; false delegates smoothing to the policy.
+    bool client_smoothing = true;  // Legacy name: service ramps; false delegates smoothing to the policy.
     std::string switch_group;  // Explicitly compatible live-switch policies; empty disables it.
     std::string display_name;
     std::optional<Velocity> slow_limits;
     std::optional<Velocity> fast_limits;
+    bool HasSpeedModes() const {
+        if (!slow_limits || !fast_limits) return false;
+        const auto different = [](double low, double high, double slow, double fast) {
+            return std::min(std::max(0.0, -low), slow) != std::min(std::max(0.0, -low), fast) ||
+                std::min(std::max(0.0, high), slow) != std::min(std::max(0.0, high), fast);
+        };
+        return different(minimum.vx, maximum.vx, slow_limits->vx, fast_limits->vx) ||
+            different(minimum.vy, maximum.vy, slow_limits->vy, fast_limits->vy) ||
+            different(minimum.wz, maximum.wz, slow_limits->wz, fast_limits->wz);
+    }
 };
 struct Fault {
     bool active = false;
@@ -69,6 +80,8 @@ struct Status {
     uint64_t teleop_preset_sequence = 0;
     RequestResult request;
     bool trajectory_enabled = false;
+    Velocity target_velocity;
+    Velocity command_velocity;
 };
 struct Reply {
     bool ok = false;

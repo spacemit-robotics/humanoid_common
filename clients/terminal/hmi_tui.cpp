@@ -105,7 +105,7 @@ void Run(operator_service::Client *client) {
     operator_terminal::View view;
     view.policies = client->Policies();
     view.actions = client->Actions();
-    const auto step = client->VelocityStep();
+    operator_service::Velocity input;
     auto last_renew = Clock::now(), last_velocity = last_renew, highlight_until = last_renew;
     uint64_t pending = 0;
     std::string previous_policy;
@@ -115,7 +115,8 @@ void Run(operator_service::Client *client) {
     };
     const auto clear = [&] {
         view.target_command = {};
-        if (view.status.owns_control && view.status.state == "RL") client->SetVelocity({});
+        input = {};
+        if (view.status.owns_control && view.status.state == "RL") client->PostTeleopInput({});
     };
     const auto transition = [&](const std::string &s) {
         clear();
@@ -128,10 +129,11 @@ void Run(operator_service::Client *client) {
         view.status = client->LatestStatus();
         const auto &s = view.status;
         if (s.policy != previous_policy) {
-            view.target_command = {};
+            input = {};
             previous_policy = s.policy;
         }
-        if (!s.owns_control || !s.online || s.state != "RL") view.target_command = {};
+        if (!s.owns_control || !s.online || s.state != "RL" || s.fault.latched) input = {};
+        view.target_command = s.target_velocity;
         if (pending && s.request.sequence == pending && s.request.phase != "accepted") {
             view.last_action =
                 s.request.phase == "completed" ? "请求已确认" : s.request.phase + ": " + s.request.message;
@@ -163,7 +165,7 @@ void Run(operator_service::Client *client) {
             reply(client->ReleaseControl(), "释放控制权");
         } else if (key == ' ') {
             clear();
-            view.last_action = "速度已清零";
+            view.last_action = "目标速度归零，减速停车";
         } else if (key == 'x') reply(client->AcknowledgeFault(), "确认故障");
         else if (key == 'c') reply(client->CancelInteraction(), "取消动作");
         else if (key == 'g' && !s.trajectory_enabled) {
@@ -179,16 +181,14 @@ void Run(operator_service::Client *client) {
                 view.page = Page::MAIN;
             }
             if (s.owns_control && s.state == "RL" && policy != view.policies.end()) {
-                auto &v = view.target_command;
-                if (key == 'w') v.vx += step.vx;
-                if (key == 's') v.vx -= step.vx;
-                if (key == 'a') v.vy += step.vy;
-                if (key == 'd') v.vy -= step.vy;
-                if (key == 'q') v.wz += step.wz;
-                if (key == 'e') v.wz -= step.wz;
-                v.vx = std::clamp(v.vx, policy->minimum.vx, policy->maximum.vx);
-                v.vy = std::clamp(v.vy, policy->minimum.vy, policy->maximum.vy);
-                v.wz = std::clamp(v.wz, policy->minimum.wz, policy->maximum.wz);
+                if (key == 'w') input.vx = 1;
+                if (key == 's') input.vx = -1;
+                if (key == 'a') input.vy = 1;
+                if (key == 'd') input.vy = -1;
+                if (key == 'q') input.wz = 1;
+                if (key == 'e') input.wz = -1;
+                if (key == 'b' && policy->HasSpeedModes()) reply(client->SetTeleopPreset(
+                    s.teleop_preset == "fast" ? "slow" : "fast"), "切换快慢档");
             }
         } else if (view.page == Page::POLICY_SELECT || view.page == Page::INTERACTION_SELECT) {
             const bool policies = view.page == Page::POLICY_SELECT;
@@ -225,10 +225,12 @@ void Run(operator_service::Client *client) {
             if (key == 'z') transition("ZERO");
             if (key == 'r') transition(s.trajectory_enabled ? "TRAJECTORY" : "RL");
         }
-        if (s.owns_control && s.state == "RL" && now - last_velocity >= std::chrono::milliseconds(100)) {
-            const auto r = client->SetVelocity(view.target_command);
+        if (s.owns_control && s.state == "RL" && now - last_velocity >= std::chrono::milliseconds(50)) {
+            auto r = client->LatestVelocityReply();
+            if (r.ok) r = client->PostTeleopInput(input);
             if (!r.ok) {
-                view.target_command = {};
+                input = {};
+                client->PostTeleopInput({});
                 reply(r, "速度请求");
             }
             last_velocity = now;

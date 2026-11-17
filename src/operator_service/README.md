@@ -37,9 +37,9 @@ hmi_runtime /absolute/path/robot.yaml --sim
 hmi_tui --connection "$HOME/.local/state/humanoid-operator/robot/connection.json"
 ```
 
-`--sim` 只接受本机 TUI，不提供网页、App 配对或二维码，绑定回环地址，连接凭据仅在
-本次运行有效。`--real` 启用实机客户端入口；不传模式时按 YAML 的 `driver.backend`
-选择，只有 `whole_body` 启用实机入口。driver 与 HMI 的模式须一致，一键启动脚本统一传入。
+仿真与实机使用同一套 TUI、网页、App 和手柄入口，默认监听回环地址。
+手机连接仿真时同样需要显式配置 `--listen` 和可达的 `--public-url`；
+`--sim`、`--real` 不改变客户端能力，driver 后端仍由启动方式选择。
 
 `--terminal-only` 或 `operator_service.terminal_only: true` 可让实机仅使用本机客户端，
 绑定回环地址且不提供网页和二维码，不影响 driver 后端。
@@ -69,7 +69,7 @@ hmi_runtime /absolute/path/robot.yaml --real --export-pairing --public-url http:
 
 实机网页可从同一服务下载 `/downloads/SpacemiT-Operator.apk`，支持 GET/HEAD，文件位于
 `operator_web/downloads/`。这是不含凭据的安装包，不要求操作权限；下载不授予控制权。
-APK 缺失时返回 404，网页隐藏下载按钮；仿真仍禁用网页、App 和 APK 下载入口。
+APK 缺失时返回 404，网页隐藏下载按钮；`terminal-only` 不提供下载入口。
 YAML `operator_service.voice_chat_port` 大于 0 时，扫码首页默认语音，底部保留管理员入口。
 手机浏览器只在 HTTPS 页面里允许录音，所以语音由机器人上的语音服务提供：它给本控制台套一层 HTTPS
 （除 `/voice/` 外的请求原样转发到本服务，含 WebSocket），并提供语音面板 `/voice/panel.js`。网页在 HTTPS
@@ -93,7 +93,8 @@ control 实际回报的状态，不把“已受理”当作“已完成”。
 - 网页控制权栏显示已确认的持有者，如“手柄已接管控制权”；横屏移动页也显示，
   释放后恢复“无人持有”，状态过期显示“等待状态确认”。只翻译显示，不改变控制权逻辑。
 - 默认控制权有效期 1000 ms，客户端存活期间续租。速度另有有效期，默认 300 ms。
-- 断连、后台、控制权过期或 control 反馈超时会清零速度、取消待处理请求与交互动作。
+- 松手、速度有效期结束、断连、后台或控制权过期时，服务端将目标归零并按配置减速，取消待处理请求与交互动作。
+- 明确的 `stop`、POWER_OFF/DAMP、离开 RL、控制反馈过期或故障立即清零；不为普通遥控断连请求掉电。
 - 清零不会自动 DAMP 或掉电，避免站立机器人因遥控断连突然卸力。原 control 安全保护仍有效。
 - 控制客户端可执行停止、DAMP 或 POWER_OFF；启用管理员密码后，公开扫码会话不能发送这些命令。
 - HOME/ZERO/RL 不跳过前置状态；RL 仍要求 ZERO 已到位，不改变原闭环阈值。
@@ -121,7 +122,7 @@ Web/WebView 的连接恢复与运动输入分开：速度回执延迟或缺失�
 服务拒绝时清除相关输入。发送缓冲未清空时不追加中间速度，恢复后发送最新目标，
 包括松手的零目标。摇杆仅增加空间死区与范围裁剪，不额外增加时间滤波。
 
-`operator_service.teleop` 配置档位和客户端加减速度：
+`operator_service.teleop` 配置档位和服务端加减速度：
 
 ```yaml
 operator_service:
@@ -137,13 +138,14 @@ operator_service:
 零限速方向不可操作，切换策略后重新计算范围。
 
 各策略可在 `command.teleop` 中配置 `slow_limits`、`fast_limits`，分别覆盖全局同名档位。
-数值仍与该策略的 `command.limits` 取交集，网页、WebView 和手柄共用这些配置。
+数值仍与该策略的 `command.limits` 取交集，网页、WebView、手柄和 TUI 共用这些配置。
 两档实际范围相同时，网页隐藏快慢档按钮；机型也应省略该策略的手柄档位切换绑定。
 切换策略时，网页按新策略的档位重新填写速度，不沿用上一策略的较低数值。
 
-默认客户端按斜坡加减速，反向先降到零再加速；松手目标归零。
-策略配置 `command.client_smoothing: false` 时，客户端直接发送目标，由策略处理缓变。
-此字段随 catalog 下发，缺省为 `true`。按键和摇杆使用同一规则，不按机型或模型名称分支。
+客户端发送方向/推幅，服务端按当前策略和档位换算目标，在自己的时钟上按斜坡加减速，反向先降到零再加速。
+客户端不再计算时间平滑，也不等待上一条速度回执。目标速度、发给 control 的速度与 control 实际采用速度分别回报。
+策略配置 `command.smoothing: false` 时直接传递目标，由策略处理缓变；兼容原 `command.client_smoothing` 配置名。
+默认启用服务端平滑。目录中的 `service_smoothing` 表示此配置，旧 `client_smoothing` 始终为 false，避免旧网页重复平滑。
 
 切换页面、失焦、进入后台、释放控制权或故障会清除旧输入；重新连接不恢复旧动作。
 普通松手不释放控制权。桌面空格和协议 `stop` 清零并释放控制权，网页不显示全局停止按钮。
@@ -153,9 +155,9 @@ operator_service:
 ### 终端
 
 终端按 `L` 接管，右箭头依次前进，左箭头退回；`p` 选策略，`A` 选动作，`G` 开始
-手动参考动作，`v` 进入速度页。速度页保留 `Q/W/E`、`A/S/D` 六键，空格只清零速度，
+手动参考动作，`v` 进入速度页。速度页保留 `Q/W/E`、`A/S/D` 六键，按当前档位持续移动；`B` 切换快慢档，空格将目标归零，
 `U` 释放控制权，`X` 确认故障，`Ctrl+C` 退出。速度页 `Esc` 清零后返回。
-按键步长继续读取 `hmi.velocity.step_*`，默认 0.1。终端不承担扫码入口显示。
+终端没有松键事件，松开按键不会停，须按空格；退出速度页清除方向。终端不承担扫码入口显示。
 网页方块按钮与终端 `C` 都发送 `cancel`，取消当前动作并按配置收回，不掉电；网页不再显示全局停止按钮。
 
 服务在现有 HMI 日志会话的 `events.log` 记录接管、释放、状态/策略/动作请求及确认结果。
@@ -211,12 +213,16 @@ WebSocket 路径 `/api/v1/ws`；JSON UTF-8 文本，版本 `v: 1`。建立连接
 | state | `{"state":"ZERO"}` | 请求状态切换，返回请求序号 |
 | policy | `{"policy":"name"}` | 请求切换策略 |
 | velocity | `{"vx":0.1,"vy":0,"wz":0,"valid_for_ms":300}` | 短期速度指令，服务按策略范围限幅 |
+| teleop | `{"vx":1,"vy":0,"wz":0,"valid_for_ms":300}` | 归一化方向/推幅，范围 -1..1，由服务端换算档位和平滑 |
+| preset | `{"name":"fast"}` | 持有者选择 slow/fast，成功后在状态和语音中确认 |
 | stop | `{}` | 清零、撤销控制权和未完成请求；不是硬件急停 |
 | interaction / cancel | `{"action":"key"}` / `{}` | 开始、取消交互动作 |
 | reference_start | `{}` | 开始手动参考动作 |
 | ack | `{}` | POWER_OFF 下确认已解除的锁存故障 |
 
 状态包含 `online/state/zero_ready/policy/velocity/fault/owner/owns_control/interaction/request`。
+`target_velocity` 是限幅后的目标，`command_velocity` 是服务端平滑输出，`velocity` 是 control 的实际回报。
+`velocity` 操作使用 m/s、rad/s，不套用遥控档位；`teleop` 操作使用归一化输入，两者共用服务端平滑。
 网页状态额外包含 `admin/admin_login_pending/admin_login_error`；`admin_login` 返回 `pending` 后
 通过这些字段确认验证结果。C++ 客户端结构和接口保持不变。
 `request.phase` 区分 `accepted/completed/rejected/expired/cancelled`。`completed` 表示

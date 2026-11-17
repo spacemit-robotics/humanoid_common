@@ -15,6 +15,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <thread>
 
@@ -41,7 +42,15 @@ struct Client::Impl {
     Connection connection;
     std::string host;
     std::string port;
-    std::deque<std::string> writes;
+    struct Outgoing {
+        uint64_t id;
+        std::string message;
+        bool velocity;
+    };
+    std::deque<std::shared_ptr<Outgoing>> writes;
+    std::set<uint64_t> velocity_requests;
+    uint64_t velocity_reply_id = 0;
+    Reply velocity_reply{true, "idle", "", {}};
     std::map<uint64_t, Json> replies;
     uint64_t next_id = 0;
     uint64_t waiting_id = 0;
@@ -78,6 +87,12 @@ struct Client::Impl {
                 } else if (message.contains("id") && message.at("id") == waiting_id) {
                     replies[waiting_id] = message;
                     condition.notify_all();
+                } else if (message.contains("id")) {
+                    const auto id = message.at("id").get<uint64_t>();
+                    if (velocity_requests.erase(id) && id > velocity_reply_id) {
+                        velocity_reply_id = id;
+                        velocity_reply = DecodeReply(message);
+                    }
                 }
             } catch (const std::exception &e) {
                 Fail(net::error::invalid_argument, e.what());
@@ -88,7 +103,8 @@ struct Client::Impl {
         });
     }
     void Write() {
-        socket.async_write(net::buffer(writes.front()), [this](boost::system::error_code ec, size_t) {
+        const auto message = writes.front();
+        socket.async_write(net::buffer(message->message), [this, message](boost::system::error_code ec, size_t) {
             if (ec) {
                 Fail(ec);
                 return;
@@ -98,6 +114,41 @@ struct Client::Impl {
                 Write();
         });
     }
+    void Queue(uint64_t id, std::string message, bool velocity) {
+        // Keep the in-flight buffer alive; replace only unsent velocity updates.
+        net::post(io, [this, id, message = std::move(message), velocity] {
+            if (velocity && !writes.empty()) {
+                std::lock_guard<std::mutex> lock(mutex);
+                auto it = std::next(writes.begin());
+                while (it != writes.end()) {
+                    if ((*it)->velocity) {
+                        velocity_requests.erase((*it)->id);
+                        it = writes.erase(it);
+                    } else ++it;
+                }
+            }
+            const bool idle = writes.empty();
+            writes.push_back(std::make_shared<Outgoing>(Outgoing{id, message, velocity}));
+            if (idle) Write();
+        });
+    }
+    Reply PostVelocity(const Velocity &input, int ttl) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!connected) return {false, "disconnected", "service disconnected", {}};
+        const auto id = ++next_id;
+        auto args = Encode(input);
+        args["valid_for_ms"] = ttl;
+        velocity_requests.insert(id);
+        while (velocity_requests.size() > 128) velocity_requests.erase(velocity_requests.begin());
+        Queue(id, Json{{"v", 1}, {"id", id}, {"op", "teleop"}, {"args", args}}.dump(), true);
+        return {true, "queued", "input queued; confirmation is asynchronous", {}};
+    }
+    void ResetVelocityReplies() {
+        std::lock_guard<std::mutex> lock(mutex);
+        velocity_requests.clear();
+        velocity_reply_id = next_id;
+        velocity_reply = {true, "idle", "", {}};
+    }
     Json Call(const std::string &op, const Json &args = Json::object()) {
         std::lock_guard<std::mutex> serial(request_mutex);
         std::unique_lock<std::mutex> lock(mutex);
@@ -106,12 +157,7 @@ struct Client::Impl {
         const auto id = ++next_id;
         waiting_id = id;
         const auto message = Json{{"v", 1}, {"id", id}, {"op", op}, {"args", args}}.dump();
-        net::post(io, [this, message] {
-            const bool idle = writes.empty();
-            writes.push_back(message);
-            if (idle)
-                Write();
-        });
+        Queue(id, message, false);
         condition.wait_for(
             lock, std::chrono::milliseconds(connection.timeout_ms), [&] { return !connected || replies.count(id); });
         waiting_id = 0;
@@ -256,20 +302,46 @@ Velocity Client::VelocityStep() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->velocity_step;
 }
-Reply Client::AcquireControl() { return DecodeReply(impl_->Call("acquire")); }
+Reply Client::AcquireControl() {
+    const auto reply = DecodeReply(impl_->Call("acquire"));
+    if (reply.ok) impl_->ResetVelocityReplies();
+    return reply;
+}
 Reply Client::RenewControl() { return DecodeReply(impl_->Call("renew")); }
-Reply Client::ReleaseControl() { return DecodeReply(impl_->Call("release")); }
-Reply Client::RequestState(const std::string &s) { return DecodeReply(impl_->Call("state", {{"state", s}})); }
-Reply Client::SelectPolicy(const std::string &s) { return DecodeReply(impl_->Call("policy", {{"policy", s}})); }
+Reply Client::ReleaseControl() {
+    impl_->ResetVelocityReplies();
+    return DecodeReply(impl_->Call("release"));
+}
+Reply Client::RequestState(const std::string &s) {
+    impl_->ResetVelocityReplies();
+    return DecodeReply(impl_->Call("state", {{"state", s}}));
+}
+Reply Client::SelectPolicy(const std::string &s) {
+    impl_->ResetVelocityReplies();
+    return DecodeReply(impl_->Call("policy", {{"policy", s}}));
+}
 Reply Client::SetVelocity(const Velocity &v, int ttl) {
     auto args = Encode(v);
     args["valid_for_ms"] = ttl;
     return DecodeReply(impl_->Call("velocity", args));
 }
-Reply Client::SetTeleopPreset(const std::string &preset) {
-    return DecodeReply(impl_->Call("client_event", {{"event", "teleop_preset"}, {"detail", preset}}));
+Reply Client::SetTeleopInput(const Velocity &v, int ttl) {
+    auto args = Encode(v);
+    args["valid_for_ms"] = ttl;
+    return DecodeReply(impl_->Call("teleop", args));
 }
-Reply Client::Stop() { return DecodeReply(impl_->Call("stop")); }
+Reply Client::PostTeleopInput(const Velocity &v, int ttl) { return impl_->PostVelocity(v, ttl); }
+Reply Client::LatestVelocityReply() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->velocity_reply;
+}
+Reply Client::SetTeleopPreset(const std::string &preset) {
+    return DecodeReply(impl_->Call("preset", {{"name", preset}}));
+}
+Reply Client::Stop() {
+    impl_->ResetVelocityReplies();
+    return DecodeReply(impl_->Call("stop"));
+}
 Reply Client::StartInteraction(const std::string &s) {
     return DecodeReply(impl_->Call("interaction", {{"action", s}}));
 }

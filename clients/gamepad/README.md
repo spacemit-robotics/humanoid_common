@@ -45,15 +45,16 @@ LB/RB 单键长按与 LB+RB 并存时，从第二键按下重新计时；组合�
 静止摇杆没有输入事件，不能据此判断断连。客户端通过 evdev HUP/ENODEV 检测设备断开；
 接收器须在无线连接中断时撤销输入设备，不支持断连后继续保留旧轴值的接收器。
 
-速度在 50 Hz 上限下刷新，有效期 300 ms，租约每 250 ms 续期；沿用 HMI 的租约和失联站立行为。
+归一化输入在 50 Hz 上限下刷新，有效期 300 ms，租约每 250 ms 续期；沿用 HMI 的租约和失联站立行为。
 本地请求回执上限 500 ms，单次慢回执不主动断开连接，也不重试状态切换；
-速度请求失败后回中重新操作。按键读取先排空积压到最新完整报告，SYN_DROPPED 读取快照清零。
+速度流通过 `PostTeleopInput` 只保留最新待发目标，不等待逐帧回执；明确被拒绝后回中重新操作。
+按键读取先排空积压到最新完整报告，SYN_DROPPED 读取快照清零。
 无速度日志刷屏，只记录设备、控制权、状态、组合键结果及首次变化的错误。
 
-速度限额、死区、加减速复用 `operator_service.teleop`，并与当前策略 limits 取交集。
-策略的 `command.teleop.slow_limits/fast_limits` 可覆盖全局档位；未配置则沿用全局值。
-`client_smoothing: false` 的策略已有内部平滑，客户端不叠加一次；其他策略沿用网页同样的线性斜坡。
-preset 通过公开 `Client::SetTeleopPreset` 报告成功档位，使音频观察器复用原事件。
+死区属于手柄输入处理；速度限额、快慢档与加减速统一由操作服务按 `operator_service.teleop` 处理。
+策略的 `command.teleop.slow_limits/fast_limits` 可覆盖全局档位；客户端不保存另一份速度配置。
+`command.smoothing: false` 的策略由自身平滑，服务端不叠加一次。手柄不计算时间斜坡。
+preset 通过公开 `Client::SetTeleopPreset` 选择，按服务确认的档位显示并触发音频。
 模型准备、手臂或舞蹈执行、故障时不发送摇杆非零速度。
 
 可选 `rumble` 配置：`enabled: true`、`backend: ds4_usb`、`device: HIDRAW_BY_ID`、

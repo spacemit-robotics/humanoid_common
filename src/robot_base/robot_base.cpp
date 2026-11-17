@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <sstream>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -191,6 +192,8 @@ template std::optional<std::vector<int>> YamlFile::Read<std::vector<int>>(
     const std::string &) const;
 template std::optional<std::vector<std::string>> YamlFile::Read<std::vector<std::string>>(
     const std::string &) const;
+template std::optional<std::map<std::string, std::string>>
+YamlFile::Read<std::map<std::string, std::string>>(const std::string &) const;
 
 std::string YamlFile::ToAbsPath(const std::string &path) const {
     fs::path p(path);

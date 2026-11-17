@@ -72,6 +72,16 @@ bool Busy(robot_base::InteractionStatus::Phase p) {
 bool SupportsInteraction(robot_base::ControlMode mode) {
     return mode == robot_base::ControlMode::RL || mode == robot_base::ControlMode::TRAJECTORY;
 }
+double Advance(double value, double target, double acceleration, double deceleration, double dt) {
+    if (value * target < 0) {
+        const auto braking = std::abs(value) / deceleration;
+        if (dt <= braking) return value - std::copysign(deceleration * dt, value);
+        dt -= braking;
+        value = 0;
+    }
+    const auto rate = std::abs(target) > std::abs(value) ? acceleration : deceleration;
+    return value + std::clamp(target - value, -rate * dt, rate * dt);
+}
 std::vector<Action> LoadActions(const robot_base::YamlFile &yaml, const std::string &catalog) {
     std::vector<Action> actions;
     for (const auto &key :
@@ -149,8 +159,7 @@ std::string PairingSvg(const std::string &url) {
 Config LoadConfig(const std::string &path) {
     const auto yaml = robot_base::YamlFile::Load(path);
     Config c;
-    c.terminal_only = yaml.Read<bool>("operator_service.terminal_only").value_or(
-        yaml.Read<std::string>("driver.backend").value_or("mujoco") != "whole_body");
+    c.terminal_only = yaml.Read<bool>("operator_service.terminal_only").value_or(false);
     c.robot = yaml.Read<std::string>("robot_base.name").value_or("robot");
     if (c.robot.empty() || c.robot.size() > 64 ||
         c.robot.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") !=
@@ -223,7 +232,8 @@ Config LoadConfig(const std::string &path) {
         p.name = name;
         const std::string base = "rl_policy.onnx_infer.policies." + name;
         p.display_name = yaml.Read<std::string>(base + ".display_name").value_or(name);
-        p.client_smoothing = yaml.Read<bool>(base + ".command.client_smoothing").value_or(true);
+        p.client_smoothing = yaml.Read<bool>(base + ".command.smoothing").value_or(
+            yaml.Read<bool>(base + ".command.client_smoothing").value_or(true));
         p.switch_group = yaml.Read<std::string>(base + ".switch_group").value_or("");
         p.manual_reference =
             yaml.Read<std::string>(base + ".policy_adapter.start_mode")
@@ -262,6 +272,14 @@ Service::Service(Config config) : config_(std::move(config)) {
         throw std::runtime_error("invalid operator admin_password_hash");
     if (!config_.admin_password_hash.empty() && TokenEqual(config_.control_token, config_.token))
         throw std::runtime_error("public and control tokens must differ when administrator access is enabled");
+    for (auto &policy : config_.policies) {
+        const Velocity full{std::max(-policy.minimum.vx, policy.maximum.vx),
+            std::max(-policy.minimum.vy, policy.maximum.vy), std::max(-policy.minimum.wz, policy.maximum.wz)};
+        if (!policy.slow_limits) policy.slow_limits = config_.teleop.slow_limits.value_or(
+            Velocity{full.vx * 0.4, full.vy * 0.4, full.wz * 0.4});
+        if (!policy.fast_limits) policy.fast_limits = config_.teleop.fast_limits.value_or(full);
+    }
+    velocity_at_ = Now();
 }
 uint64_t Service::Open() {
     if (sessions_.size() >= 32) return 0;
@@ -301,17 +319,65 @@ void Service::Finish(const std::string &phase, const std::string &message) {
         "operator request #" + std::to_string(result_.sequence) + " " + result_.operation + " " + phase + ": " +
             message);
 }
-void Service::ClearInput(const std::string &reason) {
+void Service::ClearVelocity(bool immediate) {
+    velocity_input_ = {};
+    target_velocity_ = {};
+    normalized_input_ = false;
+    velocity_until_ = 0;
+    const auto *policy = ActivePolicy();
+    if (immediate || !policy || !policy->client_smoothing) command_.vx = command_.vy = command_.wz = 0;
+}
+Velocity Service::TeleopTarget(const Policy &policy) const {
+    const auto &caps = *(teleop_preset_ == "fast" ? policy.fast_limits : policy.slow_limits);
+    const auto scale = [](double input, double low, double high, double cap) {
+        return input * std::min(cap, input >= 0 ? std::max(0.0, high) : std::max(0.0, -low));
+    };
+    return {scale(velocity_input_.vx, policy.minimum.vx, policy.maximum.vx, caps.vx),
+        scale(velocity_input_.vy, policy.minimum.vy, policy.maximum.vy, caps.vy),
+        scale(velocity_input_.wz, policy.minimum.wz, policy.maximum.wz, caps.wz)};
+}
+void Service::AdvanceVelocity(double now) {
+    const auto dt = std::clamp(now - velocity_at_, 0.0, 0.1);
+    velocity_at_ = now;
+    const auto *policy = ActivePolicy();
+    if (!Online() || !policy || status_.mode != robot_base::ControlMode::RL || fault_.latched || fault_.active) {
+        ClearVelocity(true);
+        return;
+    }
+    if (now >= velocity_until_) ClearVelocity(false);
+    target_velocity_ = normalized_input_ ? TeleopTarget(*policy) : velocity_input_;
+    const auto &a = config_.teleop.acceleration;
+    const auto &d = config_.teleop.deceleration;
+    if (policy->client_smoothing) {
+        command_.vx = Advance(command_.vx, target_velocity_.vx, a.vx, d.vx, dt);
+        command_.vy = Advance(command_.vy, target_velocity_.vy, a.vy, d.vy, dt);
+        command_.wz = Advance(command_.wz, target_velocity_.wz, a.wz, d.wz, dt);
+    } else {
+        command_.vx = target_velocity_.vx;
+        command_.vy = target_velocity_.vy;
+        command_.wz = target_velocity_.wz;
+    }
+}
+bool Service::SelectPreset(uint64_t session, const std::string &preset) {
+    if (owner_ != session || !Online() || (preset != "slow" && preset != "fast")) return false;
+    const auto *policy = ActivePolicy();
+    const auto selected = policy && !policy->HasSpeedModes() ? "slow" : preset;
+    if (teleop_preset_ != selected) {
+        teleop_preset_ = selected;
+        ++teleop_preset_sequence_;
+    }
+    return true;
+}
+void Service::ClearInput(const std::string &reason, bool immediate) {
     if (owner_) runtime_logging::Log(runtime_logging::Level::kInfo, "operator control released: " + reason);
     if (result_.phase == "accepted") Finish("cancelled", reason);
     owner_ = 0;
     lease_until_ = 0;
-    velocity_until_ = 0;
+    ClearVelocity(immediate);
     reference_until_ = 0;
     command_.key = 0;
     command_.switch_policy.clear();
     command_.policy_request_sequence = 0;
-    command_.vx = command_.vy = command_.wz = 0;
     acknowledge_sequence_ = 0;
     command_.interaction.sequence = std::max(command_.interaction.sequence, status_.interaction.sequence) + 1;
     command_.interaction.operation = robot_base::InteractionRequest::Operation::CANCEL;
@@ -330,8 +396,7 @@ void Service::Tick() {
         login_session_ = 0;
     }
     if (owner_ && (now >= lease_until_ || !Online())) ClearInput("control lease or feedback expired");
-    if (now >= velocity_until_ || status_.mode != robot_base::ControlMode::RL)
-        command_.vx = command_.vy = command_.wz = 0;
+    AdvanceVelocity(now);
     if (reference_until_ > 0 && now >= reference_until_) {
         command_.key = 0;
         reference_until_ = 0;
@@ -351,7 +416,11 @@ void Service::UpdateStatus(const robot_base::ControlStatus &status, const robot_
     status_at_ = Now();
     status_samples_ = std::min(2, status_samples_ + 1);
     if (changed) {
-        command_.vx = command_.vy = command_.wz = 0;
+        ClearVelocity(true);
+        if (teleop_preset_ != "slow") {
+            teleop_preset_ = "slow";
+            ++teleop_preset_sequence_;
+        }
         reference_until_ = 0;
         if (result_.operation != "state") command_.key = 0;
     }
@@ -394,6 +463,8 @@ Status Service::Snapshot(uint64_t session) const {
     s.age_ms = status_at_ < 0 ? 0 : std::max(0.0, (Now() - status_at_) * 1000);
     s.rl_hz = status_.rl_frequency_hz;
     s.velocity = {status_.vx, status_.vy, status_.wz};
+    s.target_velocity = target_velocity_;
+    s.command_velocity = {command_.vx, command_.vy, command_.wz};
     s.fault = {fault_.active, fault_.latched, fault_.sequence, robot_base::FaultSourceName(fault_.source),
         robot_base::FaultCodeName(fault_.code), fault_.detail};
     const auto it = sessions_.find(owner_);
@@ -483,8 +554,7 @@ Json Service::Handle(uint64_t session, const Json &request) {
             if (event == "teleop_preset") {
                 if (detail != "slow" && detail != "fast") return fail("bad_request", "unknown speed preset");
                 if (owner_ != session || !Online()) return fail("not_owner", "acquire control first");
-                teleop_preset_ = detail;
-                ++teleop_preset_sequence_;
+                SelectPreset(session, detail);
             }
             for (char &c : detail)
                 if (static_cast<unsigned char>(c) < 32 || c == 127) c = ' ';
@@ -526,7 +596,7 @@ Json Service::Handle(uint64_t session, const Json &request) {
         }
         if (!it->second.admin) return fail("admin_required", "administrator login required");
         if (op == "stop") {
-            ClearInput("stopped by authenticated client");
+            ClearInput("stopped by authenticated client", true);
             return ReplyTo(id, true, "ok", "velocity cleared; pending requests cancelled");
         }
         if (op == "release") {
@@ -554,14 +624,19 @@ Json Service::Handle(uint64_t session, const Json &request) {
         if (owner_ != session && !safety_request) return fail("not_owner", "acquire control first");
         if (safety_request) {
             const bool was_owner = owner_ == session;
-            ClearInput("safety state requested");
+            ClearInput("safety state requested", true);
             if (was_owner) {
                 owner_ = session;
                 lease_until_ = Now() + config_.lease_ms / 1000.0;
             }
         }
-        if (op == "velocity") {
-            if (config_.trajectory_enabled || status_.mode != robot_base::ControlMode::RL || fault_.latched)
+        if (op == "preset") {
+            const auto preset = args.value("name", "");
+            if (!SelectPreset(session, preset)) return fail("bad_request", "unknown speed preset");
+            return ReplyTo(id, true, "ok", "speed preset selected");
+        }
+        if (op == "velocity" || op == "teleop") {
+            if (config_.trajectory_enabled || status_.mode != robot_base::ControlMode::RL || fault_.latched || fault_.active)
                 return fail("not_ready", "velocity is only available in healthy RL");
             const auto *policy = ActivePolicy();
             if (!policy) return fail("not_ready", "active policy has no catalog");
@@ -569,12 +644,24 @@ Json Service::Handle(uint64_t session, const Json &request) {
             const int ttl = args.value("valid_for_ms", 300);
             if (!std::isfinite(vx) || !std::isfinite(vy) || !std::isfinite(wz) || ttl < 50 || ttl > 1000)
                 return fail("bad_request", "invalid velocity or validity period");
-            command_.vx = std::clamp(vx, policy->minimum.vx, policy->maximum.vx);
-            command_.vy = std::clamp(vy, policy->minimum.vy, policy->maximum.vy);
-            command_.wz = std::clamp(wz, policy->minimum.wz, policy->maximum.wz);
+            if (result_.phase == "accepted" && result_.operation == "policy")
+                return ReplyTo(id, true, "ok", "stopping for policy switch");
+            normalized_input_ = op == "teleop";
+            velocity_input_ = normalized_input_
+                ? Velocity{std::clamp(vx, -1.0, 1.0), std::clamp(vy, -1.0, 1.0), std::clamp(wz, -1.0, 1.0)}
+                : Velocity{std::clamp(vx, policy->minimum.vx, policy->maximum.vx),
+                    std::clamp(vy, policy->minimum.vy, policy->maximum.vy),
+                    std::clamp(wz, policy->minimum.wz, policy->maximum.wz)};
+            target_velocity_ = normalized_input_ ? TeleopTarget(*policy) : velocity_input_;
+            if (!policy->client_smoothing) {
+                command_.vx = target_velocity_.vx;
+                command_.vy = target_velocity_.vy;
+                command_.wz = target_velocity_.wz;
+            }
             velocity_until_ = Now() + ttl / 1000.0;
             return ReplyTo(id, true, "ok", "velocity accepted",
-                {{"velocity", Encode(Velocity{command_.vx, command_.vy, command_.wz})}});
+                {{"target_velocity", Encode(target_velocity_)},
+                    {"velocity", Encode(Velocity{command_.vx, command_.vy, command_.wz})}});
         }
         if (result_.phase == "accepted") return fail("busy", "waiting for control to confirm previous request");
         if (fault_.latched && !safety_request && op != "ack") return fail("fault", "fault is latched");
@@ -606,7 +693,7 @@ Json Service::Handle(uint64_t session, const Json &request) {
                 active->switch_group == selected->switch_group;
             if (status_.mode != M::POWER_OFF && status_.mode != M::DAMP && !hot)
                 return fail("not_ready", "select policy in POWER_OFF/DAMP or a compatible running group");
-            command_.vx = command_.vy = command_.wz = 0.0;
+            ClearVelocity(false);
             command_.switch_policy = name;
             policy_sequence_ = std::max(policy_sequence_, status_.policy_switch.sequence) + 1;
             if (policy_sequence_ == 0) ++policy_sequence_;

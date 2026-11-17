@@ -82,7 +82,7 @@ make
 ```bash
 run_driver_g1.sh    # 终端1（PC，x86_64）
 run_control_g1.sh   # 终端2（K3 板卡）
-hmi_runtime /absolute/path/g1.yaml --sim # 终端3，仅接受本机 TUI
+hmi_runtime /absolute/path/g1.yaml --sim # 终端3，操作服务
 hmi_tui --connection FILE          # 可选终端客户端，FILE 使用服务启动时显示的路径
 ```
 
@@ -760,9 +760,10 @@ RL 频率均来自 control 端回传，不在 HMI 本地预判。主界面用左
 | `f` | 全局请求 POWER_OFF（完全失力） |
 | `p` | 打开策略选择页；`↑/↓` 或 `j/k` 移动，Enter 确认，Esc 返回 |
 | `v` / `Enter` | 真实状态为 RL 且心跳正常时进入速度控制页 |
-| `w/s` | 速度页内增减 vx |
-| `a/d` | 速度页内增减 vy |
-| `q/e` | 速度页内增减 wz |
+| `w/s` | 速度页按当前档位前进/后退 |
+| `a/d` | 速度页按当前档位左移/右移 |
+| `q/e` | 速度页按当前档位左转/右转 |
+| `b` | 速度页切换快慢档 |
 | `空格` | 速度清零 |
 | `Esc` / `v` | 退出速度页并清零 |
 | `A` / `G` / `C` | 主页面进入动作列表 / 开始手动参考动作 / 平滑取消动作 |
@@ -770,8 +771,8 @@ RL 频率均来自 control 端回传，不在 HMI 本地预判。主界面用左
 | `Ctrl+C` | 退出客户端并释放控制权，不自动掉电 |
 
 `o/h/z/r` 保留为兼容快捷键，但合法性仍由 control 端 FSM 校验。HMI 以配置频率发送
-心跳；退出速度页、离开 RL、HMI 退出或心跳超时都会清零速度。按键步长和通信超时在
-YAML 的 `hmi` 节点配置；速度范围由应用层在每个策略的
+心跳；退出速度页、释放控制权或客户端失联将目标归零，由操作服务减速；离开 RL 和故障立即清零。
+终端没有松键事件，方向键按下后保持该方向，须按空格停止。档位和斜坡由 `operator_service.teleop` 配置；速度范围在每个策略的
 `command.limits.{min_vx,max_vx,min_vy,max_vy,min_wz,max_wz}` 中声明；未配置
 `min_*` 时默认为对应的 `-max_*`。未声明范围的策略不接受速度命令。
 

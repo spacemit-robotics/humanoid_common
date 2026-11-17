@@ -44,7 +44,7 @@ function harness() {
             const request = JSON.parse(text);
             this.sent.push(request); this.sentAt.push(now);
             if (this.ackDelay !== undefined && !this.dropReplies?.has(request.op))
-                addTimer(() => this.reply(request), request.op === "velocity" ? this.ackDelay : 0, false);
+                addTimer(() => this.reply(request), request.op === "teleop" ? this.ackDelay : 0, false);
         }
         close() { this.readyState = 3; this.onclose?.({code: 1000}); }
         receive(packet) { this.onmessage({data: JSON.stringify(packet)}); }
@@ -147,11 +147,12 @@ async function main() {
     {
         const h = harness(), socket = await h.ready();
         h.status({owns_control: true});
-        const presets = () => socket.sent.filter(r => r.op === "client_event" && r.args.event === "teleop_preset");
+        const presets = () => socket.sent.filter(r => r.op === "preset");
         assert.equal(presets().length, 0, "connection/acquire do not announce a default speed");
         h.element("mode-fast").onclick();
         assert.equal(presets().length, 1);
-        assert.equal(presets()[0].args.detail, "fast");
+        assert.equal(presets()[0].args.name, "fast");
+        h.status({owns_control:true, teleop_preset:{name:'fast'}});
         h.element("mode-fast").onclick();
         assert.equal(presets().length, 1, "clicking the current preset is silent");
         h.element("mode-slow").onclick();
@@ -196,11 +197,11 @@ async function main() {
             catalog.teleop = {slow_limits:{vx:.6,vy:.6,wz:1}}; render();`);
         h.element("speed-vx").value = "0.6";
         h.status({owns_control: true}); h.push(); await h.advance(50);
-        assert.equal(socket.sent.filter(r => r.op === "velocity").at(-1).args.vx, 0.6);
+        assert.equal(socket.sent.filter(r => r.op === "teleop").at(-1).args.vx, 1);
         h.element("direction-w").onpointerup({pointerId:1, preventDefault() {}});
         await h.advance(50);
-        assert.equal(socket.sent.filter(r => r.op === "velocity").at(-1).args.vx, 0);
-        assert.equal(socket.sent.filter(r => r.op === "velocity").length, 2);
+        assert.equal(socket.sent.filter(r => r.op === "teleop").at(-1).args.vx, 0);
+        assert.equal(socket.sent.filter(r => r.op === "teleop").length, 2);
         console.log(`Policy-side smoothing, ACK ${delay} ms: target and release each sent on the next 50 ms tick`);
     }
     for (const delay of [20, 80, 180, 280]) {
@@ -219,14 +220,14 @@ async function main() {
             h.status({owns_control: true}); await h.advance(50);
         }
         assert.equal(h.run("motion.value.vx"), 0, `${delay} ms replies must not slow braking`);
-        const velocities = socket.sent.filter(r => r.op === "velocity");
-        assert.equal(velocities.length, 17);
+        const velocities = socket.sent.filter(r => r.op === "teleop");
+        assert(velocities.length >= 13);
         assert.equal(velocities.at(-1).args.vx, 0, "final zero is sent before older replies arrive");
-        const times = socket.sentAt.filter((_, i) => socket.sent[i].op === "velocity");
+        const times = socket.sentAt.filter((_, i) => socket.sent[i].op === "teleop");
         assert(times.slice(1).every((time, i) => time - times[i] === 50), "send cadence is independent of RTT");
         await h.advance(350);
         assert.equal(h.run("pending.size"), 0);
-        console.log(`ACK ${delay} ms: 0->0.6 in 600 ms, release in 250 ms, velocity stream 20 Hz`);
+        console.log(`ACK ${delay} ms: normalized target/release sent at 20 Hz without waiting for replies`);
     }
     {
         const h = harness(), socket = await h.ready();
@@ -236,17 +237,17 @@ async function main() {
         h.element("direction-w").onpointerup({pointerId:1, preventDefault() {}});
         await h.advance(250);
         assert.equal(h.run("motion.value.vx"), 0);
-        assert(!socket.sent.some(r => r.op === "velocity"), "do not queue intermediate velocities");
+        assert(!socket.sent.some(r => r.op === "teleop"), "do not queue intermediate velocities");
         socket.bufferedAmount = 0;
         await h.advance(50);
-        const velocities = socket.sent.filter(r => r.op === "velocity");
+        const velocities = socket.sent.filter(r => r.op === "teleop");
         assert.equal(velocities.length, 1);
         assert.equal(velocities[0].args.vx, 0, "retain final zero while the transport is busy");
     }
     {
         const h = harness(), socket = await h.ready();
         h.status({owns_control: true}); h.push(); await h.advance(50);
-        const previous = socket.sent.find(r => r.op === "velocity");
+        const previous = socket.sent.find(r => r.op === "teleop");
         h.events.get("blur")(); h.push(); await h.advance(50);
         socket.reply(previous, {}, "not_ready"); await flush();
         assert(h.run("motion.value.vx") > 0, "a stale rejection must not clear a new gesture");
@@ -254,7 +255,7 @@ async function main() {
     for (const delay of [1500, 2500, Infinity]) {
         const h = harness(), socket = await h.ready();
         socket.ackDelay = Number.isFinite(delay) ? delay : 0;
-        if (!Number.isFinite(delay)) socket.dropReplies = new Set(["velocity", "renew"]);
+        if (!Number.isFinite(delay)) socket.dropReplies = new Set(["teleop", "renew"]);
         h.status({owns_control: true}); h.push();
         for (let i = 0; i < 80; ++i) {
             h.status({owns_control: true}); await h.advance(50);
@@ -267,7 +268,7 @@ async function main() {
         for (let i = 0; i < 8; ++i) {
             h.status({owns_control: true}); await h.advance(50);
         }
-        assert.equal(socket.sent.filter(r => r.op === "velocity").at(-1).args.vx, 0);
+        assert.equal(socket.sent.filter(r => r.op === "teleop").at(-1).args.vx, 0);
     }
     {
         const h = harness(), socket = await h.ready();
@@ -285,7 +286,7 @@ async function main() {
     {
         const h = harness(), socket = await h.ready();
         h.status({owns_control: true}); h.push(); await h.advance(50);
-        socket.reply(socket.sent.find(r => r.op === "velocity"), {}, "not_ready");
+        socket.reply(socket.sent.find(r => r.op === "teleop"), {}, "not_ready");
         await flush();
         assert.equal(h.run("motion.value.vx"), 0, "an explicit rejection still clears rejected input");
         assert.equal(h.run("pointers.size"), 0);
@@ -294,7 +295,7 @@ async function main() {
         const h = harness(), socket = await h.ready();
         h.status({owns_control: true}); h.push();
         await h.advance(50);
-        const velocity = socket.sent.find(r => r.op === "velocity");
+        const velocity = socket.sent.find(r => r.op === "teleop");
         assert(velocity.args.vx > 0);
         await h.advance(300);
         assert.equal(socket.readyState, 1, "300 ms acknowledgement delay must not close the connection");

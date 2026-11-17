@@ -35,6 +35,11 @@ public:
     Reply RequestState(const std::string &state);
     Reply SelectPolicy(const std::string &policy);
     Reply SetVelocity(const Velocity &velocity, int valid_for_ms = 300);
+    // Normalized axes [-1, 1]; speed presets and ramps are applied by the service.
+    Reply SetTeleopInput(const Velocity &input, int valid_for_ms = 300);
+    // Queue the latest input without waiting for a network reply.
+    Reply PostTeleopInput(const Velocity &input, int valid_for_ms = 300);
+    Reply LatestVelocityReply() const;
     Reply SetTeleopPreset(const std::string &preset);
     Reply Stop();
     Reply StartInteraction(const std::string &action);

@@ -11,13 +11,14 @@ try {
 } catch (_) { /* Browser privacy mode can disable tab storage. */ }
 let lastActionCatalog = "", lastPolicyCatalog = "";
 let lastVelocityCatalog = "";
+let requestedPreset = "";
 const motion = new window.OperatorTeleop.Motion();
 const keys = new Set();
 const pointers = new Map();
 const stickPointers = new Map();
 const stickValues = {move: {x:0,y:0}, turn: {x:0,y:0}};
 let inputMode = 'buttons';
-let motionTickAt = performance.now(), velocityDirty = false, motionEpoch = 0;
+let velocityDirty = false, motionEpoch = 0;
 let activeRequest = 0, adminLoginWaiting = false;
 const pending = new Map();
 let lastClientEvent = "", lastClientEventAt = -Infinity;
@@ -48,7 +49,7 @@ function closeConnection() {
   const previous = socket;
   socket = null;
   clearTimeout(connectTimer); connectTimer = null;
-  authenticated = false; activeRequest = 0; endMotion(false);
+  authenticated = false; activeRequest = 0; requestedPreset = ''; endMotion(false);
   statusStale = false;
   if (status) { status.online = false; status.owns_control = false; status.owner = ""; }
   for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error("连接已断开")); }
@@ -245,13 +246,18 @@ function render() {
     $("action").replaceChildren(...actions.map(a => new Option(a.display_name, a.key)));
     lastActionCatalog = signature;
   }
-  const velocityCatalog = JSON.stringify([p?.name, p?.minimum, p?.maximum, p?.client_smoothing,
+  const velocityCatalog = JSON.stringify([p?.name, p?.minimum, p?.maximum,
     p?.teleop, catalog?.teleop]);
   if (velocityCatalog !== lastVelocityCatalog) {
     lastVelocityCatalog = velocityCatalog;
     endMotion();
     motion.mode = 'slow';
     motion.configure(p, catalog?.teleop);
+    updateSpeedPresets(true);
+  }
+  const preset = status?.teleop_preset?.name || 'slow';
+  if (motion.mode !== preset) {
+    motion.mode = preset;
     updateSpeedPresets(true);
   }
   const rl = !trajectory && owns && status.state === 'RL' && !fault?.latched;
@@ -349,12 +355,13 @@ function renderMotion() {
     const active = button.dataset.speedMode === motion.mode;
     button.classList.toggle('active', active);
     button.setAttribute('aria-pressed', String(active));
-    button.disabled = !activePolicy();
+    button.disabled = !activePolicy() || !status?.owns_control;
   });
   $('speed-limits').textContent = activePolicy()
     ? `上限 · 前后 ${caps[0].toFixed(2)} / 横移 ${caps[1].toFixed(2)} m/s · 转向 ${caps[2].toFixed(2)} rad/s`
     : '等待策略限速';
-  $('command-velocity').textContent = ['vx','vy','wz'].map(axis => motion.value[axis].toFixed(2)).join(' / ');
+  const command = status?.command_velocity || status?.velocity;
+  $('command-velocity').textContent = ['vx','vy','wz'].map(axis => (command?.[axis] || 0).toFixed(2)).join(' / ');
 }
 function endMotion(send = true) {
   const wasMoving = motion.moving || velocityDirty;
@@ -373,10 +380,9 @@ function endMotion(send = true) {
     if (element.hasPointerCapture(pointer)) element.releasePointerCapture(pointer);
   }
   motion.reset();
-  motionTickAt = performance.now();
   if (send && wasMoving && authenticated && status?.owns_control)
-    call('velocity', {vx:0,vy:0,wz:0,valid_for_ms:300}).catch(() => {});
-  $('command-velocity').textContent = '0.00 / 0.00 / 0.00';
+    call('teleop', {vx:0,vy:0,wz:0,valid_for_ms:300}).catch(() => {});
+  renderMotion();
 }
 document.querySelectorAll('[data-input-mode]').forEach(button => {
   if (button.tagName !== 'BUTTON') return;
@@ -446,10 +452,13 @@ document.querySelectorAll('[data-motion]').forEach(button => {
 });
 document.querySelectorAll('[data-speed-mode]').forEach(button => {
   button.onclick = () => {
-    if (!motion.hasSpeedModes) return;
-    const changed = motion.mode !== button.dataset.speedMode;
-    motion.mode = button.dataset.speedMode; updateSpeedPresets(true); renderMotion();
-    if (changed && status?.owns_control) clientEvent('teleop_preset', motion.mode);
+    if (!motion.hasSpeedModes || !status?.owns_control) return;
+    const preset = button.dataset.speedMode;
+    if ((requestedPreset || motion.mode) === preset) return;
+    requestedPreset = preset;
+    call('preset', {name:preset}).catch(e => tell(e.message)).finally(() => {
+      if (requestedPreset === preset) requestedPreset = '';
+    });
   };
 });
 $("acquire").onclick = () => request('acquire');
@@ -541,19 +550,18 @@ setInterval(() => {
   });
 }, 300);
 setInterval(() => {
-  const now = performance.now(), dt = (now - motionTickAt) / 1000;
-  motionTickAt = now;
   if (!motionAllowed()) { endMotion(); return; }
   const wasMoving = motion.moving;
-  const v = motion.step(motionInput(), dt);
+  const input = motionInput();
+  motion.step(input);
   velocityDirty ||= wasMoving || motion.moving;
   renderMotion();
-  // Advance every tick; slow replies must not throttle the velocity stream.
+  // Input refresh never waits for velocity acknowledgement.
   // If transport is backed up, keep only the latest value, including final zero.
   if (!velocityDirty || socket?.bufferedAmount > 0) return;
   const current = socket, epoch = motionEpoch;
   velocityDirty = false;
-  call('velocity', {...v,valid_for_ms:300}).catch(e => {
+  call('teleop', {...input,valid_for_ms:300}).catch(e => {
     if (socket === current && epoch === motionEpoch && e.remote) {
       clientEvent('velocity_rejected', e.message);
       endMotion(); tell(e.message);

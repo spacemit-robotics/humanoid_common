@@ -17,18 +17,9 @@ struct Config {
     Layout input;
     int vendor = 0, product = 0;
     double deadzone = 0.06;
-    std::array<double, 3> slow{}, fast{}, acceleration{}, deceleration{};
     std::vector<Binding> bindings;
     FeedbackConfig feedback;
 };
-inline std::array<double, 3> Vector(const YAML::Node &node, bool positive) {
-    const auto values = node.as<std::vector<double>>();
-    if (values.size() != 3) throw std::runtime_error("teleop vectors require three values");
-    for (const auto value : values)
-        if (!std::isfinite(value) || (positive ? value <= 0 : value < 0))
-            throw std::runtime_error("invalid teleop vector");
-    return {values[0], values[1], values[2]};
-}
 inline Config ReadConfig(const YAML::Node &root) {
     const auto pad = root["operator_gamepad"], teleop = root["operator_service"]["teleop"];
     Config c;
@@ -47,15 +38,9 @@ inline Config ReadConfig(const YAML::Node &root) {
             c.feedback.strength < 1 || c.feedback.strength > 255)
             throw std::runtime_error("invalid gamepad rumble configuration");
     }
-    c.deadzone = teleop["deadzone"].as<double>();
+    c.deadzone = teleop && teleop["deadzone"] ? teleop["deadzone"].as<double>() : c.deadzone;
     if (!std::isfinite(c.deadzone) || c.deadzone < 0 || c.deadzone >= 0.5)
         throw std::runtime_error("invalid gamepad deadzone");
-    c.slow = Vector(teleop["slow_limits"], false);
-    c.fast = Vector(teleop["fast_limits"], false);
-    c.acceleration = Vector(teleop["acceleration"], true);
-    c.deceleration = Vector(teleop["deceleration"], true);
-    for (size_t i = 0; i < 3; ++i)
-        if (c.slow[i] > c.fast[i]) throw std::runtime_error("slow caps exceed fast caps");
     // Physical extra-button names belong to the machine YAML, not the generic layout.
     if (const auto codes = pad["button_codes"]) {
         if (!codes.IsMap()) throw std::runtime_error("button_codes must be a map");

@@ -10,7 +10,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const root = path.resolve(__dirname, "../../clients/web");
-const {Motion, advance, stick} = require(path.join(root, "teleop.js"));
+const {Motion, stick} = require(path.join(root, "teleop.js"));
 const close = (actual, expected) => assert(Math.abs(actual - expected) < 1e-9, `${actual} != ${expected}`);
 assert.deepEqual(stick(0.03, 0.03), {x: 0, y: 0});
 close(stick(0.53, 0).x, 0.5);
@@ -29,26 +29,24 @@ motion.configure(stand, config);
 assert.deepEqual(motion.step({vx: 1}, 0.05), {vx: 0, vy: 0, wz: 0});
 motion.configure(walk, config);
 close(motion.limits("vx").max, 0.6); // Startup/stand must not erase mode presets.
-close(motion.step({vx: 1}, 0.05).vx, 0.05);
+close(motion.step({vx: 1}, 0.05).vx, 0.6);
 for (let i = 0; i < 30; ++i) motion.step({vx: 1}, 0.05);
 close(motion.value.vx, 0.6);
 motion.mode = "fast";
-close(motion.step({vx: 1}, 0.05).vx, 0.65);
+close(motion.step({vx: 1}, 0.05).vx, 1.5);
 for (let i = 0; i < 30; ++i) motion.step({vx: 1}, 0.05);
 close(motion.value.vx, 1.5);
 motion.mode = "slow";
-close(motion.step({vx: 1}, 0.05).vx, 1.375); // Mode changes brake; no jump to the new cap.
-close(motion.step({}, 0.05).vx, 1.25);
+close(motion.step({vx: 1}, 0.05).vx, 0.6); // Only the service ramps actual commands.
+close(motion.step({}, 0.05).vx, 0);
 for (let i = 0; i < 30; ++i) motion.step({}, 0.05);
 assert.equal(motion.value.vx, 0);
 assert(!motion.moving);
-close(advance(0.2, -1, 1, 2.5, 0.1), -0.02); // Piecewise reversal across zero.
-close(advance(-0.5, 0, 1, 2.5, 0.05), -0.375);
 motion.mode = "fast";
 for (let i = 0; i < 50; ++i) motion.step({vx: -1, vy: 1, wz: 1}, 0.05);
 close(motion.value.vx, -0.8); close(motion.value.vy, 0.5); close(motion.value.wz, 1);
 motion.reset();
-close(motion.step({vx: 1}, 20).vx, 0.1); // A large dt cannot produce an unlimited step.
+close(motion.step({vx: 1}, 20).vx, 1.5); // UI stalls do not add a second ramp.
 motion.reset();
 
 motion.configure({...walk, client_smoothing: false}, config);
@@ -69,7 +67,7 @@ for (const mode of ["slow", "fast"]) {
 motion.configure({...stand, client_smoothing: false}, config);
 assert.deepEqual(motion.step({vx: 1, vy: 1, wz: 1}, 0.05), {vx: 0, vy: 0, wz: 0});
 motion.configure(walk, config);
-close(motion.step({vx: 1}, 0.05).vx, 0.05); // Switching back restores default client ramps.
+close(motion.step({vx: 1}, 0.05).vx, 1.5);
 motion.configure({...walk, teleop: {slow_limits: {vx: 0.7, vy: 0.4, wz: 1},
     fast_limits: {vx: 0.7, vy: 0.4, wz: 1}}}, config);
 close(motion.limits("vx").max, 0.7);
@@ -135,7 +133,7 @@ assert.equal(element("direction-w").disabled, true);
 render(catalog);
 assert.equal(element("direction-w").disabled, false);
 close(run('motion.limits("vx").max'), 0.6);
-run("call = async (op, args) => { captured.push({op, args}); return {}; };");
+run("call = async (op, args) => { captured.push({op, args}); if (op === 'preset') { status.teleop_preset = {name:args.name}; render(); } return {}; };");
 const pointer = (id, x, y) => ({pointerId: id, button: 0, clientX: x, clientY: y, preventDefault() {}});
 async function tick() {
     now += 50;
@@ -183,8 +181,8 @@ async function main() {
     element("direction-w").onpointerdown(pointer(1, 73, 23));
     element("direction-j").onpointerdown(pointer(2, 23, 73));
     await tick();
-    close(captured.at(-1).args.vx, 0.05);
-    close(captured.at(-1).args.wz, 0.1);
+    close(captured.at(-1).args.vx, 1);
+    close(captured.at(-1).args.wz, 1);
     await tick(); await tick();
     const previous = run("motion.value.vx");
     element("direction-w").onpointerup(pointer(1, 73, 23));
@@ -220,7 +218,7 @@ async function main() {
     render({...catalog, policies: [stand, {...walk, client_smoothing: false}]});
     element("direction-w").onpointerdown(pointer(7, 73, 23));
     await tick();
-    close(captured.at(-1).args.vx, 0.6);
+    close(captured.at(-1).args.vx, 1);
     element("direction-w").onpointerup(pointer(7, 73, 23));
     await tick();
     close(captured.at(-1).args.vx, 0);
@@ -229,7 +227,7 @@ async function main() {
     element('stick-move').onpointerdown(pointer(20, 73, half));
     element('stick-turn').onpointerdown(pointer(21, half, 73));
     await tick();
-    close(captured.at(-1).args.vx, 0.3); close(captured.at(-1).args.wz, 0.5);
+    close(captured.at(-1).args.vx, 0.5); close(captured.at(-1).args.wz, 0.5);
     element('stick-move').onpointerup(pointer(20, 73, half));
     await tick();
     close(captured.at(-1).args.vx, 0); close(captured.at(-1).args.wz, 0.5);
@@ -240,7 +238,7 @@ async function main() {
     render(catalog);
     element("direction-w").onpointerdown(pointer(8, 73, 23));
     await tick();
-    close(captured.at(-1).args.vx, 0.05);
+    close(captured.at(-1).args.vx, 1);
     events.get("blur")();
     run("call = () => new Promise(() => {});");
     element("direction-w").onpointerdown(pointer(6, 73, 23));
@@ -248,6 +246,6 @@ async function main() {
     for (let i = 0; i < 22; ++i) await tick();
     close(run("motion.value.vx"), 0.6);
     assert.equal(run("pointers.size"), 1, "missing velocity replies must not cancel current input");
-    console.log("Web direction button regressions passed: presets, independent axes, ramps, multitouch, stop, delayed refresh and replies");
+    console.log("Web input regressions passed: presets, normalized axes, multitouch, stop, delayed refresh and replies");
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

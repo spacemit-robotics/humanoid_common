@@ -61,10 +61,11 @@ int main(int argc, char *argv[]) {
     assert(argc >= 3);
     const bool real_terminal = argc > 3 && std::string(argv[3]) == "--terminal-only";
     bool terminal_only = real_terminal;
+    bool simulation = false;
     bool trajectory = false;
     bool administrator = false;
     for (int i = 3; i < argc; ++i) {
-        terminal_only = terminal_only || std::string(argv[i]) == "--sim";
+        simulation = simulation || std::string(argv[i]) == "--sim";
         trajectory = trajectory || std::string(argv[i]) == "--trajectory";
         administrator = administrator || std::string(argv[i]) == "--admin";
     }
@@ -147,7 +148,7 @@ int main(int argc, char *argv[]) {
         if (real_terminal)
             execl(argv[1], argv[1], config_path.c_str(), "--real", "--terminal-only", nullptr);
         else
-            execl(argv[1], argv[1], config_path.c_str(), terminal_only ? "--sim" : "--real", nullptr);
+            execl(argv[1], argv[1], config_path.c_str(), simulation ? "--sim" : "--real", nullptr);
         _exit(127);
     }
     const auto file = operator_service::LoadConfig(config_path).connection_file;
@@ -200,6 +201,14 @@ int main(int argc, char *argv[]) {
             assert(alice.SetVelocity({1, 0, 0}, 300).ok);
             assert(Wait([&] { return alice.LatestStatus().velocity.vx > 0.09; }));
             assert(Wait([&] { return alice.LatestStatus().velocity.vx == 0; }));
+            assert(alice.SetTeleopPreset("fast").ok);
+            assert(alice.PostTeleopInput({1, 0, 0}).code == "queued");
+            assert(Wait([&] { return alice.LatestStatus().velocity.vx > 0.09; }));
+            const auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < 50; ++i) assert(alice.PostTeleopInput({i == 49 ? 0.0 : 1.0, 0, 0}).ok);
+            assert(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(200));
+            assert(Wait([&] { return alice.LatestStatus().velocity.vx == 0; }));
+            assert(Wait([&] { return alice.LatestVelocityReply().code == "ok"; }));
         }
         auto pairing = operator_service::LoadConfig(config_path);
         const auto host = "127.0.0.1:" + std::to_string(pairing.port);

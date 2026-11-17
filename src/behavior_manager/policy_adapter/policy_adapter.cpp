@@ -786,6 +786,13 @@ public:
 
     const char *Type() const override { return "mjlab"; }
 
+    robot_base::InteractionStatus GetInteractionStatus() const override {
+        // The action catalog supplies the request identity and playback phase.
+        robot_base::InteractionStatus status;
+        status.progress = playback_progress_;
+        return status;
+    }
+
     bool ReadyForPolicySwitch() const override { return handoff_.Ready(); }
     bool PlaybackFinished() const override { return handoff_.Finished(); }
     void PreparePolicySwitch(bool requested, double elapsed_s) override {
@@ -797,6 +804,7 @@ public:
         reference_sample_ready_ = false;
         playback_start_elapsed_ = 0.0;
         playback_started_ = !config_.manual_start;
+        playback_progress_ = 0.0F;
         heading_offset_ = Eigen::Quaternionf::Identity();
         if (config_.anchor_yaw_align) {
             const Eigen::Quaternionf robot_anchor =
@@ -829,6 +837,8 @@ public:
         const bool waiting = config_.manual_start && !playback_started_;
         const PlaybackSample sample = handoff_.Sample(
             elapsed_s - playback_start_elapsed_, num_frames_, config_, waiting);
+        playback_progress_ = waiting ? 0.0F : sample.hold_last_frame ? 1.0F :
+            std::clamp((sample.frame0 + sample.alpha) / std::max(1, num_frames_ - 1), 0.0F, 1.0F);
         const Eigen::VectorXf &pos0 = reference_joint_pos_[sample.frame0];
         const Eigen::VectorXf &pos1 = reference_joint_pos_[sample.frame1];
         const Eigen::VectorXf &vel0 = reference_joint_vel_[sample.frame0];
@@ -1117,6 +1127,7 @@ private:
     bool reference_sample_ready_ = false;
     ReferenceHandoff handoff_;
     bool playback_started_ = true;
+    float playback_progress_ = 0.0F;
     double playback_start_elapsed_ = 0.0;
     std::vector<ReferenceActionBinding> reference_action_bindings_;
 };
@@ -2247,6 +2258,8 @@ Config LoadConfig(const std::string &yaml_path,
                 encoder_base + ".runtime.ep_dump_subgraphs").value_or(false);
             encoder.runtime.ep_profile_prefix = yaml.Read<std::string>(
                 encoder_base + ".runtime.ep_profile_prefix").value_or("");
+            encoder.runtime.ep_options = yaml.Read<std::map<std::string, std::string>>(
+                encoder_base + ".runtime.ep_options").value_or(std::map<std::string, std::string>{});
         }
         const std::string planner_base = adapter_base + ".planner";
         const auto planner_model =
@@ -2289,6 +2302,8 @@ Config LoadConfig(const std::string &yaml_path,
             config.sonic_planner.runtime.ep_profile_prefix =
                 yaml.Read<std::string>(
                     planner_base + ".runtime.ep_profile_prefix").value_or("");
+            config.sonic_planner.runtime.ep_options = yaml.Read<std::map<std::string, std::string>>(
+                planner_base + ".runtime.ep_options").value_or(std::map<std::string, std::string>{});
             config.sonic_planner.output_fps = yaml.Read<double>(
                 planner_base + ".output_fps").value_or(config.motion_fps);
             config.sonic_planner.check_interval = yaml.Read<double>(

@@ -55,13 +55,19 @@ async function exercise(browser, name, width, app, direct = false) {
             const r = JSON.parse(message);
             sent.push(r);
             if (r.op === "acquire") { status.owns_control = true; status.owner = name; }
-            if (r.op === "velocity") status.velocity = r.args;
+            if (r.op === "preset") status.teleop_preset = {name:r.args.name};
+            if (r.op === "teleop") {
+                const limits = catalog.teleop[(status.teleop_preset?.name || 'slow') + '_limits'];
+                status.velocity = Object.fromEntries(['vx','vy','wz'].map(axis => [axis, r.args[axis] * limits[axis]]));
+                status.command_velocity = status.velocity;
+            }
             if (["release", "stop"].includes(r.op)) {
                 status.owns_control = false; status.owner = ""; status.velocity = {vx: 0, vy: 0, wz: 0};
+                status.command_velocity = status.velocity;
             }
             const reply = JSON.stringify({v: 1, id: r.id, ok: true, code: "ok", message: "",
                 data: r.op === "hello" ? {catalog: clientCatalog, status} : {}});
-            if (r.op === "velocity" && acknowledgementDelay) {
+            if (r.op === "teleop" && acknowledgementDelay) {
                 const timer = setTimeout(() => { replies.delete(timer); route.send(reply); }, acknowledgementDelay);
                 replies.add(timer);
             } else route.send(reply);
@@ -119,17 +125,13 @@ async function exercise(browser, name, width, app, direct = false) {
         const touch = (type, points) => cdp.send("Input.dispatchTouchEvent", {type, touchPoints: points});
         await touch("touchStart", [touchPoint(left, 1), touchPoint(right, 2)]);
         await waitVelocity("vx", 0.3); await waitVelocity("wz", 0.5);
-        assert(sent.some(r => r.op === "velocity" && r.args.vx > 0.2 && r.args.wz > 0.2));
+        assert(sent.some(r => r.op === "teleop" && r.args.vx > 0.2 && r.args.wz > 0.2));
         const releaseAt = sent.length;
         await touch("touchEnd", []);
         await waitVelocity("vx", 0); await waitVelocity("wz", 0);
-        const release = sent.slice(releaseAt).filter(r => r.op === "velocity");
-        if (direct) {
-            assert(release.every(r => r.args.vx === 0.3 || r.args.vx === 0), "release must not add a client ramp");
-            assert.equal(release.at(-1).args.vx, 0);
-        } else {
-            assert(release.some(r => r.args.vx > 0 && r.args.vx < 0.29), "release must ramp down");
-        }
+        const release = sent.slice(releaseAt).filter(r => r.op === "teleop");
+        assert(release.every(r => r.args.vx === 0.5 || r.args.vx === 0), "release must not add a client ramp");
+        assert.equal(release.at(-1).args.vx, 0);
         await page.locator('[data-speed-mode="fast"]').click();
         left = await page.locator("#direction-w").boundingBox();
         await touch("touchStart", [touchPoint(left, 3)]);
@@ -142,9 +144,8 @@ async function exercise(browser, name, width, app, direct = false) {
         const back = await page.locator("#direction-s").boundingBox();
         await touch("touchStart", [touchPoint(back, 3)]);
         await waitVelocity("vx", -0.6);
-        const reversal = sent.slice(reverseAt).filter(r => r.op === "velocity").map(r => r.args.vx);
-        if (direct) assert(reversal.every(v => [0.6, 0, -0.6].includes(v)), "reversal is smoothed by the policy");
-        else assert(reversal.some(v => v > 0 && v < 0.5) && reversal.some(v => v < 0 && v > -0.3));
+        const reversal = sent.slice(reverseAt).filter(r => r.op === "teleop").map(r => r.args.vx);
+        assert(reversal.every(v => [1, 0, -1].includes(v)), "reversal is smoothed by the service or policy");
         await page.keyboard.press("Space");
         await waitVelocity("vx", 0);
         await touch("touchEnd", []);
@@ -184,7 +185,7 @@ async function exercise(browser, name, width, app, direct = false) {
         await touch("touchEnd", []);
         await page.waitForTimeout(350);
         assert.equal(Number((await page.locator("#command-velocity").textContent()).split(" / ")[0]), 0);
-        assert.equal(sent.filter(r => r.op === "velocity").at(-1).args.vx, 0);
+        assert.equal(sent.filter(r => r.op === "teleop").at(-1).args.vx, 0);
         acknowledgementDelay = 0;
         publish = false;
         await page.waitForTimeout(1400);
@@ -197,7 +198,7 @@ async function exercise(browser, name, width, app, direct = false) {
         await socket.close();
         await page.waitForFunction(() => document.getElementById("connection").textContent === "控制链路在线");
         assert.equal(connections, originalConnections + 1);
-        assert(!sent.slice(disconnectedAt).some(r => ["acquire", "velocity", "state", "interaction"].includes(r.op)),
+        assert(!sent.slice(disconnectedAt).some(r => ["acquire", "teleop", "state", "interaction"].includes(r.op)),
             "automatic reconnect must not replay robot commands");
         await page.locator("#acquire").click();
         await page.waitForFunction(() => !document.getElementById("direction-w").disabled);
@@ -231,8 +232,8 @@ async function exercise(browser, name, width, app, direct = false) {
         await touch('touchStart', [moveTouch, turnTouch]);
         await waitVelocity('vx', 0.3); await waitVelocity('wz', 0.5);
         if (direct) {
-            const first = sent.slice(sticksAt).find(r => r.op === 'velocity' && r.args.vx > 0);
-            assert(Math.abs(first.args.vx - 0.3) < 0.015, 'stick target is not ramped in the webpage');
+            const first = sent.slice(sticksAt).find(r => r.op === 'teleop' && r.args.vx > 0);
+            assert(Math.abs(first.args.vx - 0.5) < 0.015, 'stick input is normalized and not ramped in the webpage');
         }
         await page.waitForTimeout(2600);
         await waitVelocity('vx', 0.3); await waitVelocity('wz', 0.5);

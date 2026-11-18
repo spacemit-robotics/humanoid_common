@@ -22,6 +22,12 @@ namespace runtime_config {
 
 using ActionEnvironmentMap = std::map<std::string, robot_base::EnvironmentSet>;
 
+inline bool ActionEnabled(const ActionEnvironmentMap &actions, const std::string &name,
+        robot_base::RuntimeEnvironment environment) {
+    const auto entry = actions.find(name);
+    return entry == actions.end() || entry->second.Allows(environment);
+}
+
 inline std::string PolicyBase(const std::string &policy) {
     return "rl_policy.onnx_infer.policies." + policy;
 }

@@ -282,8 +282,7 @@ public:
     bool ActionEnabled(const std::string &policy, const std::string &action) const {
         const auto catalog = action_environments.find(policy);
         if (catalog == action_environments.end()) return true;
-        const auto entry = catalog->second.find(action);
-        return entry == catalog->second.end() || entry->second.Allows(sensor.environment);
+        return runtime_config::ActionEnabled(catalog->second, action, sensor.environment);
     }
 
     std::string EnvironmentDetail(const std::string &item) const {

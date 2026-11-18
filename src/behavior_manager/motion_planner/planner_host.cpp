@@ -140,6 +140,8 @@ HostConfig LoadHostConfig(const std::string &yaml_path,
         throw std::runtime_error("[motion_planner] 使用规划器需要配置 robot_base.num_dof");
     }
 
+    host.action_environments = runtime_config::LoadActionEnvironments(
+        yaml, yaml.Read<std::string>(adapter_base + ".catalog").value_or(""));
     int preloaded = 0;
     for (const auto &entry : entries) {
         const PlannerType *type = FindPlannerType(entry.type);
@@ -290,6 +292,11 @@ public:
         HandleRequest(request, tracker.busy);
         if (auto_start_pending_ && !tracker.busy) AutoStart();
         if (running_) UpdateRunning(robot, command, tracker.playback);
+        if (output_ && !output_->action.empty() &&
+            !runtime_config::ActionEnabled(config_.action_environments, output_->action, environment_)) {
+            Fail("action " + output_->action + " is not enabled in the " +
+                robot_base::RuntimeEnvironmentName(environment_) + " environment");
+        }
         Advance(robot);
         UpdatePreparation();
         UpdatePhase();
@@ -419,6 +426,7 @@ private:
     }
 
     void Begin(int index, const std::string &argument) {
+        ++start_id_;
         active_ = index;
         argument_ = argument;
         ++argument_sequence_;
@@ -591,6 +599,7 @@ private:
     }
 
     void Post() {
+        job_start_id_ = start_id_;
         job_kind_ = job_.kind;
         stage_.store(kStagePosted, std::memory_order_release);
         // Without the worker mutex: a wakeup lost to the race costs one kWorkerPoll.
@@ -612,6 +621,8 @@ private:
         planner_ = result.planner;
         loaded_ = result.loaded_index;
         started_ = result.started;
+        // Always reconcile the worker-owned slot, but never publish an old request's result.
+        if (job_start_id_ != start_id_) return;
         if (!result.error.empty()) {
             const std::string name = kind == JobKind::LOAD
                 ? config_.planners[job_.index].name : status_.planner;
@@ -649,6 +660,7 @@ private:
     // during generation, otherwise estimated from the expected load time.
     void UpdatePreparation() {
         if (!start_pending_) return;
+        if (job_start_id_ != start_id_) return;
         if (job_kind_ == JobKind::GENERATE) {
             status_.progress = UnitInterval(generation_progress_.load(std::memory_order_acquire));
         } else if (loading_ && expected_prepare_s_ > 0.0) {
@@ -663,6 +675,7 @@ private:
         if (failed_) return Phase::FAILED;
         if (start_pending_) {
             const bool offline = Active().category == Category::OFFLINE;
+            if (job_kind_ != JobKind::NONE && job_start_id_ != start_id_) return Phase::LOADING;
             if (job_kind_ == JobKind::GENERATE || (offline && loaded_ == active_)) {
                 return Phase::GENERATING;
             }
@@ -871,6 +884,8 @@ private:
     bool failed_ = false;
     bool auto_start_pending_ = false;
     uint64_t last_sequence_ = 0;
+    uint64_t start_id_ = 0;
+    uint64_t job_start_id_ = 0;
     robot_base::RuntimeEnvironment environment_ = robot_base::RuntimeEnvironment::UNKNOWN;
     double time_s_ = 0.0;
     double release_started_s_ = 0.0;

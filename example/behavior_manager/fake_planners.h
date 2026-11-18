@@ -48,6 +48,7 @@ struct Script {
     std::atomic<int> generate_delay_ms{0};
     std::atomic<bool> fail_load{false};
     std::atomic<bool> fail_start{false};
+    std::atomic<bool> hold_start{false};
     std::atomic<bool> fail_update{false};
     std::atomic<bool> fail_generate{false};
     std::atomic<bool> invalid_output{false};
@@ -64,6 +65,7 @@ struct Script {
         constructed = destroyed = started = stopped = generated = 0;
         load_delay_ms = generate_delay_ms = 0;
         fail_load = fail_start = fail_update = fail_generate = invalid_output = false;
+        hold_start = false;
         settled = true;
         saw_cancel = false;
         generate_progress = 0.0F;
@@ -119,6 +121,9 @@ public:
 
     void Start(const robot_base::RobotData &, double time_s) override {
         Script &script = GetScript();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (script.hold_start && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         if (script.fail_start) throw std::runtime_error("scripted start failure");
         ++script.started;
         vx_ = 0.0F;

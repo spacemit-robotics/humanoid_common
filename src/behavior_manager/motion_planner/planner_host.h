@@ -9,6 +9,7 @@
 #ifndef PLANNER_HOST_H
 #define PLANNER_HOST_H
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -38,6 +39,7 @@ struct PlannerConfig {
 struct HostConfig {
     std::vector<PlannerConfig> planners;
     std::string auto_start;  ///< 进入策略后自动启动的实时规划器；为空时等待操作端请求
+    std::map<std::string, robot_base::EnvironmentSet> action_environments;
 
     bool Enabled() const { return !planners.empty(); }
 };

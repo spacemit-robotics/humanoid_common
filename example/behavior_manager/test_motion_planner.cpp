@@ -436,6 +436,28 @@ void TestFailures() {
     std::cout << "planner failures: PASS" << std::endl;
 }
 
+void TestSupersededStart() {
+    for (bool old_start_fails : {false, true}) {
+        auto &script = GetScript();
+        script.Reset();
+        script.hold_start = true;
+        script.fail_start = old_start_fails;
+        auto first = MakePlanner("first", "fake_trajectory");
+        first.preload = true;
+        Tracker tracker(MakeHost({first, MakePlanner("second", "fake_choice")}));
+        tracker.Start("first");
+        tracker.Step();
+        tracker.Stop();
+        tracker.Step();
+        tracker.Start("second", "gesture");
+        tracker.Step();
+        script.hold_start = false;
+        Require(tracker.UntilPhase(Phase::RUNNING) && tracker.host.Output() &&
+            tracker.host.Output()->action == "gesture",
+            "a cancelled start must neither complete nor fail the replacement request");
+    }
+}
+
 void TestStopTimeout() {
     auto &script = GetScript();
     script.Reset();
@@ -898,6 +920,20 @@ void TestBinding() {
         return MakeHost({MakePlanner("walker", "fake_trajectory"), MakePlanner("chooser", "fake_choice"),
             MakePlanner("writer", "fake_generator", Category::OFFLINE)});
     };
+    for (const bool offline : {false, true}) {
+        auto config = host();
+        config.action_environments["gesture"].real = false;
+        BoundTracker tracker(std::move(config));
+        tracker.robot.environment = robot_base::RuntimeEnvironment::REAL;
+        tracker.Start(offline ? "writer" : "chooser", offline ? "action:gesture" : "gesture");
+        Require(tracker.UntilPhase(Phase::FAILED) && tracker.sink.calls.empty() &&
+            Contains(tracker.binding.Status().detail, "gesture is not enabled"),
+            "a sim-only planner action must never reach the tracker on hardware");
+        tracker.robot.environment = robot_base::RuntimeEnvironment::SIMULATION;
+        tracker.Start(offline ? "writer" : "chooser", offline ? "action:gesture" : "gesture");
+        Require(tracker.Until([&] { return tracker.binding.Following(); }) &&
+            tracker.sink.Take() == Calls{"action:gesture"}, "the same action must work in simulation");
+    }
     {
         // Realtime trajectories: one crossfade in, in-place replacements, one crossfade out.
         BoundTracker tracker(host());
@@ -1028,6 +1064,7 @@ int main() {
         TestUnloadAndSwitch();
         TestRejections();
         TestBackgroundLoad();
+        TestSupersededStart();
         TestFailures();
         TestStopTimeout();
         TestPreloadAndAutoStart();

@@ -9,7 +9,7 @@ try {
   if (token) sessionStorage.setItem("operator.session", token);
   else token = sessionStorage.getItem("operator.session") || "";
 } catch (_) { /* Browser privacy mode can disable tab storage. */ }
-let lastActionCatalog = "", lastPolicyCatalog = "";
+let lastActionCatalog = "", lastPolicyCatalog = "", lastPlannerCatalog = "";
 let lastVelocityCatalog = "";
 let requestedPreset = "";
 const motion = new window.OperatorTeleop.Motion();
@@ -29,11 +29,16 @@ function clientEvent(event, detail = "") {
   lastClientEvent = signature; lastClientEventAt = now;
   call('client_event', {event, detail:String(detail).slice(0, 256)}).catch(() => {});
 }
-const messages = {not_owner:"请先接管控制",busy:"其他客户端持有控制权，或请求正在处理",not_ready:"操作条件尚未满足",fault:"故障已锁存",unauthorized:"配对已失效，请重新扫描操作二维码",timeout:"确认超时，请检查当前状态",admin_required:"请先登录管理员",rate_limited:"尝试次数过多，请稍后再试"};
-const operationNames = {state:"状态切换",policy:"策略切换",interaction:"开始动作",cancel:"取消动作",ack:"故障确认",reference_start:"开始参考动作"};
+const messages = {unavailable:"当前运行环境不可用",not_owner:"请先接管控制",busy:"其他客户端持有控制权，或请求正在处理",not_ready:"操作条件尚未满足",fault:"故障已锁存",unauthorized:"配对已失效，请重新扫描操作二维码",timeout:"确认超时，请检查当前状态",admin_required:"请先登录管理员",rate_limited:"尝试次数过多，请稍后再试"};
+const operationNames = {state:"状态切换",policy:"策略切换",interaction:"开始动作",cancel:"取消动作",ack:"故障确认",reference_start:"开始参考动作",planner:"启动规划器",planner_stop:"停止规划器"};
 const phaseNames = {accepted:"待确认",completed:"已确认",rejected:"已拒绝",expired:"确认超时",cancelled:"已撤销",sent:"已发送"};
 const actionPhases = {IDLE:"就绪",BLEND_IN:"进入",PLAYING:"播放",HOLDING:"保持",BLEND_OUT:"收回",FINISHED:"完成",REJECTED:"拒绝"};
-const descriptions = {"control acquired":"已取得控制权","released":"控制权已释放","control renewed":"控制权已续期","velocity accepted":"速度请求已受理","velocity cleared; pending requests cancelled":"速度已清零，控制权及待处理请求已撤销","control entered requested state":"机器人已切换状态","control selected requested policy":"机器人已采用所选策略","control handled action request":"机器人已处理动作请求","control acknowledged fault":"故障已确认","already in requested state":"已经在请求状态"};
+const plannerPhases = {IDLE:"未启动",LOADING:"加载中",WARMING:"预热中",READY:"已加载",GENERATING:"生成中",RUNNING:"运行中",STOPPING:"停止中",FAILED:"失败"};
+const plannerHints = {LOADING:"正在加载规划器，机器人保持待命",WARMING:"正在预热规划器，机器人保持待命",GENERATING:"正在生成动作，机器人保持待命",STOPPING:"正在停止并回到待命"};
+// 这些阶段里参考动作归规划器所有，或正在交给它、收回来
+const plannerEngagedPhases = ['LOADING','WARMING','GENERATING','RUNNING','STOPPING'];
+const plannerPreparingPhases = ['LOADING','WARMING','GENERATING'];
+const descriptions = {"control acquired":"已取得控制权","released":"控制权已释放","control renewed":"控制权已续期","velocity accepted":"速度请求已受理","velocity cleared; pending requests cancelled":"速度已清零，控制权及待处理请求已撤销","control entered requested state":"机器人已切换状态","control selected requested policy":"机器人已采用所选策略","control handled action request":"机器人已处理动作请求","control handled planner request":"机器人已处理规划器请求","no motion planner is active":"当前没有运行中的规划器","control acknowledged fault":"故障已确认","already in requested state":"已经在请求状态"};
 const inApp = navigator.userAgent.includes("SpaceMITOperatorApp");
 history.replaceState(null, "", location.pathname);
 window.addEventListener('hashchange', () => {
@@ -137,6 +142,8 @@ function connect() {
         }
         render(); return;
       }
+      // 驱动上报的运行环境变化后，服务端重发按环境过滤的目录
+      if (r.event === "catalog") { catalog = r.data; render(); return; }
       const waiting = pending.get(r.id);
       if (!waiting) return;
       pending.delete(r.id); clearTimeout(waiting.timer);
@@ -157,6 +164,27 @@ function connect() {
   };
 }
 function activePolicy() { return catalog?.policies.find(p => p.name === status?.policy); }
+function plannerEngaged() { return plannerEngagedPhases.includes(status?.planner?.phase); }
+// 规划器运行时速度指令由它接收，限速和快慢档按它在目录里的登记；其余时候按当前策略
+function commandProfile() {
+  const policy = activePolicy();
+  if (status?.planner?.phase !== 'RUNNING') return policy;
+  return policy?.planners?.find(planner => planner.name === status.planner.name) || policy;
+}
+function plannerSummary(planner, name) {
+  if (!planner) return '';
+  const parts = [];
+  if (plannerHints[planner.phase]) parts.push(plannerHints[planner.phase]);
+  if (planner.phase === 'RUNNING') {
+    if (name) parts.push(name);
+    if (planner.plan_count > 0) parts.push(`已规划 ${planner.plan_count} 次`);
+    if (planner.last_plan_ms > 0) parts.push(`单次 ${planner.last_plan_ms.toFixed(0)} ms`);
+    if (planner.plan_rate_hz > 0) parts.push(`${planner.plan_rate_hz.toFixed(1)} 次/秒`);
+    if (planner.reference_remaining_s > 0) parts.push(`参考余量 ${planner.reference_remaining_s.toFixed(2)} s`);
+  }
+  if (planner.detail) parts.push(planner.detail);
+  return parts.join(' · ');
+}
 function controlOwnerLabel(owner, owns) {
   if (owns) return "本客户端已接管";
   if (!owner) return "无人持有";
@@ -182,7 +210,8 @@ function render() {
   const owns = online && admin && status.owns_control;
   const fault = status?.fault;
   const busy = status?.request.phase === "accepted";
-  $("connection").textContent = online ? "控制链路在线" : authenticated
+  const environment = {sim:"仿真", real:"实机"}[status?.environment];
+  $("connection").textContent = online ? `控制链路在线${environment ? ` · ${environment}` : ""}` : authenticated
     ? (fresh ? "等待控制程序" : "网络延迟，等待恢复")
     : connectionWanted && token ? "连接中 · 自动重试" : "未连接";
   $("connection").classList.toggle("online", !!online);
@@ -246,13 +275,14 @@ function render() {
     $("action").replaceChildren(...actions.map(a => new Option(a.display_name, a.key)));
     lastActionCatalog = signature;
   }
-  const velocityCatalog = JSON.stringify([p?.name, p?.minimum, p?.maximum,
-    p?.teleop, catalog?.teleop]);
+  const profile = commandProfile();
+  const velocityCatalog = JSON.stringify([p?.name, profile?.name, profile?.minimum, profile?.maximum,
+    profile?.teleop, catalog?.teleop]);
   if (velocityCatalog !== lastVelocityCatalog) {
     lastVelocityCatalog = velocityCatalog;
     endMotion();
     motion.mode = 'slow';
-    motion.configure(p, catalog?.teleop);
+    motion.configure(profile, catalog?.teleop);
     updateSpeedPresets(true);
   }
   const preset = status?.teleop_preset?.name || 'slow';
@@ -262,11 +292,41 @@ function render() {
   }
   const rl = !trajectory && owns && status.state === 'RL' && !fault?.latched;
   const actionReady = owns && status.state === (trajectory ? 'TRAJECTORY' : 'RL') && !fault?.latched;
-  const movable = p && ['vx','vy','wz'].some(axis => p.minimum[axis] < 0 || p.maximum[axis] > 0);
+  const movable = profile && ['vx','vy','wz'].some(axis => profile.minimum[axis] < 0 || profile.maximum[axis] > 0);
   $("motion-state").textContent = rl ? (movable ? '可操作' : '定点站立') : owns ? '等待 RL'
     : online && status.owner ? ownerLabel : '等待接管';
   const actionBusy = ['BLEND_IN','PLAYING','HOLDING','BLEND_OUT'].includes(status?.interaction.phase);
-  $("start-action").disabled = !actionReady || busy || actionBusy || !actions.length;
+  const planners = trajectory ? [] : (p?.planners || []);
+  const plannerSignature = JSON.stringify([status?.policy || '', p?.auto_planner || '',
+    planners.map(planner => [planner.name, planner.display_name, planner.category])]);
+  if (plannerSignature !== lastPlannerCatalog) {
+    $("planner").replaceChildren(...planners.map(planner => new Option(planner.display_name || planner.name, planner.name)));
+    $("planner").value = (planners.find(planner => planner.name === p?.auto_planner) || planners[0])?.name || '';
+    lastPlannerCatalog = plannerSignature;
+  }
+  const plannerPhase = status?.planner?.phase || 'IDLE';
+  const engaged = plannerEngaged();
+  const plannerShown = engaged || plannerPhase === 'FAILED';
+  if (plannerShown && planners.some(planner => planner.name === status.planner.name)) $("planner").value = status.planner.name;
+  const selectedPlanner = planners.find(planner => planner.name === $("planner").value);
+  $("planner-panel").hidden = !planners.length;
+  $("planner").disabled = engaged;
+  $("planner-argument").hidden = selectedPlanner?.category !== 'offline';
+  $("planner-argument").disabled = engaged;
+  $("planner-state").textContent = plannerPhases[plannerPhase] || plannerPhase;
+  $("planner-state").dataset.phase = plannerPhase;
+  // 加载、预热、生成阶段显示准备进度，没有估计值（0）时显示为进行中；有限长度的参考显示播放进度
+  const plannerPreparing = plannerPreparingPhases.includes(plannerPhase);
+  const plannerProgress = Math.min(1, Math.max(0, Number(status?.planner?.progress) || 0));
+  $("planner-progress-row").hidden = !(plannerPreparing || (plannerPhase === 'RUNNING' && plannerProgress > 0));
+  if (plannerPreparing && !plannerProgress) $("planner-progress").removeAttribute('value');
+  else $("planner-progress").value = plannerProgress;
+  $("planner-progress-label").textContent = plannerPreparing && !plannerProgress ? '' : `${Math.round(plannerProgress * 100)}%`;
+  $("planner-detail").textContent = plannerSummary(status?.planner, selectedPlanner?.display_name || selectedPlanner?.name);
+  // 规划器和交互动作共用同一条参考动作：一方占用时另一方不可启动
+  $("start-planner").disabled = !rl || busy || engaged || actionBusy || !selectedPlanner;
+  $("stop-planner").disabled = !rl || busy || !plannerShown;
+  $("start-action").disabled = !actionReady || busy || actionBusy || engaged || !actions.length;
   $("cancel-action").disabled = !actionReady || busy || !actionBusy;
   $("start-reference").hidden = trajectory || !p?.manual_reference;
   $("start-reference").disabled = !rl || busy;
@@ -464,6 +524,13 @@ document.querySelectorAll('[data-speed-mode]').forEach(button => {
 $("acquire").onclick = () => request('acquire');
 $("release").onclick = () => releaseControl();
 $("policy").onchange = () => render();
+$("planner").onchange = () => render();
+$("start-planner").onclick = () => {
+  endMotion();
+  const offline = activePolicy()?.planners?.find(planner => planner.name === $("planner").value)?.category === 'offline';
+  request('planner', {name:$("planner").value, argument:offline ? $("planner-argument").value.trim() : ''});
+};
+$("stop-planner").onclick = () => { endMotion(); request('planner_stop'); };
 $("select-policy").onclick = () => { endMotion(); request('policy', {policy:$("policy").value}); };
 $("start-action").onclick = () => request('interaction', {action:$("action").value});
 $("cancel-action").onclick = () => request('cancel');

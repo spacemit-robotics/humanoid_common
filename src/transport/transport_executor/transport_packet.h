@@ -38,10 +38,12 @@ namespace transport {
 // ==================== 协议常量 ====================
 
 static constexpr uint32_t kMagic = 0x484D5253;  ///< "HMRS" 魔数
-static constexpr uint16_t kVersion = 7;         ///< 协议版本（策略请求序号及结果回传）
+static constexpr uint16_t kVersion = 8;         ///< 协议版本（运行环境、规划器请求及状态回传）
 static constexpr int kMaxDof = 64;              ///< 最大自由度数
 static constexpr std::size_t kPolicyNameLength = 64;
 static constexpr std::size_t kInteractionNameLength = 64;
+static constexpr std::size_t kPlannerNameLength = 64;
+static constexpr std::size_t kPlannerArgumentLength = robot_base::kPlannerArgumentMaxLength + 1;
 static constexpr std::size_t kFaultDetailLength = 160;
 
 // ==================== 消息类型 ====================
@@ -95,6 +97,10 @@ struct HmiCmdPacket {
     uint64_t interaction_sequence = 0;
     uint8_t interaction_operation = 0;
     char interaction_action[kInteractionNameLength] = {};
+    uint64_t planner_sequence = 0;
+    uint8_t planner_operation = 0;
+    char planner_name[kPlannerNameLength] = {};
+    char planner_argument[kPlannerArgumentLength] = {};
 };
 
 /**
@@ -118,6 +124,7 @@ struct RobotStatePacket {
     double joint_temperature[kMaxDof] = {0.0};
     uint32_t joint_error[kMaxDof] = {0};
     FaultPacket fault{};
+    uint8_t environment = 0;  ///< robot_base::RuntimeEnvironment
 };
 
 /**
@@ -143,6 +150,20 @@ struct PolicySwitchPacket {
     uint64_t sequence = 0;
     uint8_t phase = 0;
     char policy[kPolicyNameLength] = {};
+    char detail[kFaultDetailLength] = {};
+};
+
+/** @brief robot_base::PlannerStatus 的固定布局。 */
+struct PlannerStatusPacket {
+    uint64_t sequence = 0;
+    uint8_t request_accepted = 0;
+    uint8_t phase = 0;
+    char planner[kPlannerNameLength] = {};
+    float progress = 0.0f;
+    uint32_t plan_count = 0;
+    float plan_rate_hz = 0.0f;
+    float last_plan_ms = 0.0f;
+    float reference_remaining_s = 0.0f;
     char detail[kFaultDetailLength] = {};
 };
 
@@ -176,7 +197,7 @@ struct ControlStatusPacket {
     int8_t control_mode = 0;
     uint8_t zero_ready = 0;
     uint8_t hmi_connected = 0;
-    uint8_t reserved = 0;
+    uint8_t environment = 0;  ///< robot_base::RuntimeEnvironment
     float vx = 0.0f;
     float vy = 0.0f;
     float wz = 0.0f;
@@ -189,11 +210,12 @@ struct ControlStatusPacket {
     char interaction_action[kInteractionNameLength] = {};
     PolicySwitchPacket policy_switch{};
     FaultPacket fault{};
+    PlannerStatusPacket planner{};
 };
 
 #pragma pack(pop)
 
-static_assert(sizeof(ControlStatusPacket) == 592, "Keep the v7 heartbeat wire layout");
+static_assert(sizeof(ControlStatusPacket) == 846, "Unexpected v8 control status packet size");
 static_assert(kMaxDof == robot_base::RobotFeedback::kMaxJoints, "Feedback joint capacity must match");
 
 inline std::size_t FeedbackPacketSize(int num_dof) {
@@ -335,6 +357,11 @@ inline bool ValidControlModeValue(int8_t value) {
     return false;
 }
 
+inline bool ValidEnvironmentValue(uint8_t value) {
+    return robot_base::IsValidRuntimeEnvironment(
+        static_cast<robot_base::RuntimeEnvironment>(value));
+}
+
 inline bool ValidCommandKey(int32_t key) {
     return key == -1 || (key >= 0 && key <= robot_base::kCommandStartReference);
 }
@@ -363,6 +390,48 @@ inline bool ValidInteractionPhaseValue(uint8_t value) {
         return true;
     }
     return false;
+}
+
+inline bool ValidPlannerOperationValue(uint8_t value) {
+    using Operation = robot_base::PlannerRequest::Operation;
+    switch (static_cast<Operation>(value)) {
+    case Operation::NONE:
+    case Operation::START:
+    case Operation::STOP:
+        return true;
+    }
+    return false;
+}
+
+inline bool ValidPlannerPhaseValue(uint8_t value) {
+    return value <= static_cast<uint8_t>(robot_base::PlannerStatus::Phase::FAILED);
+}
+
+inline bool CanEncodePlannerRequest(const robot_base::PlannerRequest &request) {
+    if (!ValidPlannerOperationValue(static_cast<uint8_t>(request.operation)) ||
+        request.planner.size() >= kPlannerNameLength ||
+        request.planner.find('\0') != std::string::npos ||
+        request.argument.size() >= kPlannerArgumentLength ||
+        request.argument.find('\0') != std::string::npos) {
+        return false;
+    }
+    if (request.operation == robot_base::PlannerRequest::Operation::START) {
+        return request.sequence != 0 && !request.planner.empty();
+    }
+    if (!request.planner.empty() || !request.argument.empty()) return false;
+    return request.operation != robot_base::PlannerRequest::Operation::STOP ||
+        request.sequence != 0;
+}
+
+inline bool CanEncodePlannerStatus(const robot_base::PlannerStatus &status) {
+    const auto non_negative = [](float value) { return std::isfinite(value) && value >= 0.0F; };
+    return ValidPlannerPhaseValue(static_cast<uint8_t>(status.phase)) &&
+        non_negative(status.progress) && status.progress <= 1.0F &&
+        non_negative(status.plan_rate_hz) && non_negative(status.last_plan_ms) &&
+        non_negative(status.reference_remaining_s) &&
+        status.planner.size() < kPlannerNameLength &&
+        status.planner.find('\0') == std::string::npos &&
+        status.detail.find('\0') == std::string::npos;
 }
 
 inline bool CanEncodeInteractionRequest(
@@ -508,7 +577,8 @@ inline bool CanEncodeRobotState(const robot_base::RobotData &state,
         !AllFinite(state.base_pos) || !AllFinite(state.base_quat) ||
         !AllFinite(state.base_vel) || !AllFinite(state.joint_pos) ||
         !AllFinite(state.joint_vel) || !AllFinite(state.joint_torque) ||
-        !AllFinite(state.joint_temperature) || !CanEncodeFault(fault)) {
+        !AllFinite(state.joint_temperature) || !CanEncodeFault(fault) ||
+        !robot_base::IsValidRuntimeEnvironment(state.environment)) {
         return false;
     }
     double quaternion_norm_squared = 0.0;
@@ -540,7 +610,8 @@ inline bool CanEncodeCommand(const robot_base::Command &command) {
         std::isfinite(command.vy) && std::isfinite(command.wz) &&
         command.switch_policy.size() < kPolicyNameLength &&
         command.switch_policy.find('\0') == std::string::npos &&
-        CanEncodeInteractionRequest(command.interaction);
+        CanEncodeInteractionRequest(command.interaction) &&
+        CanEncodePlannerRequest(command.planner);
 }
 
 inline bool CanEncodeStatus(const robot_base::ControlStatus &status,
@@ -553,6 +624,8 @@ inline bool CanEncodeStatus(const robot_base::ControlStatus &status,
         status.active_policy.find('\0') == std::string::npos &&
         CanEncodeInteractionStatus(status.interaction) &&
         CanEncodePolicySwitch(status.policy_switch) &&
+        robot_base::IsValidRuntimeEnvironment(status.environment) &&
+        CanEncodePlannerStatus(status.planner) &&
         CanEncodeFault(fault);
 }
 
@@ -567,7 +640,14 @@ inline bool ValidHmiCmdPacket(const HmiCmdPacket &packet) {
             packet.interaction_sequence,
             static_cast<robot_base::InteractionRequest::Operation>(
                 packet.interaction_operation),
-            DecodeText(packet.interaction_action)});
+            DecodeText(packet.interaction_action)}) &&
+        ValidPlannerOperationValue(packet.planner_operation) &&
+        HasNullTerminator(packet.planner_name) &&
+        HasNullTerminator(packet.planner_argument) &&
+        CanEncodePlannerRequest({
+            packet.planner_sequence,
+            static_cast<robot_base::PlannerRequest::Operation>(packet.planner_operation),
+            DecodeText(packet.planner_name), DecodeText(packet.planner_argument)});
 }
 
 inline bool ValidRobotStatePacket(const RobotStatePacket &packet) {
@@ -581,7 +661,7 @@ inline bool ValidRobotStatePacket(const RobotStatePacket &packet) {
         !FinitePrefix(packet.joint_vel, packet.num_dof) ||
         !FinitePrefix(packet.joint_torque, packet.num_dof) ||
         !FinitePrefix(packet.joint_temperature, packet.num_dof) ||
-        !ValidFaultPacket(packet.fault)) {
+        !ValidFaultPacket(packet.fault) || !ValidEnvironmentValue(packet.environment)) {
         return false;
     }
     double quaternion_norm_squared = 0.0;
@@ -609,10 +689,69 @@ inline bool ValidControlCmdPacket(const ControlCmdPacket &packet) {
     return true;
 }
 
+inline void EncodePlannerRequest(const robot_base::PlannerRequest &request,
+        HmiCmdPacket *packet) {
+    packet->planner_sequence = request.sequence;
+    packet->planner_operation = static_cast<uint8_t>(request.operation);
+    std::strncpy(packet->planner_name, request.planner.c_str(),
+        sizeof(packet->planner_name) - 1);
+    std::strncpy(packet->planner_argument, request.argument.c_str(),
+        sizeof(packet->planner_argument) - 1);
+}
+
+inline void DecodePlannerRequest(const HmiCmdPacket &packet,
+        robot_base::PlannerRequest *request) {
+    request->sequence = packet.planner_sequence;
+    request->operation =
+        static_cast<robot_base::PlannerRequest::Operation>(packet.planner_operation);
+    request->planner = DecodeText(packet.planner_name);
+    request->argument = DecodeText(packet.planner_argument);
+}
+
+inline void EncodePlannerStatus(const robot_base::PlannerStatus &status,
+        PlannerStatusPacket *packet) {
+    *packet = {};
+    packet->sequence = status.sequence;
+    packet->request_accepted = status.request_accepted ? 1 : 0;
+    packet->phase = static_cast<uint8_t>(status.phase);
+    std::strncpy(packet->planner, status.planner.c_str(), sizeof(packet->planner) - 1);
+    packet->progress = status.progress;
+    packet->plan_count = status.plan_count;
+    packet->plan_rate_hz = status.plan_rate_hz;
+    packet->last_plan_ms = status.last_plan_ms;
+    packet->reference_remaining_s = status.reference_remaining_s;
+    const auto detail = DetailForPacket(status.detail);
+    std::strncpy(packet->detail, detail.c_str(), sizeof(packet->detail) - 1);
+}
+
+inline void DecodePlannerStatus(const PlannerStatusPacket &packet,
+        robot_base::PlannerStatus *status) {
+    status->sequence = packet.sequence;
+    status->request_accepted = packet.request_accepted != 0;
+    status->phase = static_cast<robot_base::PlannerStatus::Phase>(packet.phase);
+    status->planner = DecodeText(packet.planner);
+    status->progress = packet.progress;
+    status->plan_count = packet.plan_count;
+    status->plan_rate_hz = packet.plan_rate_hz;
+    status->last_plan_ms = packet.last_plan_ms;
+    status->reference_remaining_s = packet.reference_remaining_s;
+    status->detail = DecodeText(packet.detail);
+}
+
+inline bool ValidPlannerStatusPacket(const PlannerStatusPacket &packet) {
+    if (packet.request_accepted > 1 || !ValidPlannerPhaseValue(packet.phase) ||
+        !HasNullTerminator(packet.planner) || !HasNullTerminator(packet.detail)) {
+        return false;
+    }
+    robot_base::PlannerStatus status;
+    DecodePlannerStatus(packet, &status);
+    return CanEncodePlannerStatus(status);
+}
+
 inline bool ValidControlStatusPacket(const ControlStatusPacket &packet) {
     return ValidHeader(packet.header, MsgType::CONTROL_STATUS) &&
         ValidControlModeValue(packet.control_mode) && packet.zero_ready <= 1 &&
-        packet.hmi_connected <= 1 && packet.reserved == 0 &&
+        packet.hmi_connected <= 1 && ValidEnvironmentValue(packet.environment) &&
         std::isfinite(packet.vx) && std::isfinite(packet.vy) &&
         std::isfinite(packet.wz) && std::isfinite(packet.rl_frequency_hz) &&
         packet.rl_frequency_hz >= 0.0f && HasNullTerminator(packet.active_policy) &&
@@ -627,7 +766,8 @@ inline bool ValidControlStatusPacket(const ControlStatusPacket &packet) {
                 packet.interaction_phase),
             packet.interaction_progress,
             DecodeText(packet.interaction_action)}) &&
-        ValidPolicySwitchPacket(packet.policy_switch) && ValidFaultPacket(packet.fault);
+        ValidPolicySwitchPacket(packet.policy_switch) && ValidFaultPacket(packet.fault) &&
+        ValidPlannerStatusPacket(packet.planner);
 }
 
 inline void EncodeFault(

@@ -34,7 +34,7 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
     operator_gamepad::SuccessFeedback feedback;
     operator_gamepad::Rumble rumble;
     bool armed = false, owned = false;
-    std::string previous_error, previous_policy, previous_state, previous_fault;
+    std::string previous_error, previous_policy, previous_state, previous_fault, previous_planner;
     auto next_device = Clock::now(), next_connection = next_device, last_renew = next_device;
     auto last_send = next_device;
     const auto clear = [&] {
@@ -109,11 +109,16 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
             if (!status.online || !owned) {
                 armed = false;
             }
-            if (status.policy != previous_policy || status.state != previous_state) {
+            // A running planner takes over the velocity commands and their range.
+            const std::string planner = status.planner.phase == "RUNNING" ? status.planner.name : "";
+            if (status.policy != previous_policy || status.state != previous_state ||
+                planner != previous_planner) {
                 armed = false;
                 previous_policy = status.policy;
                 previous_state = status.state;
-                std::printf("[gamepad] state=%s policy=%s\n", status.state.c_str(), status.policy.c_str());
+                previous_planner = planner;
+                std::printf("[gamepad] state=%s policy=%s planner=%s\n", status.state.c_str(),
+                    status.policy.c_str(), planner.empty() ? "none" : planner.c_str());
             }
             const auto fault = status.fault.latched ? status.fault.source + "/" + status.fault.code : "";
             if (fault != previous_fault) {
@@ -176,7 +181,10 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
                 reply = client.RequestState(command.value);
             } else if (command.operation == "policy") reply = client.SelectPolicy(command.value);
             else if (command.operation == "action") reply = client.StartInteraction(command.value);
-            else if (command.operation == "cancel") reply = client.CancelInteraction();
+            else if (command.operation == "planner") reply = client.StartPlanner(command.value);
+            // Cancel frees the reference from whichever holds it: a planner or a catalog action.
+            else if (command.operation == "cancel") reply = status.planner.Engaged() ||
+                status.planner.phase == "FAILED" ? client.StopPlanner() : client.CancelInteraction();
             else if (command.operation == "reference") reply = client.StartReference();
             else if (command.operation == "ack") reply = client.AcknowledgeFault();
             Report(label, reply);

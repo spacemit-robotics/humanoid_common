@@ -238,6 +238,9 @@ public:
         const auto now = std::chrono::steady_clock::now();
         const bool publish = now - last_publish >= std::chrono::milliseconds(100);
         if (publish) last_publish = now;
+        // Sessions authenticated earlier hold the catalog of their hello reply.
+        const bool publish_catalog = catalog_revision != service.CatalogRevision();
+        catalog_revision = service.CatalogRevision();
         std::optional<std::string> feedback_message;
         for (auto it = sessions.begin(); it != sessions.end();) {
             const auto session = it->lock();
@@ -246,6 +249,8 @@ public:
                 continue;
             }
             if (service.Authenticated(session->Id())) {
+                if (publish_catalog)
+                    session->Send({{"v", 1}, {"event", "catalog"}, {"data", service.Catalog()}});
                 if (publish)
                     session->Send(
                         {{"v", 1}, {"event", "status"}, {"data", service.StatusMessage(session->Id())}}, true);
@@ -273,6 +278,7 @@ public:
     int connections = 0;
     bool send_failed = false;
     std::chrono::steady_clock::time_point last_publish{};
+    uint64_t catalog_revision = 0;
 };
 Session::Session(Tcp::socket socket, Server &server) : server_(server), stream_(std::move(socket)) {
     ++server_.connections;

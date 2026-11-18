@@ -61,6 +61,10 @@ public:
                 (status.interaction_action != previous_.interaction_action ||
                     (previous_.interaction_phase != "BLEND_IN" && previous_.interaction_phase != "PLAYING")))
                 cues.push_back("action." + status.interaction_action);
+            // A planner is announced once it has taken over the reference.
+            if (status.state == "RL" && !status.fault.latched && status.planner.phase == "RUNNING" &&
+                (previous_.planner.phase != "RUNNING" || status.planner.name != previous_.planner.name))
+                cues.push_back("planner." + status.planner.name);
         }
         previous_ = status;
         return cues;

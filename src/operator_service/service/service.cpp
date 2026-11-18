@@ -18,6 +18,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "planner_catalog.h"
+#include "policy_availability.h"
 #include "policy_command_limits.h"
 #include "qrcodegen.hpp"
 #include "runtime_logger.h"
@@ -64,6 +66,33 @@ const char *PhaseName(robot_base::InteractionStatus::Phase phase) {
         return "REJECTED";
     }
     return "UNKNOWN";
+}
+const char *PhaseName(robot_base::PlannerStatus::Phase phase) {
+    using P = robot_base::PlannerStatus::Phase;
+    switch (phase) {
+    case P::IDLE:
+        return "IDLE";
+    case P::LOADING:
+        return "LOADING";
+    case P::WARMING:
+        return "WARMING";
+    case P::READY:
+        return "READY";
+    case P::GENERATING:
+        return "GENERATING";
+    case P::RUNNING:
+        return "RUNNING";
+    case P::STOPPING:
+        return "STOPPING";
+    case P::FAILED:
+        return "FAILED";
+    }
+    return "UNKNOWN";
+}
+// The tracker follows the planner or is preparing to.
+bool Engaged(robot_base::PlannerStatus::Phase p) {
+    using P = robot_base::PlannerStatus::Phase;
+    return p == P::LOADING || p == P::WARMING || p == P::GENERATING || p == P::RUNNING || p == P::STOPPING;
 }
 bool Busy(robot_base::InteractionStatus::Phase p) {
     using P = robot_base::InteractionStatus::Phase;
@@ -226,6 +255,7 @@ Config LoadConfig(const std::string &path) {
         const auto catalog = yaml.Read<std::string>("behavior_manager.trajectory.catalog")
             .value_or("behavior_manager.trajectory");
         c.actions = LoadActions(file ? robot_base::YamlFile::Load(yaml.ToAbsPath(*file)) : yaml, catalog);
+        c.action_environments[""] = runtime_config::LoadTrajectoryActionEnvironments(yaml);
         return c;
     }
     const auto names =
@@ -250,21 +280,32 @@ Config LoadConfig(const std::string &path) {
         const auto fast = p.fast_limits ? p.fast_limits : c.teleop.fast_limits;
         if (slow && fast && (slow->vx > fast->vx || slow->vy > fast->vy || slow->wz > fast->wz))
             throw std::runtime_error(base + ".command.teleop slow_limits must not exceed fast_limits");
-        const std::string adapter = base + ".policy_adapter";
-        const auto type = yaml.Read<std::string>(adapter + ".type").value_or("");
-        const auto configured = yaml.Read<std::string>(adapter +
-            (type == "stance_motion" ? ".joint_trajectory.catalog" : ".catalog"));
-        if (type == "joint_trajectory" ||
-            ((type == "sonic" || type == "supermimic" || type == "stance_motion" ||
-                type == "history_actor") &&
-                configured && !configured->empty())) {
-            const std::string catalog = configured.value_or(adapter);
-            p.actions = LoadActions(yaml, catalog);
+        const auto catalog = runtime_config::PolicyActionCatalog(yaml, name);
+        if (!catalog.empty()) p.actions = LoadActions(yaml, catalog);
+        if (catalog == base + ".policy_actions") p.manual_reference = false;
+        c.policy_environments[name] = runtime_config::LoadPolicyEnvironments(yaml, name);
+        c.action_environments[name] = runtime_config::LoadActionEnvironments(yaml, catalog);
+        for (const auto &entry : runtime_config::LoadPolicyPlanners(yaml, name)) {
+            Planner planner;
+            planner.name = entry.name;
+            planner.display_name = entry.display_name;
+            planner.category = entry.category;
+            planner.type = entry.type;
+            planner.minimum = {entry.limits.min_vx, entry.limits.min_vy, entry.limits.min_wz};
+            planner.maximum = {entry.limits.max_vx, entry.limits.max_vy, entry.limits.max_wz};
+            planner.client_smoothing = yaml.Read<bool>(entry.base + ".command.smoothing").value_or(true);
+            planner.slow_limits = ReadTeleopVector(yaml, "slow_limits", false, entry.base + ".command.teleop");
+            planner.fast_limits = ReadTeleopVector(yaml, "fast_limits", false, entry.base + ".command.teleop");
+            const auto planner_slow = planner.slow_limits ? planner.slow_limits : c.teleop.slow_limits;
+            const auto planner_fast = planner.fast_limits ? planner.fast_limits : c.teleop.fast_limits;
+            if (planner_slow && planner_fast && (planner_slow->vx > planner_fast->vx ||
+                    planner_slow->vy > planner_fast->vy || planner_slow->wz > planner_fast->wz))
+                throw std::runtime_error(
+                    entry.base + ".command.teleop slow_limits must not exceed fast_limits");
+            c.planner_environments[entry.name] = entry.environments;
+            p.planners.push_back(std::move(planner));
         }
-        if (yaml.Read<std::vector<std::string>>(base + ".policy_actions.action_names")) {
-            p.actions = LoadActions(yaml, base + ".policy_actions");
-            p.manual_reference = false;
-        }
+        p.auto_planner = yaml.Read<std::string>(base + ".policy_adapter.auto_planner").value_or("");
         c.policies.push_back(p);
     }
     return c;
@@ -275,12 +316,29 @@ Service::Service(Config config) : config_(std::move(config)) {
         throw std::runtime_error("invalid operator admin_password_hash");
     if (!config_.admin_password_hash.empty() && TokenEqual(config_.control_token, config_.token))
         throw std::runtime_error("public and control tokens must differ when administrator access is enabled");
-    for (auto &policy : config_.policies) {
-        const Velocity full{std::max(-policy.minimum.vx, policy.maximum.vx),
-            std::max(-policy.minimum.vy, policy.maximum.vy), std::max(-policy.minimum.wz, policy.maximum.wz)};
-        if (!policy.slow_limits) policy.slow_limits = config_.teleop.slow_limits.value_or(
+    // Presets default to the global teleop limits, else to 40% and 100% of the range.
+    const auto fill_presets = [this](const Velocity &minimum, const Velocity &maximum,
+            std::optional<Velocity> *slow, std::optional<Velocity> *fast) {
+        const Velocity full{std::max(-minimum.vx, maximum.vx),
+            std::max(-minimum.vy, maximum.vy), std::max(-minimum.wz, maximum.wz)};
+        if (!*slow) *slow = config_.teleop.slow_limits.value_or(
             Velocity{full.vx * 0.4, full.vy * 0.4, full.wz * 0.4});
-        if (!policy.fast_limits) policy.fast_limits = config_.teleop.fast_limits.value_or(full);
+        if (!*fast) *fast = config_.teleop.fast_limits.value_or(full);
+    };
+    for (auto &policy : config_.policies) {
+        fill_presets(policy.minimum, policy.maximum, &policy.slow_limits, &policy.fast_limits);
+        for (auto &planner : policy.planners) {
+            fill_presets(planner.minimum, planner.maximum, &planner.slow_limits, &planner.fast_limits);
+            Policy profile;
+            profile.name = planner.name;
+            profile.display_name = planner.display_name;
+            profile.minimum = planner.minimum;
+            profile.maximum = planner.maximum;
+            profile.client_smoothing = planner.client_smoothing;
+            profile.slow_limits = planner.slow_limits;
+            profile.fast_limits = planner.fast_limits;
+            planner_profiles_[planner.name] = std::move(profile);
+        }
     }
     velocity_at_ = Now();
 }
@@ -310,6 +368,38 @@ const Policy *Service::ActivePolicy() const {
         [this](const Policy &p) { return p.name == status_.active_policy; });
     return it == config_.policies.end() ? nullptr : &*it;
 }
+const Policy *Service::CommandPolicy() const {
+    if (status_.planner.phase == robot_base::PlannerStatus::Phase::RUNNING) {
+        const auto profile = planner_profiles_.find(status_.planner.planner);
+        if (profile != planner_profiles_.end()) return &profile->second;
+    }
+    return ActivePolicy();
+}
+const Planner *Service::ActivePlanner(const std::string &name) const {
+    const auto *policy = ActivePolicy();
+    if (!policy) return nullptr;
+    const auto it = std::find_if(policy->planners.begin(), policy->planners.end(),
+        [&](const Planner &p) { return p.name == name; });
+    return it == policy->planners.end() ? nullptr : &*it;
+}
+bool Service::PlannerEnabled(const std::string &planner) const {
+    const auto it = config_.planner_environments.find(planner);
+    return it == config_.planner_environments.end() || it->second.Allows(status_.environment);
+}
+bool Service::PolicyEnabled(const std::string &policy) const {
+    const auto it = config_.policy_environments.find(policy);
+    return it == config_.policy_environments.end() || it->second.Allows(status_.environment);
+}
+bool Service::ActionEnabled(const std::string &policy, const std::string &action) const {
+    const auto catalog = config_.action_environments.find(policy);
+    if (catalog == config_.action_environments.end()) return true;
+    const auto it = catalog->second.find(action);
+    return it == catalog->second.end() || it->second.Allows(status_.environment);
+}
+std::string Service::EnvironmentMessage(const std::string &item) const {
+    return item + " is not enabled in the " + robot_base::RuntimeEnvironmentName(status_.environment) +
+        " environment";
+}
 void Service::Finish(const std::string &phase, const std::string &message) {
     result_.phase = phase;
     result_.message = message;
@@ -327,7 +417,7 @@ void Service::ClearVelocity(bool immediate) {
     target_velocity_ = {};
     normalized_input_ = false;
     velocity_until_ = 0;
-    const auto *policy = ActivePolicy();
+    const auto *policy = CommandPolicy();
     if (immediate || !policy || !policy->client_smoothing) command_.vx = command_.vy = command_.wz = 0;
 }
 Velocity Service::TeleopTarget(const Policy &policy) const {
@@ -342,7 +432,7 @@ Velocity Service::TeleopTarget(const Policy &policy) const {
 void Service::AdvanceVelocity(double now) {
     const auto dt = std::clamp(now - velocity_at_, 0.0, 0.1);
     velocity_at_ = now;
-    const auto *policy = ActivePolicy();
+    const auto *policy = CommandPolicy();
     if (!Online() || !policy || status_.mode != robot_base::ControlMode::RL || fault_.latched || fault_.active) {
         ClearVelocity(true);
         return;
@@ -363,7 +453,7 @@ void Service::AdvanceVelocity(double now) {
 }
 bool Service::SelectPreset(uint64_t session, const std::string &preset) {
     if (owner_ != session || !Online() || (preset != "slow" && preset != "fast")) return false;
-    const auto *policy = ActivePolicy();
+    const auto *policy = CommandPolicy();
     const auto selected = policy && !policy->HasSpeedModes() ? "slow" : preset;
     if (teleop_preset_ != selected) {
         teleop_preset_ = selected;
@@ -385,6 +475,16 @@ void Service::ClearInput(const std::string &reason, bool immediate) {
     command_.interaction.sequence = std::max(command_.interaction.sequence, status_.interaction.sequence) + 1;
     command_.interaction.operation = robot_base::InteractionRequest::Operation::CANCEL;
     command_.interaction.action.clear();
+    // A motion generated by an offline planner ends with the operator's control,
+    // like a catalog action. A realtime planner keeps running on a zero command.
+    const auto *planner = ActivePlanner(status_.planner.planner);
+    if (planner && planner->category == "offline" && Engaged(status_.planner.phase)) {
+        command_.planner.sequence = std::max(command_.planner.sequence, status_.planner.sequence) + 1;
+        if (command_.planner.sequence == 0) ++command_.planner.sequence;
+        command_.planner.operation = robot_base::PlannerRequest::Operation::STOP;
+        command_.planner.planner.clear();
+        command_.planner.argument.clear();
+    }
 }
 void Service::Tick() {
     const auto now = Now();
@@ -411,9 +511,22 @@ void Service::Tick() {
         command_.interaction.operation = robot_base::InteractionRequest::Operation::NONE;
         command_.interaction.action.clear();
     }
+    if (command_.planner.operation != robot_base::PlannerRequest::Operation::NONE &&
+        (status_.mode != robot_base::ControlMode::RL ||
+            status_.planner.sequence == command_.planner.sequence)) {
+        command_.planner.operation = robot_base::PlannerRequest::Operation::NONE;
+        command_.planner.planner.clear();
+        command_.planner.argument.clear();
+    }
 }
 void Service::UpdateStatus(const robot_base::ControlStatus &status, const robot_base::FaultStatus &fault) {
-    const bool changed = status.mode != status_.mode || status.active_policy != status_.active_policy;
+    // A planner starting or stopping changes who receives velocity commands and their range.
+    using PlannerPhase = robot_base::PlannerStatus::Phase;
+    const bool planner_runs = status.planner.phase == PlannerPhase::RUNNING;
+    const bool changed = status.mode != status_.mode || status.active_policy != status_.active_policy ||
+        planner_runs != (status_.planner.phase == PlannerPhase::RUNNING) ||
+        (planner_runs && status.planner.planner != status_.planner.planner);
+    if (status.environment != status_.environment) ++catalog_revision_;
     status_ = status;
     fault_ = fault;
     status_at_ = Now();
@@ -450,6 +563,15 @@ void Service::UpdateStatus(const robot_base::ControlStatus &status, const robot_
         Finish(status.interaction.request_accepted ? "completed" : "rejected", "control handled action request");
         command_.interaction.operation = robot_base::InteractionRequest::Operation::NONE;
         command_.interaction.action.clear();
+    } else if ((result_.operation == "planner" || result_.operation == "planner_stop") &&
+        command_.planner.sequence == status.planner.sequence) {
+        // Later failures of an accepted start are reported by the planner phase and detail.
+        if (status.planner.request_accepted) Finish("completed", "control handled planner request");
+        else Finish("rejected", status.planner.detail.empty() ? "control rejected planner request"
+            : status.planner.detail);
+        command_.planner.operation = robot_base::PlannerRequest::Operation::NONE;
+        command_.planner.planner.clear();
+        command_.planner.argument.clear();
     } else if (result_.operation == "ack" && !fault.latched) {
         Finish("completed", "control acknowledged fault");
     }
@@ -522,6 +644,7 @@ Status Service::Snapshot(uint64_t session) const {
     s.hmi_connected = status_.hmi_connected;
     s.zero_ready = status_.zero_ready;
     s.trajectory_enabled = config_.trajectory_enabled;
+    s.environment = robot_base::RuntimeEnvironmentName(status_.environment);
     s.state = StateName(status_.mode);
     s.policy = status_.active_policy;
     s.age_ms = status_at_ < 0 ? 0 : std::max(0.0, (Now() - status_at_) * 1000);
@@ -542,6 +665,16 @@ Status Service::Snapshot(uint64_t session) const {
     s.interaction_accepted = status_.interaction.request_accepted;
     s.teleop_preset = teleop_preset_;
     s.teleop_preset_sequence = teleop_preset_sequence_;
+    s.planner.name = status_.planner.planner;
+    s.planner.phase = PhaseName(status_.planner.phase);
+    s.planner.progress = status_.planner.progress;
+    s.planner.sequence = status_.planner.sequence;
+    s.planner.accepted = status_.planner.request_accepted;
+    s.planner.plan_count = status_.planner.plan_count;
+    s.planner.plan_rate_hz = status_.planner.plan_rate_hz;
+    s.planner.last_plan_ms = status_.planner.last_plan_ms;
+    s.planner.reference_remaining_s = status_.planner.reference_remaining_s;
+    s.planner.detail = status_.planner.detail;
     s.request = result_;
     return s;
 }
@@ -555,9 +688,20 @@ Json Service::StatusMessage(uint64_t session) const {
 }
 Json Service::Catalog() const {
     Json policies = Json::array();
-    for (const auto &p : config_.policies) policies.push_back(Encode(p));
+    for (const auto &p : config_.policies) {
+        if (!PolicyEnabled(p.name)) continue;
+        Policy visible = p;
+        visible.actions.erase(std::remove_if(visible.actions.begin(), visible.actions.end(),
+            [&](const Action &a) { return !ActionEnabled(p.name, a.key); }), visible.actions.end());
+        visible.planners.erase(std::remove_if(visible.planners.begin(), visible.planners.end(),
+            [&](const Planner &planner) { return !PlannerEnabled(planner.name); }), visible.planners.end());
+        if (!PlannerEnabled(visible.auto_planner)) visible.auto_planner.clear();
+        policies.push_back(Encode(visible));
+    }
     Json actions = Json::array();
-    for (const auto &a : config_.actions) actions.push_back({{"key", a.key}, {"display_name", a.display_name}});
+    for (const auto &a : config_.actions) {
+        if (ActionEnabled("", a.key)) actions.push_back({{"key", a.key}, {"display_name", a.display_name}});
+    }
     Json teleop = {{"deadzone", config_.teleop.deadzone},
         {"acceleration", Encode(config_.teleop.acceleration)},
         {"deceleration", Encode(config_.teleop.deceleration)}};
@@ -566,7 +710,8 @@ Json Service::Catalog() const {
     return {{"robot", config_.robot}, {"policies", policies}, {"lease_ms", config_.lease_ms},
         {"velocity_step", Encode(config_.velocity_step)}, {"trajectory_enabled", config_.trajectory_enabled},
         {"actions", actions}, {"teleop", teleop}, {"voice_chat_port", config_.voice_chat_port},
-        {"admin_required", !config_.admin_password_hash.empty()}};
+        {"admin_required", !config_.admin_password_hash.empty()},
+        {"environment", robot_base::RuntimeEnvironmentName(status_.environment)}};
 }
 Json Service::ReplyTo(
     uint64_t id, bool ok, const std::string &code, const std::string &message, const Json &data) const {
@@ -715,7 +860,7 @@ Json Service::Handle(uint64_t session, const Json &request) {
         if (op == "velocity" || op == "teleop") {
             if (config_.trajectory_enabled || status_.mode != robot_base::ControlMode::RL || fault_.latched || fault_.active)
                 return fail("not_ready", "velocity is only available in healthy RL");
-            const auto *policy = ActivePolicy();
+            const auto *policy = CommandPolicy();
             if (!policy) return fail("not_ready", "active policy has no catalog");
             const double vx = args.at("vx"), vy = args.at("vy"), wz = args.at("wz");
             const int ttl = args.value("valid_for_ms", 300);
@@ -755,6 +900,8 @@ Json Service::Handle(uint64_t session, const Json &request) {
             if (target == StateName(mode) && target != "POWER_OFF")
                 return ReplyTo(id, true, "ok", "already in requested state");
             if (!key) return fail("not_ready", "state prerequisite is not satisfied");
+            if (key == 3 && !config_.trajectory_enabled && !PolicyEnabled(status_.active_policy))
+                return fail("unavailable", EnvironmentMessage("policy " + status_.active_policy));
             command_.key = key;
             source_mode_ = mode;
             pending_target_ = target;
@@ -765,6 +912,7 @@ Json Service::Handle(uint64_t session, const Json &request) {
                 [&](const Policy &p) { return p.name == name; });
             if (selected == config_.policies.end())
                 return fail("bad_request", "unknown policy");
+            if (!PolicyEnabled(name)) return fail("unavailable", EnvironmentMessage("policy " + name));
             const auto *active = ActivePolicy();
             const bool hot = status_.mode == M::RL && active && !active->switch_group.empty() &&
                 active->switch_group == selected->switch_group;
@@ -783,6 +931,12 @@ Json Service::Handle(uint64_t session, const Json &request) {
             const auto *actions = config_.trajectory_enabled ? &config_.actions : (policy ? &policy->actions : nullptr);
             const auto action = args.value("action", "");
             if (op == "interaction" &&
+                !ActionEnabled(config_.trajectory_enabled || !policy ? "" : policy->name, action))
+                return fail("unavailable", EnvironmentMessage("action " + action));
+            if (Engaged(status_.planner.phase))
+                return fail("not_ready", "motion planner " + status_.planner.planner +
+                    " holds the reference; stop it first");
+            if (op == "interaction" &&
                 (!actions || Busy(status_.interaction.phase) ||
                     std::none_of(actions->begin(), actions->end(),
                         [&](const Action &a) { return a.key == action; })))
@@ -792,6 +946,38 @@ Json Service::Handle(uint64_t session, const Json &request) {
                 ? robot_base::InteractionRequest::Operation::START
                 : robot_base::InteractionRequest::Operation::CANCEL;
             command_.interaction.action = op == "interaction" ? action : "";
+        } else if (op == "planner" || op == "planner_stop") {
+            using Operation = robot_base::PlannerRequest::Operation;
+            if (config_.trajectory_enabled || status_.mode != M::RL)
+                return fail("not_ready", "motion planners run inside the RL state");
+            const bool start = op == "planner";
+            const auto name = start ? args.at("name").get<std::string>() : std::string();
+            const auto argument = start ? args.value("argument", "") : std::string();
+            if (start) {
+                const auto *planner = ActivePlanner(name);
+                if (!planner) return fail("bad_request", "unknown planner for the active policy");
+                if (!PlannerEnabled(name)) return fail("unavailable", EnvironmentMessage("planner " + name));
+                if (argument.size() > robot_base::kPlannerArgumentMaxLength ||
+                    std::any_of(argument.begin(), argument.end(),
+                        [](unsigned char c) { return c < 32 || c == 127; }))
+                    return fail("bad_request", "planner argument is too long or has control characters");
+                if (Busy(status_.interaction.phase))
+                    return fail("not_ready", "an action is in progress; cancel it or wait for it to finish");
+                if (Engaged(status_.planner.phase) &&
+                    (status_.planner.planner != name || planner->category != "realtime"))
+                    return fail("not_ready", "motion planner " + status_.planner.planner +
+                        " is active; stop it first");
+            } else if (!Engaged(status_.planner.phase) &&
+                status_.planner.phase != robot_base::PlannerStatus::Phase::FAILED) {
+                return ReplyTo(id, true, "ok", "no motion planner is active");
+            }
+            ClearVelocity(false);
+            command_.planner.sequence = std::max(command_.planner.sequence, status_.planner.sequence) + 1;
+            if (command_.planner.sequence == 0) ++command_.planner.sequence;
+            command_.planner.operation = start ? Operation::START : Operation::STOP;
+            command_.planner.planner = name;
+            command_.planner.argument = argument;
+            pending_target_ = name;
         } else if (op == "reference_start") {
             const auto *policy = ActivePolicy();
             if (config_.trajectory_enabled || status_.mode != M::RL || !policy || !policy->manual_reference)

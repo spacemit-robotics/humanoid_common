@@ -100,6 +100,12 @@ control 实际回报的状态，不把“已受理”当作“已完成”。
 - HOME/ZERO/RL 不跳过前置状态；RL 仍要求 ZERO 已到位，不改变原闭环阈值。
 - 策略在 POWER_OFF/DAMP 可选；RL 中仅允许切换到同一非空 `switch_group` 的策略。
   control 等待零速度、动作结束和新策略准备完成后执行切换。策略与动作列表及速度范围均读取 YAML。
+- 策略、动作和规划器的目录按 control 回传的运行环境（仿真 / 实机）过滤，当前环境未启用的
+  条目不列出，对应请求返回 `unavailable`；环境变化后目录版本更新，客户端重新读取。
+- 当前策略登记了规划器时，控制客户端可在 RL 中启动和停止规划器。规划器占用参考期间
+  （加载、预热、生成、运行、停止）动作请求返回 `not_ready`，动作播放期间规划器启动请求
+  返回 `not_ready`。实时规划器运行时速度范围、档位和平滑取该规划器的配置。释放控制权或
+  断连时速度归零，实时规划器继续运行并保持站立；离线规划器正在生成或播放的动作被停止。
 - 请求超时只说明未获确认，不自动重试；操作者应查看真实状态。重新连接不恢复旧命令。
 - HMI 心跳与客户端控制权分开，HMI 进程存活不能替客户端续租。
 
@@ -147,6 +153,12 @@ operator_service:
 策略配置 `command.smoothing: false` 时直接传递目标，由策略处理缓变；兼容原 `command.client_smoothing` 配置名。
 默认启用服务端平滑。目录中的 `service_smoothing` 表示此配置，旧 `client_smoothing` 始终为 false，避免旧网页重复平滑。
 
+当前策略登记了规划器时，网页在 RL 中显示规划器面板：选择规划器后点“启动”，离线
+规划器另有一个任务描述输入框。加载、预热和生成期间显示进度条，control 没有进度估计
+时显示不定进度；运行期间显示规划次数、单次耗时、每秒规划次数和参考余量。规划器
+运行时方向键和摇杆的速度范围、快慢档切换为该规划器的配置，点“停止”后回到待命并恢复
+策略自身的范围。规划器失败时面板显示原因，点“停止”清除。旁观者只看到状态。
+
 切换页面、失焦、进入后台、释放控制权或故障会清除旧输入；重新连接不恢复旧动作。
 普通松手不释放控制权。桌面空格和协议 `stop` 清零并释放控制权，网页不显示全局停止按钮。
 页面刷新异常清除输入并提示错误，但不关闭正常连接。诊断 `client_event` 记录方向按下、
@@ -154,11 +166,14 @@ operator_service:
 
 ### 终端
 
-终端按 `L` 接管，右箭头依次前进，左箭头退回；`p` 选策略，`A` 选动作，`G` 开始
+终端按 `L` 接管，右箭头依次前进，左箭头退回；`p` 选策略，`A` 选动作，`N` 选规划器，`G` 开始
 手动参考动作，`v` 进入速度页。速度页保留 `Q/W/E`、`A/S/D` 六键，按当前档位持续移动；`B` 切换快慢档，空格将目标归零，
 `U` 释放控制权，`X` 确认故障，`Ctrl+C` 退出。速度页 `Esc` 清零后返回。
 终端没有松键事件，松开按键不会停，须按空格；退出速度页清除方向。终端不承担扫码入口显示。
 网页方块按钮与终端 `C` 都发送 `cancel`，取消当前动作并按配置收回，不掉电；网页不再显示全局停止按钮。
+规划器准备、运行或失败时，终端 `C` 改为发送 `planner_stop`。主页面显示规划器的阶段、
+准备进度、单次规划耗时和每秒规划次数；速度页的范围随运行中的规划器切换。
+终端不提供离线规划器的任务描述输入。
 
 服务在现有 HMI 日志会话的 `events.log` 记录接管、释放、状态/策略/动作请求及确认结果。
 不记录 token、二维码内容或每次速度心跳。完整控制与硬件轨迹仍由原 control/driver 日志负责。
@@ -167,7 +182,7 @@ operator_service:
 ### 离线音频
 
 可选 `operator_audio` 在独立普通优先级进程观察已确认状态，播放 `audio_prompts`
-配置的离线文件。支持 `state.*`、`policy.*`、`action.*`、`preset.*`、`fault`、
+配置的离线文件。支持 `state.*`、`policy.*`、`planner.*`、`action.*`、`preset.*`、`fault`、
 `control.acquired/released`、`gamepad.connected/disconnected` 和服务事件；未配置的键不播。
 服务事件由启动器调用 `--once`；其他事件订阅本机操作服务。
 
@@ -177,6 +192,7 @@ operator_audio robot.yaml --once service.ready --dry-run
 ```
 
 `policy.*` 在成功进入 RL 或 RL 内完成策略切换时触发，不在发送请求时触发。
+`planner.<名字>` 在该规划器进入运行、开始接管参考时触发，加载和预热期间不触发。
 `audio_prompts.fault_repeat_interval_s` 设置锁存故障的重复间隔，默认 0 关闭重复；
 锁存清除或状态失联时取消待播及正在播放的故障提示。
 
@@ -218,10 +234,19 @@ WebSocket 路径 `/api/v1/ws`；JSON UTF-8 文本，版本 `v: 1`。建立连接
 | preset | `{"name":"fast"}` | 持有者选择 slow/fast，成功后在状态和语音中确认 |
 | stop | `{}` | 清零、撤销控制权和未完成请求；不是硬件急停 |
 | interaction / cancel | `{"action":"key"}` / `{}` | 开始、取消交互动作 |
+| planner / planner_stop | `{"name":"key","argument":"..."}` / `{}` | 启动、停止当前策略登记的规划器；`argument` 可省略，离线规划器用它传任务描述，最长 255 字节 |
 | reference_start | `{}` | 开始手动参考动作 |
 | ack | `{}` | POWER_OFF 下确认已解除的锁存故障 |
 
-状态包含 `online/state/zero_ready/policy/velocity/fault/owner/owns_control/interaction/request`。
+状态包含 `online/state/zero_ready/policy/velocity/fault/owner/owns_control/interaction/request`，
+以及 `environment`（`sim`、`real` 或 `unknown`）和 `planner`。
+`planner` 的字段为 `name`、`phase`（`IDLE/LOADING/WARMING/READY/GENERATING/RUNNING/STOPPING/FAILED`）、
+`progress`（0–1，准备进度或有限参考的播放进度，0 表示没有估计）、`plan_count`、`last_plan_ms`、
+`plan_rate_hz`、`reference_remaining_s` 和 `detail`。`planner` 请求的 `completed` 表示 control
+已接受启动，规划器随后经加载、预热进入 `RUNNING`，以 `planner.phase` 为准。
+没有规划器在准备或运行时，`planner_stop` 直接返回成功，不向 control 发送请求。
+目录中每个策略带有 `planners`（`name/display_name/category/type` 及与策略相同的速度范围字段）
+和 `auto_planner`；目录的 `environment` 与状态一致。旧客户端忽略这些字段。
 `target_velocity` 是限幅后的目标，`command_velocity` 是服务端平滑输出，`velocity` 是 control 的实际回报。
 `velocity` 操作使用 m/s、rad/s，不套用遥控档位；`teleop` 操作使用归一化输入，两者共用服务端平滑。
 网页状态额外包含 `admin/admin_login_pending/admin_login_error`；`admin_login` 返回 `pending` 后

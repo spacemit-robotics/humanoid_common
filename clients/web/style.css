@@ -94,7 +94,23 @@ progress::-webkit-progress-bar { background: #dfe5d9; border-radius: 3px; }
 progress::-webkit-progress-value { background: #86b527; border-radius: 3px; }
 progress::-moz-progress-bar { background: #86b527; border-radius: 3px; }
 .progress-row span { font-size: 11px; color: #6d7a61; font-variant-numeric: tabular-nums; min-width: 30px; }
+/* 没有 value 的进度条：耗时未知，用往复的色带表示正在进行 */
+progress:indeterminate { background: linear-gradient(90deg, #dfe5d9 0%, #86b527 50%, #dfe5d9 100%) 0 0 / 200% 100%; animation: progress-sweep 1.4s linear infinite; }
+progress:indeterminate::-webkit-progress-bar { background: transparent; }
+progress:indeterminate::-moz-progress-bar { background: transparent; }
+@keyframes progress-sweep { from { background-position: 200% 0; } to { background-position: 0 0; } }
+@media (prefers-reduced-motion: reduce) { progress:indeterminate { animation: none; } }
+.planner-panel .progress-row { margin-top: 14px; }
+.planner-panel .progress-row span:empty { display: none; }
 .reference-button { margin-top: 12px; }
+.planner-panel { margin-top: 22px; padding-top: 20px; border-top: 1px solid var(--line); }
+.planner-panel .select-row { flex-wrap: wrap; }
+.planner-panel select { flex-basis: 100%; }
+.planner-panel #start-planner { flex: 1; }
+.planner-panel > input { width: 100%; margin-top: 8px; }
+.planner-detail { margin: 12px 0 0; font-size: 11px; line-height: 1.6; color: #58634f; overflow-wrap: anywhere; min-height: 18px; }
+#planner-state[data-phase="RUNNING"] { color: #496e09; font-weight: 600; }
+#planner-state[data-phase="FAILED"] { color: #b3402e; font-weight: 600; }
 .request { display: flex; flex-direction: column; gap: 8px; margin-top: 20px; font-size: 11px; }
 .request > span { color: var(--muted); }
 .request strong { color: #58634f; font-weight: 400; overflow-wrap: anywhere; line-height: 1.6; min-height: 18px; }
@@ -206,6 +222,10 @@ body[data-trajectory="true"] .status-band { grid-template-columns: repeat(3, min
   .action-section .select-row { flex-wrap: nowrap; }
   .action-section select { flex-basis: auto; }
   .action-section #start-action { flex: none; }
+  .planner-panel { margin-top: 18px; padding-top: 16px; }
+  .planner-panel .select-row { flex-wrap: nowrap; }
+  .planner-panel select { flex-basis: auto; }
+  .planner-panel #start-planner { flex: none; }
   .operations > section { padding-bottom: 18px; margin-bottom: 18px; }
   .section-heading { margin-bottom: 13px; }
   h2 { font-size: 13px; }

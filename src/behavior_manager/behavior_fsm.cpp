@@ -152,6 +152,10 @@ robot_base::InteractionStatus FSM::CurrentInteractionStatus() const {
         : robot_base::InteractionStatus{};
 }
 
+robot_base::PlannerStatus FSM::CurrentPlannerStatus() const {
+    return current_ ? current_->CurrentPlannerStatus() : robot_base::PlannerStatus{};
+}
+
 void FSM::SwitchTo(StateName target) {
     auto it = states_.find(target);
     if (it == states_.end()) {

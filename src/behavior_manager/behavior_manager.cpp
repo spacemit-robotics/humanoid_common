@@ -33,6 +33,8 @@
 #include <yaml-cpp/yaml.h>
 
 #include "behavior_fsm.h"      // 内部实现，位于 src/
+#include "planner_catalog.h"
+#include "policy_availability.h"
 #include "runtime_logger.h"
 #include "state_factory.h"     // 内部实现，位于 src/
 namespace behavior_manager {
@@ -205,6 +207,18 @@ public:
     bool action_returning = false;
     uint64_t previous_action_sequence = 0;
     robot_base::InteractionStatus policy_action_status;
+    // enabled_in：策略及其动作可用的运行环境；动作表以策略名为键，独立 TRAJECTORY 状态用空键
+    std::unordered_map<std::string, robot_base::EnvironmentSet> policy_environments;
+    std::unordered_map<std::string, runtime_config::ActionEnvironmentMap> action_environments;
+    uint64_t blocked_action_sequence = 0;  // 最近一次因环境不可用而未下发的动作请求
+    std::string blocked_action;
+    // 规划器请求由 RL 状态内的跟踪策略处理；无法送达的请求在这里拒绝
+    std::unordered_set<std::string> planner_policies;  // 配置了 policy_adapter.planners 的策略
+    uint64_t previous_planner_sequence = 0;
+    uint64_t blocked_planner_sequence = 0;
+    std::string blocked_planner;
+    std::string blocked_planner_detail;
+    bool environment_block_reported = false;
     bool hot_switch_requested = false;
     double switch_timeout_s = 30.0;
     double switch_started_s = 0.0;
@@ -258,6 +272,83 @@ public:
     bool RequestedPolicyReady() const {
         return policy_runtime_ready && pending_policy == active_policy &&
             !policy_prepare_active && !prepared_policy;
+    }
+
+    bool PolicyEnabled(const std::string &policy) const {
+        const auto entry = policy_environments.find(policy);
+        return entry == policy_environments.end() || entry->second.Allows(sensor.environment);
+    }
+
+    bool ActionEnabled(const std::string &policy, const std::string &action) const {
+        const auto catalog = action_environments.find(policy);
+        if (catalog == action_environments.end()) return true;
+        const auto entry = catalog->second.find(action);
+        return entry == catalog->second.end() || entry->second.Allows(sensor.environment);
+    }
+
+    std::string EnvironmentDetail(const std::string &item) const {
+        return item + " is not enabled in the " +
+            robot_base::RuntimeEnvironmentName(sensor.environment) + " environment";
+    }
+
+    // Requests owned by a state or adapter catalog never reach it when the
+    // action is disabled here; CurrentInteractionStatus() reports the rejection.
+    void BlockUnavailableAction() {
+        auto &request = command.interaction;
+        if (!action_owner.empty() || request.sequence == 0 ||
+            request.operation != robot_base::InteractionRequest::Operation::START ||
+            ActionEnabled(has_rl ? active_policy : std::string(), request.action)) return;
+        if (blocked_action_sequence != request.sequence) {
+            blocked_action_sequence = request.sequence;
+            blocked_action = request.action;
+            runtime_logging::Log(runtime_logging::Level::kWarning,
+                "action request rejected: " + EnvironmentDetail(request.action), false);
+        }
+        request = {};
+    }
+
+    // CurrentPlannerStatus() reports the rejection of a request that no
+    // tracker policy can answer in the current state.
+    void BlockUnhandledPlannerRequest() {
+        const auto &request = command.planner;
+        if (request.sequence == 0 || request.sequence == previous_planner_sequence ||
+            request.operation == robot_base::PlannerRequest::Operation::NONE) return;
+        previous_planner_sequence = request.sequence;
+        std::string detail;
+        if (fsm.CurrentState() != StateName::RL) {
+            detail = "planner requests are handled in the RL state";
+        } else if (!planner_policies.count(active_policy)) {
+            detail = "policy " + active_policy + " has no motion planner";
+        }
+        if (detail.empty()) return;
+        blocked_planner_sequence = request.sequence;
+        blocked_planner = request.planner;
+        blocked_planner_detail = detail;
+        runtime_logging::Log(runtime_logging::Level::kWarning,
+            "planner request rejected: " + detail, false);
+    }
+
+    robot_base::PlannerStatus MergedPlannerStatus() const {
+        auto status = fsm.CurrentPlannerStatus();
+        if (blocked_planner_sequence <= status.sequence) return status;
+        status.sequence = blocked_planner_sequence;
+        status.request_accepted = false;
+        status.detail = blocked_planner_detail;
+        if (status.planner.empty()) status.planner = blocked_planner;
+        return status;
+    }
+
+    robot_base::InteractionStatus MergedInteractionStatus() const {
+        auto status = action_owner.empty() ? fsm.CurrentInteractionStatus() : policy_action_status;
+        if (blocked_action_sequence <= status.sequence) return status;
+        using Phase = robot_base::InteractionStatus::Phase;
+        const bool busy = status.phase == Phase::BLEND_IN || status.phase == Phase::PLAYING ||
+            status.phase == Phase::HOLDING || status.phase == Phase::BLEND_OUT;
+        // A rejected request must not hide an action that is still running.
+        if (!busy) return {blocked_action_sequence, false, Phase::REJECTED, 0.0f, blocked_action};
+        status.sequence = blocked_action_sequence;
+        status.request_accepted = false;
+        return status;
     }
 
     bool SameSwitchGroup(const std::string &target) const {
@@ -319,6 +410,7 @@ public:
         const auto &catalog = policy_actions.at(action_owner);
         const auto action = catalog.find(request.action);
         if (!can_run || request.operation != Operation::START || action == catalog.end() ||
+            !ActionEnabled(action_owner, request.action) ||
             !action_target.empty() || active_policy != action_owner || pending_policy != active_policy ||
             !RequestedPolicyReady()) {
             policy_action_status.sequence = request.sequence;
@@ -878,6 +970,12 @@ public:
                 const auto pname = node.first.as<std::string>();
                 switch_groups[pname] = yaml_file.Read<std::string>(
                     "rl_policy.onnx_infer.policies." + pname + ".switch_group").value_or("");
+                policy_environments[pname] = runtime_config::LoadPolicyEnvironments(yaml_file, pname);
+                if (!runtime_config::LoadPolicyPlanners(yaml_file, pname).empty()) {
+                    planner_policies.insert(pname);
+                }
+                action_environments[pname] = runtime_config::LoadActionEnvironments(
+                    yaml_file, runtime_config::PolicyActionCatalog(yaml_file, pname));
                 return_policies[pname] = yaml_file.Read<std::string>(
                     "rl_policy.onnx_infer.policies." + pname + ".return_policy").value_or("");
                 const std::string base = "rl_policy.onnx_infer.policies." + pname + ".prerequisite";
@@ -935,6 +1033,29 @@ public:
                     entry.duration <= 0.0 || prerequisite_map.count(entry.policy))
                     throw std::runtime_error("prerequisite requires a selectable, non-chained policy and positive duration");
             }
+            // A policy reached without an operator request must be enabled
+            // wherever the policy or action leading to it is enabled.
+            const auto require_enabled = [this](const std::string &target,
+                    const robot_base::EnvironmentSet &source, const std::string &what) {
+                if (!policy_environments[target].Covers(source))
+                    throw std::runtime_error("enabled_in of policy " + target +
+                        " must cover " + what);
+            };
+            for (const auto &[name, target] : return_policies) {
+                if (!target.empty())
+                    require_enabled(target, policy_environments[name], "return_policy source " + name);
+            }
+            for (const auto &[name, entry] : prerequisite_map) {
+                require_enabled(entry.policy, policy_environments[name], "prerequisite source " + name);
+            }
+            for (const auto &[owner, actions] : policy_actions) {
+                require_enabled(policy_nodes[owner]["policy_actions"]["idle_policy"].as<std::string>(),
+                    policy_environments[owner], "policy_actions entry " + owner);
+                for (const auto &[name, target] : actions) {
+                    require_enabled(target, action_environments[owner][name],
+                        "policy_actions action " + owner + "/" + name);
+                }
+            }
         } else {
             // 无 RL 策略时，ZERO 使用独立安全增益和可选 zero_pos。
             const auto &effective_zero_kp = zero_kp.empty() ? home_kp : zero_kp;
@@ -951,6 +1072,7 @@ public:
                 ValidateGainVector(kd, num_dof, "behavior_manager.trajectory.kd");
                 fsm.AddState(StateName::TRAJECTORY,
                     CreateStateTrajectory(config, zero_pos, kp, kd));
+                action_environments[""] = runtime_config::LoadTrajectoryActionEnvironments(yaml_file);
             }
             fsm.AddState(StateName::ZERO,
                 CreateStateZero(
@@ -1112,6 +1234,22 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
             }
         }
     }
+    if (current != StateName::ZERO) {
+        impl_->environment_block_reported = false;
+    } else if (impl_->has_rl && impl_->command.key == 3) {
+        // The default policy, or a driver backend started after the selection,
+        // can leave a policy selected that this environment does not enable.
+        for (const auto *policy : {&impl_->active_policy, &impl_->pending_policy, &impl_->action_owner}) {
+            if (policy->empty() || impl_->PolicyEnabled(*policy)) continue;
+            impl_->command.key = 0;
+            if (!impl_->environment_block_reported) {
+                runtime_logging::Log(runtime_logging::Level::kWarning,
+                    "RL entry blocked: " + impl_->EnvironmentDetail("policy " + *policy), false);
+                impl_->environment_block_reported = true;
+            }
+            break;
+        }
+    }
     impl_->fsm.Step(control_dt, rl_dt);
     if (requested_key == 0) impl_->command.key = 0;
 
@@ -1133,6 +1271,11 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
     if (cur == StateName::RL && !impl_->action_owner.empty() &&
         impl_->active_policy == impl_->action_target && !impl_->action_returning) {
         impl_->policy_action_status.progress = impl_->fsm.CurrentInteractionStatus().progress;
+    }
+    if (impl_->prev_fsm_state != cur) {
+        impl_->blocked_action_sequence = 0;
+        impl_->blocked_action.clear();
+        impl_->blocked_planner_sequence = 0;
     }
     if (impl_->prev_fsm_state == StateName::RL && cur != StateName::RL) {
         impl_->policy_runtime_ready = false;
@@ -1205,6 +1348,8 @@ void BehaviorManagerClass::SetSensorFault(const robot_base::FaultStatus &fault) 
 
 void BehaviorManagerClass::SetCommand(const robot_base::Command &cmd) {
     impl_->command = cmd;
+    impl_->BlockUnavailableAction();
+    impl_->BlockUnhandledPlannerRequest();
     impl_->HandlePolicyAction(cmd.interaction);
     // switch_policy 边沿检测：control_runtime 每帧把缓存 cmd 重复喂入，必须只在变化时响应
     const bool edge = cmd.switch_policy != impl_->prev_switch_policy ||
@@ -1226,6 +1371,11 @@ void BehaviorManagerClass::SetCommand(const robot_base::Command &cmd) {
         impl_->policy_switch_status.phase = Phase::REJECTED;
         impl_->policy_switch_status.detail =
             "policy not selectable here; running switches require a common switch_group";
+        return;
+    }
+    if (!impl_->PolicyEnabled(cmd.switch_policy)) {
+        impl_->policy_switch_status.phase = Phase::REJECTED;
+        impl_->policy_switch_status.detail = impl_->EnvironmentDetail("policy " + cmd.switch_policy);
         return;
     }
     impl_->hot_switch_requested = hot;
@@ -1317,7 +1467,11 @@ robot_base::FaultStatus BehaviorManagerClass::CurrentFault() const {
 
 robot_base::InteractionStatus
 BehaviorManagerClass::CurrentInteractionStatus() const {
-    return impl_->action_owner.empty() ? impl_->fsm.CurrentInteractionStatus() : impl_->policy_action_status;
+    return impl_->MergedInteractionStatus();
+}
+
+robot_base::PlannerStatus BehaviorManagerClass::CurrentPlannerStatus() const {
+    return impl_->MergedPlannerStatus();
 }
 
 bool BehaviorManagerClass::IsRunning() const {

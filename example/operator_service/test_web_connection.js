@@ -26,6 +26,7 @@ function harness() {
                 classList: {toggle() {}, remove() {}, add() {}},
                 querySelector: part => element(`${key} ${part}`), replaceChildren() {},
                 setAttribute: (name, value) => attributes.set(name, value), getAttribute: name => attributes.get(name),
+                removeAttribute: name => attributes.delete(name),
                 hasPointerCapture: () => false, setPointerCapture() {}, focus() {},
                 getBoundingClientRect: () => ({left: 0, top: 0, width: 146, height: 146})});
         }
@@ -377,6 +378,154 @@ async function main() {
         assert.equal(h.sockets.length, 1, "invalid pairing must not cause an authentication retry loop");
         assert.equal(h.element("login").hidden, false);
     }
-    console.log("Web connection regressions passed: latency, stale status, retry/backoff, foreground, manual disconnect, auth and no command replay");
+    {
+        // The service resends the catalog once the driver reports its environment.
+        const h = harness(), socket = await h.ready();
+        h.status({environment: "real"});
+        assert.equal(h.element("connection").textContent, "控制链路在线 · 实机");
+        socket.receive({v: 1, event: "catalog", data: {...catalog, policies: [...catalog.policies,
+            {name: "show", actions: [], minimum: {vx: 0, vy: 0, wz: 0}, maximum: {vx: 0, vy: 0, wz: 0}}]}});
+        assert.equal(h.run("catalog.policies.length"), 2, "catalog event replaces the hello catalog");
+        h.status({environment: "sim"});
+        assert.equal(h.element("connection").textContent, "控制链路在线 · 仿真");
+        h.status({environment: "unknown"});
+        assert.equal(h.element("connection").textContent, "控制链路在线");
+    }
+    {
+        // Planner panel: listed planners, start/stop requests, the lock shared with actions
+        // and the velocity range of a running planner.
+        const h = harness(), socket = await h.ready();
+        h.status({owns_control: true});
+        assert.equal(h.element("planner-panel").hidden, true, "policies without planners hide the panel");
+        const planners = [
+            {name: "walker", display_name: "行走规划", category: "realtime",
+                minimum: {vx: -0.3, vy: -0.5, wz: -1}, maximum: {vx: 0.8, vy: 0.5, wz: 1},
+                teleop: {slow_limits: {vx: 0.4, vy: 0.2, wz: 0.5}, fast_limits: {vx: 0.8, vy: 0.5, wz: 1}}},
+            {name: "writer", display_name: "文本生成", category: "offline",
+                minimum: {vx: 0, vy: 0, wz: 0}, maximum: {vx: 0, vy: 0, wz: 0}}];
+        const tracker = {...catalog.policies[0], actions: [{key: "wave", display_name: "挥手"}], planners,
+            auto_planner: ""};
+        socket.receive({v: 1, event: "catalog", data: {...catalog, policies: [tracker]}});
+        const planner = (phase, extra = {}, owns = true) => h.status({owns_control: owns,
+            planner: {name: "walker", phase, progress: 0, plan_count: 0, plan_rate_hz: 0, last_plan_ms: 0,
+                reference_remaining_s: 0, detail: "", ...extra}});
+        const sent = op => socket.sent.filter(r => r.op === op);
+        assert.equal(h.element("planner-panel").hidden, false);
+        assert.equal(h.element("planner").value, "walker", "the first planner is preselected");
+        assert.equal(h.element("planner-state").textContent, "未启动");
+        assert.equal(h.element("planner-argument").hidden, true);
+        assert.equal(h.element("start-planner").disabled, false);
+        assert.equal(h.element("stop-planner").disabled, true);
+        assert.equal(h.element("start-action").disabled, false);
+        assert.equal(h.run("motion.maximum.vx"), 1);
+
+        h.push(); await h.advance(50);
+        assert(h.run("motion.value.vx") > 0);
+        h.element("start-planner").onclick();
+        assert.equal(h.run("motion.value.vx"), 0, "starting a planner clears the held speed");
+        assert.deepEqual(sent("planner").at(-1).args, {name: "walker", argument: ""});
+        assert.equal(h.element("planner-progress-row").hidden, true);
+        for (const [phase, label, hint] of [["LOADING", "加载中", "正在加载规划器，机器人保持待命"],
+                                            ["WARMING", "预热中", "正在预热规划器，机器人保持待命"]]) {
+            // Without an estimate the bar is indeterminate; with one it shows the fraction.
+            h.element("planner-progress").value = 0.7;
+            planner(phase);
+            assert.equal(h.element("planner-progress-row").hidden, false);
+            assert.equal(h.element("planner-progress").value, 0.7, "an indeterminate bar is given no value");
+            assert.equal(h.element("planner-progress-label").textContent, "");
+            planner(phase, {progress: 0.42});
+            assert.equal(h.element("planner-progress").value, 0.42);
+            assert.equal(h.element("planner-progress-label").textContent, "42%");
+            assert.equal(h.element("planner-state").textContent, label);
+            assert.equal(h.element("planner-state").dataset.phase, phase);
+            assert.equal(h.element("planner-detail").textContent, hint);
+            assert.equal(h.element("planner").disabled, true);
+            assert.equal(h.element("start-planner").disabled, true);
+            assert.equal(h.element("stop-planner").disabled, false, "a start in progress can be stopped");
+            assert.equal(h.element("start-action").disabled, true, "actions wait while a planner is engaged");
+            assert.equal(h.run("motion.maximum.vx"), 1, "the policy receives velocity until the planner runs");
+        }
+        planner("RUNNING", {plan_count: 12, plan_rate_hz: 9.5, last_plan_ms: 104.2, reference_remaining_s: 1.25});
+        assert.equal(h.element("planner-state").textContent, "运行中");
+        assert.equal(h.element("planner-detail").textContent,
+            "行走规划 · 已规划 12 次 · 单次 104 ms · 9.5 次/秒 · 参考余量 1.25 s");
+        assert.equal(h.element("start-planner").disabled, true);
+        assert.equal(h.element("stop-planner").disabled, false);
+        assert.equal(h.element("start-action").disabled, true);
+        assert.equal(h.run("motion.maximum.vx"), 0.8, "a running planner supplies the velocity range");
+        assert.equal(h.run("motion.minimum.vx"), -0.3);
+        assert.equal(h.run("motion.limits('vx').max"), 0.4, "and its slow preset");
+        assert.equal(h.run("motion.hasSpeedModes"), true);
+        assert.equal(h.element("motion-state").textContent, "可操作");
+        assert.equal(h.element("planner-progress-row").hidden, true, "a continuous reference has no progress");
+        planner("RUNNING", {}, false);
+        assert.equal(h.element("start-planner").disabled, true, "spectators cannot start planners");
+        assert.equal(h.element("stop-planner").disabled, true, "or stop them");
+
+        planner("RUNNING");
+        h.push(); await h.advance(50);
+        assert.equal(h.run("motion.value.vx"), 0.4);
+        h.element("stop-planner").onclick();
+        assert.equal(h.run("motion.value.vx"), 0, "stopping a planner clears the held speed");
+        assert.equal(sent("planner_stop").length, 1);
+        assert.deepEqual(sent("planner_stop")[0].args, {});
+        planner("STOPPING");
+        assert.equal(h.element("planner-detail").textContent, "正在停止并回到待命");
+        assert.equal(h.element("start-action").disabled, true);
+        assert.equal(h.run("motion.maximum.vx"), 1, "velocity returns to the policy once the planner stops");
+        planner("READY");
+        assert.equal(h.element("planner-state").textContent, "已加载");
+        assert.equal(h.element("planner").disabled, false);
+        assert.equal(h.element("start-planner").disabled, false);
+        assert.equal(h.element("stop-planner").disabled, true);
+        assert.equal(h.element("start-action").disabled, false);
+
+        // An offline planner takes a text argument.
+        h.element("planner").value = "writer"; h.element("planner").onchange();
+        assert.equal(h.element("planner-argument").hidden, false);
+        h.element("planner-argument").value = "  挥挥手  ";
+        h.element("start-planner").onclick();
+        assert.deepEqual(sent("planner").at(-1).args, {name: "writer", argument: "挥挥手"});
+        planner("GENERATING", {name: "writer"});
+        assert.equal(h.element("planner-progress-row").hidden, false);
+        assert.equal(h.element("planner-progress-label").textContent, "");
+        planner("GENERATING", {name: "writer", progress: 0.3});
+        assert.equal(h.element("planner-progress").value, 0.3);
+        assert.equal(h.element("planner-progress-label").textContent, "30%");
+        assert.equal(h.element("planner-state").textContent, "生成中");
+        assert.equal(h.element("planner-argument").disabled, true);
+        assert.equal(h.element("start-action").disabled, true);
+        planner("RUNNING", {name: "writer", progress: 0.5});
+        assert.equal(h.element("planner-detail").textContent, "文本生成");
+        assert.equal(h.element("planner-progress-row").hidden, false, "a generated motion shows its playback");
+        assert.equal(h.element("planner-progress").value, 0.5);
+        assert.equal(h.element("planner-progress-label").textContent, "50%");
+        planner("RUNNING", {name: "writer", progress: 7});
+        assert.equal(h.element("planner-progress").value, 1, "out-of-range progress is clamped");
+        assert.equal(h.element("motion-state").textContent, "定点站立", "a generated motion takes no velocity");
+
+        // A failure is shown with control's reason, can be cleared, and does not block a new start.
+        planner("FAILED", {detail: "model file not found"});
+        assert.equal(h.element("planner-progress-row").hidden, true);
+        assert.equal(h.element("planner").value, "walker", "the reported planner is shown");
+        assert.equal(h.element("planner-state").textContent, "失败");
+        assert.equal(h.element("planner-detail").textContent, "model file not found");
+        assert.equal(h.element("start-planner").disabled, false);
+        assert.equal(h.element("stop-planner").disabled, false);
+        assert.equal(h.element("start-action").disabled, false);
+
+        // A playing action and a pending request both lock the start button.
+        h.status({owns_control: true, interaction: {phase: "PLAYING"}});
+        assert.equal(h.element("start-planner").disabled, true, "a planner cannot start while an action plays");
+        h.status({owns_control: true, request: {phase: "accepted"}});
+        assert.equal(h.element("start-planner").disabled, true);
+        h.status({owns_control: true, state: "ZERO"});
+        assert.equal(h.element("start-planner").disabled, true, "planners run inside RL");
+
+        // The policy's auto-started planner is preselected.
+        socket.receive({v: 1, event: "catalog", data: {...catalog, policies: [{...tracker, auto_planner: "writer"}]}});
+        assert.equal(h.element("planner").value, "writer");
+    }
+    console.log("Web connection regressions passed: latency, stale status, retry/backoff, foreground, manual disconnect, auth, no command replay, catalog refresh and planners");
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

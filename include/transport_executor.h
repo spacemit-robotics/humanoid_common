@@ -151,6 +151,9 @@ std::unique_ptr<TransportBaseV2> CreateV2(const std::string &yaml_path);
 /** @brief Check interaction metadata against the status wire contract, without sending. */
 bool IsValidInteractionStatus(const robot_base::InteractionStatus &status);
 
+/** @brief Check planner status against the status wire contract, without sending. */
+bool IsValidPlannerStatus(const robot_base::PlannerStatus &status);
+
 }  // namespace transport
 
 #endif  // TRANSPORT_EXECUTOR_H

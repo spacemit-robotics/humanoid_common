@@ -209,6 +209,9 @@ ToolResult OperatorTools::PerformAction(const std::string& key) {
         }
         return Error("现在做不了「" + key + "」。可以做的动作有：" + Join(available, false) + "。");
     }
+    if (status.planner.Engaged()) {
+        return Error("机器人正在由动作规划器控制，需要先用手机或终端停止规划器，才能做上半身动作。");
+    }
     // 先判断忙再动续租线程：正在播放时停掉续租，1 s 后操作服务就会取消这个动作。
     if (InteractionBusy(status.interaction_phase)) {
         const auto playing = std::find_if(available.begin(), available.end(),

@@ -31,7 +31,9 @@ void Require(bool condition, const std::string &message) {
 
 class Fixture {
 public:
-    explicit Fixture(const std::string &initial = "good") {
+    // restricted: "other" and the catalog action "motion" are enabled in simulation only.
+    explicit Fixture(const std::string &initial = "good", bool restricted = false,
+            const std::string &extra = "") {
         const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
         directory_ = fs::temp_directory_path() / ("policy_switch_" + std::to_string(nonce));
         Require(fs::create_directory(directory_), "cannot create test directory");
@@ -64,7 +66,7 @@ public:
             "          idle_policy: good\n"
             "          action_names: [motion, broken]\n"
             "          actions:\n"
-            "            motion: {policy: clip}\n"
+            << "            motion: {policy: clip" << (restricted ? ", enabled_in: [sim]" : "") << "}\n"
             "            broken: {policy: clip_missing}\n";
         for (const std::string name : {"good", "missing", "other", "chain", "finite", "clip", "clip_missing"}) {
             yaml << "      " << name << ":\n"
@@ -90,6 +92,8 @@ public:
                 yaml << "        motion_length: 0.1\n        return_policy: good\n";
             }
             if (name == "clip") yaml << "        motion_length: 0.4\n";
+            if (restricted && name == "other") yaml << "        enabled_in: [sim]\n";
+            if (name == "missing") yaml << extra;
         }
         Require(yaml.good(), "cannot write test config");
     }
@@ -378,6 +382,114 @@ void TestPolicyActions() {
     Require(probe.manager.CurrentPolicySelectionName() == "other", "mode switch kept stale action ownership");
     probe.Key(-1, State::POWER_OFF);
 }
+
+void TestEnvironmentAvailability() {
+    using ActionPhase = robot_base::InteractionStatus::Phase;
+    using Environment = robot_base::RuntimeEnvironment;
+    using Operation = robot_base::InteractionRequest::Operation;
+    {
+        Fixture fixture("good", true);
+        Probe probe(fixture.Path());
+        // Before the driver reports its backend only unrestricted entries are available.
+        probe.Request("other", 1);
+        probe.Wait(Phase::REJECTED);
+        probe.sensor.environment = Environment::REAL;
+        probe.Request("other", 2);
+        probe.Wait(Phase::REJECTED);
+        Require(probe.manager.CurrentPolicySwitchStatus().detail.find("real environment") !=
+            std::string::npos, "rejection did not name the environment");
+        Require(probe.manager.CurrentPolicyName() == "good", "disabled policy replaced the active one");
+        probe.sensor.environment = Environment::SIMULATION;
+        probe.Request("other", 3);
+        probe.Wait(Phase::READY);
+        Require(probe.manager.CurrentPolicyName() == "other", "policy enabled in simulation was not selected");
+    }
+    {
+        Fixture fixture("catalog", true);
+        Probe probe(fixture.Path());
+        probe.sensor.environment = Environment::REAL;
+        probe.EnterRl();
+        probe.Tick(600);
+        probe.command.interaction = {1, Operation::START, "motion"};
+        probe.Tick(600);
+        const auto status = probe.manager.CurrentInteractionStatus();
+        Require(status.sequence == 1 && !status.request_accepted && status.phase == ActionPhase::REJECTED &&
+            probe.manager.CurrentPolicyName() == "catalog", "action disabled on the robot was started");
+        probe.sensor.environment = Environment::SIMULATION;
+        probe.command.interaction = {2, Operation::START, "motion"};
+        for (int i = 0; i < 5000 && probe.manager.CurrentPolicyName() != "clip"; ++i) probe.Tick(1);
+        Require(probe.manager.CurrentPolicyName() == "clip", "action enabled in simulation did not start");
+        probe.Key(-1, State::POWER_OFF);
+    }
+    {
+        // A restricted default policy must not run where it is disabled.
+        Fixture fixture("other", true);
+        Probe probe(fixture.Path());
+        probe.sensor.environment = Environment::REAL;
+        probe.Key(1, State::DAMP);
+        probe.Key(4, State::HOME);
+        probe.command = {};
+        probe.Tick(30);
+        probe.Key(2, State::ZERO);
+        probe.command = {};
+        probe.Tick(30);
+        probe.command.key = 3;
+        probe.Tick(5);
+        Require(probe.manager.CurrentState() == State::ZERO, "disabled default policy entered RL");
+        probe.sensor.environment = Environment::SIMULATION;
+        probe.Key(3, State::RL);
+        probe.Key(-1, State::POWER_OFF);
+    }
+    // An automatic return target must be enabled wherever its source is.
+    bool rejected = false;
+    try {
+        Fixture fixture("good", true, "        return_policy: other\n");
+        Probe probe(fixture.Path());
+    } catch (const std::runtime_error &error) {
+        rejected = std::string(error.what()).find("enabled_in") != std::string::npos;
+    }
+    Require(rejected, "return_policy into a restricted policy was accepted");
+}
+// Policies without planners: the manager answers planner requests itself.
+void TestPlannerRequestsWithoutPlanner() {
+    using Operation = robot_base::PlannerRequest::Operation;
+    using PlannerPhase = robot_base::PlannerStatus::Phase;
+    Fixture fixture;
+    Probe probe(fixture.Path());
+    const auto status = [&] {
+        const auto result = probe.manager.CurrentPlannerStatus();
+        Require(transport::CanEncodePlannerStatus(result), "planner status cannot be transmitted");
+        return result;
+    };
+    Require(status().sequence == 0 && status().phase == PlannerPhase::IDLE && status().detail.empty(),
+        "planner status must start idle");
+    probe.command.planner = {3, Operation::START, "walker", ""};
+    probe.Step();
+    Require(status().sequence == 3 && !status().request_accepted && status().planner == "walker" &&
+        status().phase == PlannerPhase::IDLE && status().detail.find("RL state") != std::string::npos,
+        "a planner request outside RL was not rejected");
+    probe.command = {};
+    probe.EnterRl();
+    Require(status().sequence == 0, "a rejection must not outlive the state it was made in");
+    probe.command.planner = {4, Operation::START, "walker", ""};
+    probe.Tick(40);
+    Require(status().sequence == 4 && !status().request_accepted && status().planner == "walker" &&
+        status().detail.find("no motion planner") != std::string::npos,
+        "a planner request for a policy without planners was not rejected");
+    probe.command.planner = {5, Operation::STOP, "", ""};
+    probe.Tick(40);
+    Require(status().sequence == 5 && !status().request_accepted, "a stop without planners was not rejected");
+    // A repeated sequence and an empty request are not new requests.
+    probe.command.planner = {5, Operation::START, "other", ""};
+    probe.Tick(5);
+    Require(status().sequence == 5 && status().planner.empty(), "a repeated sequence was handled again");
+    probe.command.planner = {};
+    probe.Tick(5);
+    Require(status().sequence == 5, "an empty request replaced the last result");
+    Require(probe.manager.CurrentState() == State::RL && probe.manager.CurrentPolicyName() == "good",
+        "rejected planner requests disturbed the running policy");
+    probe.Key(-1, State::POWER_OFF);
+}
 }  // namespace
 
 int main() {
@@ -386,6 +498,8 @@ int main() {
         TestTimedMotionStartsAtZero();
         TestLiveSwitch();
         TestPolicyActions();
+        TestEnvironmentAvailability();
+        TestPlannerRequestsWithoutPlanner();
         std::cout << "policy switch regression: PASS\n";
         return 0;
     } catch (const std::exception &error) {

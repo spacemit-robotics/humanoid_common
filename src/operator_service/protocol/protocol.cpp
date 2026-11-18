@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <utility>
 namespace operator_service {
 namespace {
 Velocity ReadVelocity(const Json &v) { return {v.value("vx", 0.0), v.value("vy", 0.0), v.value("wz", 0.0)}; }
@@ -16,14 +17,27 @@ RequestResult ReadRequest(const Json &v) {
 }
 } // namespace
 Json Encode(const Velocity &v) { return {{"vx", v.vx}, {"vy", v.vy}, {"wz", v.wz}}; }
+// Planner entries carry the same velocity fields as policies, so clients
+// configure their motion controls from either.
+Json Encode(const Planner &p) {
+    Json result = {{"name", p.name}, {"display_name", p.display_name.empty() ? p.name : p.display_name},
+        {"category", p.category}, {"type", p.type}, {"minimum", Encode(p.minimum)},
+        {"maximum", Encode(p.maximum)}, {"service_smoothing", p.client_smoothing}};
+    if (p.slow_limits) result["teleop"]["slow_limits"] = Encode(*p.slow_limits);
+    if (p.fast_limits) result["teleop"]["fast_limits"] = Encode(*p.fast_limits);
+    return result;
+}
 Json Encode(const Policy &p) {
     Json actions = Json::array();
     for (const auto &a : p.actions)
         actions.push_back({{"key", a.key}, {"display_name", a.display_name}});
+    Json planners = Json::array();
+    for (const auto &planner : p.planners) planners.push_back(Encode(planner));
     Json result = {{"name", p.name}, {"manual_reference", p.manual_reference}, {"minimum", Encode(p.minimum)},
         {"maximum", Encode(p.maximum)}, {"actions", actions}, {"client_smoothing", false},
         {"service_smoothing", p.client_smoothing},
-        {"switch_group", p.switch_group}, {"display_name", p.display_name.empty() ? p.name : p.display_name}};
+        {"switch_group", p.switch_group}, {"display_name", p.display_name.empty() ? p.name : p.display_name},
+        {"planners", planners}, {"auto_planner", p.auto_planner}};
     if (p.slow_limits) result["teleop"]["slow_limits"] = Encode(*p.slow_limits);
     if (p.fast_limits) result["teleop"]["fast_limits"] = Encode(*p.fast_limits);
     return result;
@@ -34,7 +48,7 @@ Json Encode(const RequestResult &r) {
 Json Encode(const Status &s) {
     const auto &f = s.fault;
     return {{"online", s.online}, {"hmi_connected", s.hmi_connected}, {"zero_ready", s.zero_ready}, {"state", s.state},
-        {"trajectory_enabled", s.trajectory_enabled},
+        {"trajectory_enabled", s.trajectory_enabled}, {"environment", s.environment},
         {"policy", s.policy}, {"age_ms", s.age_ms}, {"rl_hz", s.rl_hz}, {"velocity", Encode(s.velocity)},
         {"target_velocity", Encode(s.target_velocity)}, {"command_velocity", Encode(s.command_velocity)},
         {"owner", s.owner}, {"owns_control", s.owns_control}, {"lease_remaining_ms", s.lease_remaining_ms},
@@ -42,6 +56,12 @@ Json Encode(const Status &s) {
             {{"phase", s.interaction_phase}, {"action", s.interaction_action}, {"progress", s.interaction_progress},
                 {"sequence", s.interaction_sequence}, {"accepted", s.interaction_accepted}}},
         {"teleop_preset", {{"name", s.teleop_preset}, {"sequence", s.teleop_preset_sequence}}},
+        {"planner",
+            {{"name", s.planner.name}, {"phase", s.planner.phase}, {"progress", s.planner.progress},
+                {"sequence", s.planner.sequence}, {"accepted", s.planner.accepted},
+                {"plan_count", s.planner.plan_count}, {"plan_rate_hz", s.planner.plan_rate_hz},
+                {"last_plan_ms", s.planner.last_plan_ms},
+                {"reference_remaining_s", s.planner.reference_remaining_s}, {"detail", s.planner.detail}}},
         {"request", Encode(s.request)},
         {"fault",
             {{"active", f.active}, {"latched", f.latched}, {"sequence", f.sequence}, {"source", f.source},
@@ -98,6 +118,7 @@ Status DecodeStatus(const Json &v) {
     s.hmi_connected = v.at("hmi_connected");
     s.zero_ready = v.at("zero_ready");
     s.trajectory_enabled = v.value("trajectory_enabled", false);
+    s.environment = v.value("environment", "unknown");
     s.state = v.at("state");
     s.policy = v.at("policy");
     s.age_ms = v.at("age_ms");
@@ -119,6 +140,17 @@ Status DecodeStatus(const Json &v) {
     const auto preset = v.value("teleop_preset", Json::object());
     s.teleop_preset = preset.value("name", "");
     s.teleop_preset_sequence = preset.value("sequence", uint64_t{0});
+    const auto planner = v.value("planner", Json::object());
+    s.planner.name = planner.value("name", "");
+    s.planner.phase = planner.value("phase", "IDLE");
+    s.planner.progress = planner.value("progress", 0.0);
+    s.planner.sequence = planner.value("sequence", uint64_t{0});
+    s.planner.accepted = planner.value("accepted", false);
+    s.planner.plan_count = planner.value("plan_count", uint32_t{0});
+    s.planner.plan_rate_hz = planner.value("plan_rate_hz", 0.0);
+    s.planner.last_plan_ms = planner.value("last_plan_ms", 0.0);
+    s.planner.reference_remaining_s = planner.value("reference_remaining_s", 0.0);
+    s.planner.detail = planner.value("detail", "");
     s.request = ReadRequest(v.at("request"));
     return s;
 }
@@ -136,6 +168,21 @@ Policy DecodePolicy(const Json &v) {
     if (teleop.contains("fast_limits")) p.fast_limits = ReadVelocity(teleop.at("fast_limits"));
     for (const auto &a : v.at("actions"))
         p.actions.push_back({a.at("key"), a.at("display_name")});
+    for (const auto &entry : v.value("planners", Json::array())) {
+        Planner planner;
+        planner.name = entry.at("name");
+        planner.display_name = entry.value("display_name", planner.name);
+        planner.category = entry.value("category", "realtime");
+        planner.type = entry.value("type", "");
+        planner.minimum = ReadVelocity(entry.value("minimum", Json::object()));
+        planner.maximum = ReadVelocity(entry.value("maximum", Json::object()));
+        planner.client_smoothing = entry.value("service_smoothing", true);
+        const auto limits = entry.value("teleop", Json::object());
+        if (limits.contains("slow_limits")) planner.slow_limits = ReadVelocity(limits.at("slow_limits"));
+        if (limits.contains("fast_limits")) planner.fast_limits = ReadVelocity(limits.at("fast_limits"));
+        p.planners.push_back(std::move(planner));
+    }
+    p.auto_planner = v.value("auto_planner", "");
     return p;
 }
 Reply DecodeReply(const Json &v) {

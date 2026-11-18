@@ -15,6 +15,7 @@
 #include <string>
 #include <vector>
 
+#include "motion_planner/planner_host.h"
 #include "rl_service.h"
 #include "robot_base.h"
 
@@ -87,36 +88,6 @@ struct ReferenceMotionCatalogConfig {
     bool Enabled() const { return !actions.empty(); }
 };
 
-/**
- * @brief Asynchronous kinematic planner settings for a SONIC tracker
- *
- * 该结构仅在 behavior_manager 内部使用。机型仓库通过 YAML 提供参数，
- * robot_base 和 model_zoo/rl 不感知具体 tracker 协议。
- */
-struct SonicPlannerConfig {
-    bool enabled = false;
-    std::string model_path;
-    rl_policy::InferenceRuntimeConfig runtime;
-    robot_base::ThreadLoop thread = robot_base::ThreadLoop::Background("motion_planner");
-    double output_fps = 50.0;
-    double check_interval = 0.1;
-    double replan_interval = 1.0;
-    double running_replan_interval = 0.1;
-    double crawling_replan_interval = 0.2;
-    double lookahead = 0.04;
-    double default_height = 0.788740;
-    double facing_horizon = 1.0;
-    double command_epsilon = 1.0e-3;
-    double slow_walk_max_speed = 0.8;
-    double walk_max_speed = 2.5;
-    int mode = -1;
-    int random_seed = 1234;
-    std::vector<int> allowed_pred_num_tokens = {
-        0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0};
-
-    bool Enabled() const { return enabled && !model_path.empty(); }
-};
-
 /** @brief 单个策略的适配器配置，由机型 YAML 提供参数。 */
 struct Config {
     std::string type;
@@ -139,7 +110,8 @@ struct Config {
     ReferenceActionConfig reference_action;
     JointTrajectoryConfig joint_trajectory;
     ReferenceMotionCatalogConfig reference_motion_catalog;
-    SonicPlannerConfig sonic_planner;
+    // policy_adapter.planners：跟踪策略可选用的参考动作规划器，待命参考由 catalog 提供。
+    motion_planner::HostConfig planners;
 
     struct SonicEncoderConfig {
         std::string model_path;
@@ -305,6 +277,17 @@ public:
     virtual robot_base::InteractionStatus GetInteractionStatus() const {
         return {};
     }
+
+    /** @brief 接收最近一次规划器启停请求；在随后的 PrepareInputs 中处理 */
+    virtual void HandlePlannerRequest(const robot_base::PlannerRequest &request) {
+        (void)request;
+    }
+
+    /** @brief 规划器状态；适配器未配置规划器时为空指针。只在推理线程读取 */
+    virtual const robot_base::PlannerStatus *PlannerStatus() const { return nullptr; }
+
+    /** @brief 推理线程已停止；在控制线程或后台回收线程调用，不得阻塞 */
+    virtual void OnInferenceStopped() {}
 
     /** @brief 适配器类型，用于日志 */
     virtual const char *Type() const = 0;

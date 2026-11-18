@@ -82,6 +82,7 @@ public:
                 state.gyro = sim_state.gyro;
                 state.rpy = sim_state.rpy;
                 state.time = sim_state.time;
+                state.environment = robot_base::RuntimeEnvironment::SIMULATION;
                 if (!publish_state(state, {})) {
                     throw std::runtime_error("failed to publish MuJoCo state");
                 }

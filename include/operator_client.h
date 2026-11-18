@@ -27,8 +27,11 @@ public:
     Reply SubscribeRobotFeedback(bool enabled = true);
     // Thread-safe snapshot; fresh becomes false on timeout, unsubscribe or disconnect.
     RobotFeedback LatestRobotFeedback() const;
+    // The service lists only the entries enabled in the driver environment and
+    // resends the catalog when that changes; the revision then advances.
     std::vector<Policy> Policies() const;
     std::vector<Action> Actions() const;
+    uint64_t CatalogRevision() const;
     std::string RobotName() const;
     Velocity VelocityStep() const;
     // Requests are serialized, bounded and never automatically retried.
@@ -48,6 +51,11 @@ public:
     Reply Stop();
     Reply StartInteraction(const std::string &action);
     Reply CancelInteraction();
+    // Start a planner listed under the active policy (Policy::planners). The
+    // argument is optional task text, at most 255 bytes. Progress and failures
+    // after acceptance are reported in Status::planner.
+    Reply StartPlanner(const std::string &planner, const std::string &argument = "");
+    Reply StopPlanner();
     Reply StartReference();
     Reply AcknowledgeFault();
     std::string PairingUrl();

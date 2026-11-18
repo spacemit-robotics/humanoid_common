@@ -62,7 +62,27 @@ struct Client::Impl {
     std::vector<Action> actions;
     std::string robot;
     Velocity velocity_step{0.1, 0.1, 0.1};
+    uint64_t catalog_revision = 0;
     std::chrono::steady_clock::time_point last_status{};
+
+    // Caller holds mutex. The service resends the catalog when the entries
+    // enabled in the driver environment change.
+    void ApplyCatalog(const Json &catalog) {
+        robot = catalog.at("robot");
+        if (catalog.contains("velocity_step")) {
+            const auto &step = catalog.at("velocity_step");
+            velocity_step = {step.at("vx").get<double>(), step.at("vy").get<double>(), step.at("wz").get<double>()};
+        }
+        std::vector<Policy> decoded_policies;
+        for (const auto &p : catalog.at("policies"))
+            decoded_policies.push_back(DecodePolicy(p));
+        std::vector<Action> decoded_actions;
+        for (const auto &a : catalog.value("actions", Json::array()))
+            decoded_actions.push_back({a.at("key"), a.at("display_name")});
+        policies = std::move(decoded_policies);
+        actions = std::move(decoded_actions);
+        ++catalog_revision;
+    }
 
     void Fail(const boost::system::error_code &ec, const std::string &detail = "") {
         std::lock_guard<std::mutex> lock(mutex);
@@ -87,6 +107,8 @@ struct Client::Impl {
                 if (message.value("event", "") == "status") {
                     status = DecodeStatus(message.at("data"));
                     last_status = std::chrono::steady_clock::now();
+                } else if (message.value("event", "") == "catalog") {
+                    ApplyCatalog(message.at("data"));
                 } else if (message.value("event", "") == "robot_feedback") {
                     if (feedback_subscribed) {
                         try {
@@ -262,16 +284,7 @@ bool Client::Connect(const Connection &c, std::string *error) {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->status = DecodeStatus(hello.at("data").at("status"));
         impl_->last_status = std::chrono::steady_clock::now();
-        const auto &catalog = hello.at("data").at("catalog");
-        impl_->robot = catalog.at("robot");
-        if (catalog.contains("velocity_step")) {
-            const auto &step = catalog.at("velocity_step");
-            impl_->velocity_step = {step.at("vx").get<double>(), step.at("vy").get<double>(), step.at("wz").get<double>()};
-        }
-        for (const auto &p : catalog.at("policies"))
-            impl_->policies.push_back(DecodePolicy(p));
-        for (const auto &a : catalog.value("actions", Json::array()))
-            impl_->actions.push_back({a.at("key"), a.at("display_name")});
+        impl_->ApplyCatalog(hello.at("data").at("catalog"));
         return true;
     } catch (const std::exception &e) {
         if (error)
@@ -336,6 +349,10 @@ std::vector<Action> Client::Actions() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->actions;
 }
+uint64_t Client::CatalogRevision() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->catalog_revision;
+}
 std::string Client::RobotName() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->robot;
@@ -388,6 +405,10 @@ Reply Client::StartInteraction(const std::string &s) {
     return DecodeReply(impl_->Call("interaction", {{"action", s}}));
 }
 Reply Client::CancelInteraction() { return DecodeReply(impl_->Call("cancel")); }
+Reply Client::StartPlanner(const std::string &planner, const std::string &argument) {
+    return DecodeReply(impl_->Call("planner", {{"name", planner}, {"argument", argument}}));
+}
+Reply Client::StopPlanner() { return DecodeReply(impl_->Call("planner_stop")); }
 Reply Client::StartReference() { return DecodeReply(impl_->Call("reference_start")); }
 Reply Client::AcknowledgeFault() { return DecodeReply(impl_->Call("ack")); }
 std::string Client::PairingUrl() {

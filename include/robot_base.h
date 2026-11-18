@@ -81,6 +81,26 @@ const char *FaultSourceName(FaultSource source);
 const char *FaultCodeName(FaultCode code);
 
 /**
+ * @brief 驱动后端所处的运行环境
+ *
+ * 由 driver 按实际启用的后端填入 RobotData，control 和 HMI 据此判断
+ * 策略、动作和规划器在当前环境是否可用。
+ */
+enum class RuntimeEnvironment : uint8_t {
+    UNKNOWN = 0,     ///< 尚未收到 driver 状态
+    SIMULATION = 1,  ///< 仿真后端
+    REAL = 2,        ///< 实机硬件后端
+};
+
+constexpr bool IsValidRuntimeEnvironment(RuntimeEnvironment environment) {
+    return environment >= RuntimeEnvironment::UNKNOWN &&
+        environment <= RuntimeEnvironment::REAL;
+}
+
+/** @brief YAML 和界面使用的环境名：unknown / sim / real。 */
+const char *RuntimeEnvironmentName(RuntimeEnvironment environment);
+
+/**
  * @brief YAML 配置读取入口
  *
  * 封装 yaml 文件加载与按路径读取能力，供各模块统一读取配置。
@@ -124,6 +144,31 @@ private:
 };
 
 /**
+ * @brief 一个配置项可用的运行环境集合
+ *
+ * 对应 YAML 的 enabled_in 列表，取值 sim / real；缺省表示所有环境可用。
+ */
+struct EnvironmentSet {
+    bool simulation = true;
+    bool real = true;
+
+    /** @brief 读取 path 处的 enabled_in 列表；空列表或未知取值抛出异常。 */
+    static EnvironmentSet FromYaml(const YamlFile &yaml_file, const std::string &path);
+
+    /** @brief 环境未知时只放行不受限的配置项。 */
+    constexpr bool Allows(RuntimeEnvironment environment) const {
+        return environment == RuntimeEnvironment::SIMULATION ? simulation
+            : environment == RuntimeEnvironment::REAL ? real
+            : simulation && real;
+    }
+
+    /** @brief other 可用的环境中本项也都可用。 */
+    constexpr bool Covers(const EnvironmentSet &other) const {
+        return (simulation || !other.simulation) && (real || !other.real);
+    }
+};
+
+/**
  * @brief 机器人基础状态
  *
  * 统一的数据结构，用于在各模块间传递机器人状态。
@@ -156,6 +201,9 @@ struct RobotData {
 
     // ==================== 时间戳 ====================
     double time = 0.0;  // 时间戳 (s)
+
+    // ==================== 数据来源 ====================
+    RuntimeEnvironment environment = RuntimeEnvironment::UNKNOWN;  // 提供该状态的后端环境
 
     // ==================== 工厂方法 ====================
 
@@ -198,7 +246,7 @@ struct RobotData {
     void UpdateImuData();
 
     /**
-     * @brief 重置状态到初始值（保持 num_dof 不变）
+     * @brief 重置状态到初始值（保持 num_dof 和 environment 不变）
      */
     void Reset();
 
@@ -246,6 +294,27 @@ struct InteractionRequest {
     std::string action;     ///< START 对应的 YAML 动作名
 };
 
+/** @brief PlannerRequest::argument 的最大字节数（不含结尾符） */
+constexpr std::size_t kPlannerArgumentMaxLength = 255;
+
+/**
+ * @brief 参考动作规划器的启停请求
+ *
+ * 规划器为跟踪类策略提供参考动作，由机型 YAML 登记；请求只在 RL 状态内处理。
+ */
+struct PlannerRequest {
+    enum class Operation : uint8_t {
+        NONE = 0,
+        START = 1,
+        STOP = 2,
+    };
+
+    uint64_t sequence = 0;  ///< 请求序号；Control 对相同序号只处理一次
+    Operation operation = Operation::NONE;
+    std::string planner;    ///< START 对应的 YAML 规划器名
+    std::string argument;   ///< START 附带的任务描述（如离线生成使用的文本），可为空
+};
+
 /**
  * @brief 行为控制命令
  *
@@ -261,6 +330,7 @@ struct Command {
     std::string switch_policy;  ///< 策略切换请求，空字符串表示无切换
     uint64_t policy_request_sequence = 0;       ///< 策略请求序号；零保留旧调用方式
     InteractionRequest interaction;
+    PlannerRequest planner;
 };
 
 /**
@@ -282,6 +352,37 @@ struct InteractionStatus {
     Phase phase = Phase::IDLE;
     float progress = 0.0f;  ///< 播放进度 [0, 1]
     std::string action;
+};
+
+/**
+ * @brief 参考动作规划器的运行状态
+ *
+ * 规划器未接管参考时，跟踪策略使用自身的待命参考。
+ */
+struct PlannerStatus {
+    enum class Phase : uint8_t {
+        IDLE = 0,        ///< 未加载规划器
+        LOADING = 1,     ///< 后台加载规划器
+        WARMING = 2,     ///< 已加载，正在预热
+        READY = 3,       ///< 已加载，未接管参考
+        GENERATING = 4,  ///< 离线规划器正在生成参考动作
+        RUNNING = 5,     ///< 跟踪策略使用规划器输出的参考
+        STOPPING = 6,    ///< 正在交还参考并停止规划器
+        FAILED = 7,      ///< 加载或规划失败，跟踪策略已回到待命参考
+    };
+
+    uint64_t sequence = 0;          ///< 最近一次已处理请求的序号
+    bool request_accepted = false;  ///< 最近一次请求是否被接受
+    Phase phase = Phase::IDLE;
+    std::string planner;            ///< 当前或最近一次请求的规划器
+    /// LOADING / WARMING / GENERATING：准备进度 [0, 1]，0 表示无法估计；
+    /// RUNNING：有限长度参考的播放进度 [0, 1]
+    float progress = 0.0f;
+    uint32_t plan_count = 0;        ///< 本次启动后完成的规划次数
+    float plan_rate_hz = 0.0f;      ///< 最近的规划频率 (Hz)
+    float last_plan_ms = 0.0f;      ///< 最近一次规划耗时 (ms)
+    float reference_remaining_s = 0.0f;  ///< 已发布参考的剩余时长 (s)
+    std::string detail;             ///< 请求被拒绝或运行失败的原因；传输时可能截断
 };
 
 /**
@@ -354,6 +455,8 @@ struct ControlStatus {
     std::string active_policy;                  ///< 当前策略入口；目录内动作由 interaction 标识
     InteractionStatus interaction;              ///< RL 或 TRAJECTORY 交互动作状态
     PolicySwitchStatus policy_switch;           ///< 最近一次策略切换的处理结果
+    RuntimeEnvironment environment = RuntimeEnvironment::UNKNOWN;  ///< driver 上报的运行环境
+    PlannerStatus planner;                      ///< RL 状态内参考动作规划器的状态
 };
 
 /**

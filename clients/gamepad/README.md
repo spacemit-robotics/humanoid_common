@@ -11,9 +11,13 @@ hid-generic 驱动，避免加载 hid-playstation 后错误解释相同 VID/PID�
 输入读取为 O_RDONLY、不使用 EVIOCGRAB，不修改接收器固件或配对状态。
 默认不写 HID；显式配置可选 `rumble` 后，仅独立反馈线程写入震动报告。
 
-每条 binding 支持一个键或两个不同按键，operation 为 control/state/policy/preset/action/reference/cancel/ack。
+每条 binding 支持一个键或两个不同按键，operation 为 control/state/policy/preset/action/reference/planner/cancel/ack。
 control 切换控制权持有状态；其余操作复用现有 HMI 校验和控制链路。
 `reference` 启动当前策略的手动参考播放，与 TUI 的 G 和网页“开始参考”一致，不需要 value。
+`planner` 启动 value 指定的规划器，与 TUI 的 N 和网页规划器面板一致；配置校验要求该规划器
+列在绑定的 `policy` 的 `policy_adapter.planners` 中，未写 `policy` 时须至少被一个可选策略列出。
+规划器准备、运行或失败时，`cancel` 改为停止规划器；其余时候取消当前动作。
+规划器运行期间摇杆速度交给规划器，范围和快慢档取该规划器的 `command` 配置。
 显式 `POWER_OFF` 按键在服务已连接、已认证时，不要求状态回传新鲜或已持有控制权；
 网页同样保留此人工掉电入口，并保留管理员校验。状态过期、网络断开或手柄断开
 不会自动触发该操作。
@@ -65,6 +69,8 @@ preset 通过公开 `Client::SetTeleopPreset` 选择，按服务确认的档位�
 不写灯光、音频、配对或固件配置。设备权限由机型部署环境提供，不自动修改 udev。
 
 仅本客户端发起的 state/policy 请求，在 completed 回执、请求序号和目标状态一致后短震一次。
+本客户端发起的 planner 请求在该规划器进入运行、开始接管摇杆时短震一次；启动被拒绝、
+加载失败或加载期间被停止不震。
 受理不算成功；失败、重连、启动状态、重复选择当前值、其他客户端操作不震。
 USB 写入和定时停止都在独立普通线程，不睡眠阻塞摇杆循环；无权限/不支持只禁用震动。
 `--dry-run` 不打开输出设备。
@@ -83,8 +89,8 @@ USB 写入和定时停止都在独立普通线程，不睡眠阻塞摇杆循环�
 - `hmi_gamepad CONFIG --dry-run [--policy NAME]`：只读设备，打印方向和绑定结果，无网络命令。
   默认以策略目录第一项作为输入测试上下文；`--policy` 只影响输入解释，不切真实模型。
 - `test_gamepad_input`：归一化、布局、单键/组合长按、点按冲突、策略范围、重连、限速和平滑。
-- `test_gamepad_config [CONFIG]`：配置拒绝用例；给 YAML 时逐条回放其声明的实际绑定，不访问设备。
-- `test_gamepad_feedback`：成功去重、失败/重连不重放和 USB 报告字段；不访问设备。
+- `test_gamepad_config [CONFIG]`：配置拒绝用例（含未被策略列出的规划器）；给 YAML 时逐条回放其声明的实际绑定，不访问设备。
+- `test_gamepad_feedback`：成功去重、失败/重连不重放、规划器进入运行时的反馈和 USB 报告字段；不访问设备。
 - `test_operator_network`：快慢档 API 的控制权约束、参数校验和状态回报。
 
 独立 dry-run 时不要同时运行会响应相同组合键的生产手柄客户端。

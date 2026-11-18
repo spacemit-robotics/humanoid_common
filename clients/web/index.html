@@ -73,6 +73,15 @@
           <div class="select-row"><label class="sr-only" for="policy">控制策略</label><select id="policy"></select>
             <button id="select-policy" title="应用策略"><i data-lucide="check"></i>应用</button></div>
           <div class="current"><span class="live-dot"></span>当前采用 <strong id="active-policy">—</strong></div>
+          <div id="planner-panel" class="planner-panel" hidden>
+            <div class="section-heading"><h2><i data-lucide="route"></i>动作规划器</h2><span id="planner-state">未启动</span></div>
+            <div class="select-row"><label class="sr-only" for="planner">动作规划器</label><select id="planner"></select>
+              <button id="start-planner" class="primary"><i data-lucide="play"></i>启动</button>
+              <button id="stop-planner" class="icon" title="停止规划器并回到待命" aria-label="停止规划器并回到待命"><i data-lucide="square"></i></button></div>
+            <input id="planner-argument" type="text" maxlength="255" placeholder="动作描述" aria-label="动作描述" hidden>
+            <div id="planner-progress-row" class="progress-row" hidden><progress id="planner-progress" max="1" value="0" aria-label="规划器进度"></progress><span id="planner-progress-label"></span></div>
+            <p id="planner-detail" class="planner-detail"></p>
+          </div>
         </section>
         <section class="action-section">
           <div class="section-heading"><h2><i data-lucide="hand"></i>交互动作</h2><span id="action-state">就绪</span></div>

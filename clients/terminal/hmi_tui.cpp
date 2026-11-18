@@ -90,6 +90,7 @@ std::string ReplyMessage(const operator_service::Reply &reply) {
         return "已受理";
     }
     if (reply.code == "not_owner") return "请先按 L 申请控制权";
+    if (reply.code == "unavailable") return "当前运行环境不可用";
     if (reply.code == "busy") {
         if (reply.message == "another client owns control") return "其他客户端持有控制权，请等待释放";
         return "上一请求尚未完成，请稍候";
@@ -103,8 +104,7 @@ std::string ReplyMessage(const operator_service::Reply &reply) {
 void Run(operator_service::Client *client) {
     Terminal terminal;
     operator_terminal::View view;
-    view.policies = client->Policies();
-    view.actions = client->Actions();
+    uint64_t catalog_revision = 0;
     operator_service::Velocity input;
     auto last_renew = Clock::now(), last_velocity = last_renew, highlight_until = last_renew;
     uint64_t pending = 0;
@@ -126,6 +126,12 @@ void Run(operator_service::Client *client) {
     };
     while (running && client->Connected()) {
         const auto now = Clock::now();
+        if (const auto revision = client->CatalogRevision(); revision != catalog_revision) {
+            catalog_revision = revision;
+            view.policies = client->Policies();
+            view.actions = client->Actions();
+            view.policy_cursor_idx = view.interaction_cursor_idx = view.planner_cursor_idx = 0;
+        }
         view.status = client->LatestStatus();
         const auto &s = view.status;
         if (s.policy != previous_policy) {
@@ -167,7 +173,15 @@ void Run(operator_service::Client *client) {
             clear();
             view.last_action = "目标速度归零，减速停车";
         } else if (key == 'x') reply(client->AcknowledgeFault(), "确认故障");
-        else if (key == 'c') reply(client->CancelInteraction(), "取消动作");
+        else if (key == 'c') {
+            // One key frees the reference from whichever holds it: a planner or a catalog action.
+            if (s.planner.Engaged() || s.planner.phase == "FAILED") {
+                clear();
+                reply(client->StopPlanner(), "停止规划器");
+            } else {
+                reply(client->CancelInteraction(), "取消动作");
+            }
+        }
         else if (key == 'g' && !s.trajectory_enabled) {
             const auto r = client->StartReference();
             reply(r, "开始参考动作");
@@ -187,9 +201,23 @@ void Run(operator_service::Client *client) {
                 if (key == 'd') input.vy = -1;
                 if (key == 'q') input.wz = 1;
                 if (key == 'e') input.wz = -1;
-                if (key == 'b' && policy->HasSpeedModes()) reply(client->SetTeleopPreset(
+                if (key == 'b' && operator_terminal::HasSpeedModes(view)) reply(client->SetTeleopPreset(
                     s.teleop_preset == "fast" ? "slow" : "fast"), "切换快慢档");
             }
+        } else if (view.page == Page::PLANNER_SELECT) {
+            const auto *planners = policy == view.policies.end() ? nullptr : &policy->planners;
+            const int count = planners ? static_cast<int>(planners->size()) : 0;
+            int &cursor = view.planner_cursor_idx;
+            cursor = std::clamp(cursor, 0, std::max(0, count - 1));
+            if (key == kUp || key == 'k') cursor = std::max(0, cursor - 1);
+            if (key == kDown || key == 'j') cursor = std::min(std::max(0, count - 1), cursor + 1);
+            if ((key == '\r' || key == '\n') && count) {
+                clear();
+                const auto response = client->StartPlanner((*planners)[cursor].name);
+                reply(response, "启动规划器");
+                if (response.ok) view.page = Page::MAIN;
+            }
+            if (key == 'n') view.page = Page::MAIN;
         } else if (view.page == Page::POLICY_SELECT || view.page == Page::INTERACTION_SELECT) {
             const bool policies = view.page == Page::POLICY_SELECT;
             const auto *actions = s.trajectory_enabled ? &view.actions
@@ -216,6 +244,16 @@ void Run(operator_service::Client *client) {
             if (key == 'a') {
                 view.page = Page::INTERACTION_SELECT;
                 view.interaction_cursor_idx = 0;
+            }
+            if (key == 'n' && !s.trajectory_enabled && policy != view.policies.end() &&
+                !policy->planners.empty()) {
+                // Open on the planner control reports, else on the one the policy starts by itself.
+                const auto &wanted = s.planner.name.empty() ? policy->auto_planner : s.planner.name;
+                const auto listed = std::find_if(policy->planners.begin(), policy->planners.end(),
+                    [&](const auto &planner) { return planner.name == wanted; });
+                view.page = Page::PLANNER_SELECT;
+                view.planner_cursor_idx = listed == policy->planners.end()
+                    ? 0 : static_cast<int>(listed - policy->planners.begin());
             }
             if (key == 'v' || key == '\r' || key == '\n')
                 view.page = s.trajectory_enabled ? Page::INTERACTION_SELECT : Page::VELOCITY;
@@ -269,6 +307,7 @@ int main(int argc, char *argv[]) {
             std::printf("robot=%s state=%s online=%d zero_ready=%d owner=%s", client.RobotName().c_str(),
                 s.state.c_str(), s.online, s.zero_ready, s.owner.c_str());
             if (!s.trajectory_enabled) std::printf(" policy=%s", s.policy.c_str());
+            if (s.planner.phase != "IDLE") std::printf(" planner=%s:%s", s.planner.name.c_str(), s.planner.phase.c_str());
             std::puts("");
             return 0;
         }

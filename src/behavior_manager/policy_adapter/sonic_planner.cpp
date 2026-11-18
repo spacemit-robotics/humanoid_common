@@ -18,8 +18,11 @@
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <iomanip>
+#include <map>
 #include <mutex>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -142,7 +145,73 @@ double MotionEndTime(const SonicPlannerMotion &motion, double fps) {
         static_cast<double>(motion.frames.size() - 1) / fps;
 }
 
+// Tracker model joint -> robot joint, following the tracker's action mapping.
+std::vector<int> TrackerJointMapping(const rl_policy::PolicyExecutorConfig &tracker) {
+    const std::size_t count = tracker.action_joint_index.empty()
+        ? tracker.rl_default_pos.size() : tracker.action_joint_index.size();
+    std::vector<int> mapping(count);
+    for (std::size_t joint = 0; joint < count; ++joint) {
+        mapping[joint] = tracker.action_joint_index.empty()
+            ? static_cast<int>(joint) : tracker.action_joint_index[joint];
+    }
+    return mapping;
+}
+
+std::vector<int> RobotJointMapping() {
+    std::vector<int> mapping(kPlannerDofCount);
+    std::iota(mapping.begin(), mapping.end(), 0);
+    return mapping;
+}
+
 }  // namespace
+
+SonicPlannerConfig LoadSonicPlannerConfig(const robot_base::YamlFile &yaml,
+    const std::string &base,
+    const std::string &robot_dir,
+    double default_fps) {
+    const auto model = yaml.Read<std::string>(base + ".model_path");
+    if (!model || model->empty()) {
+        throw std::runtime_error("[sonic_planner] 缺少 " + base + ".model_path");
+    }
+    std::filesystem::path model_path(*model);
+    if (!model_path.is_absolute()) model_path = std::filesystem::path(robot_dir) / model_path;
+
+    SonicPlannerConfig config;
+    config.enabled = true;
+    config.model_path = std::filesystem::weakly_canonical(model_path).string();
+    const std::string runtime = base + ".runtime";
+    config.runtime.provider = yaml.Read<std::string>(runtime + ".provider").value_or("cpu");
+    config.runtime.threads = yaml.Read<int>(runtime + ".threads").value_or(2);
+    config.runtime.affinity = yaml.Read<std::string>(runtime + ".affinity").value_or("");
+    config.runtime.worker_sched = yaml.Read<std::string>(runtime + ".worker_sched").value_or("");
+    config.runtime.worker_priority = yaml.Read<int>(runtime + ".worker_priority").value_or(0);
+    config.runtime.ort_spinning = yaml.Read<bool>(runtime + ".ort_spinning").value_or(false);
+    config.runtime.ep_dump_subgraphs =
+        yaml.Read<bool>(runtime + ".ep_dump_subgraphs").value_or(false);
+    config.runtime.ep_profile_prefix =
+        yaml.Read<std::string>(runtime + ".ep_profile_prefix").value_or("");
+    config.runtime.ep_options = yaml.Read<std::map<std::string, std::string>>(
+        runtime + ".ep_options").value_or(std::map<std::string, std::string>{});
+    config.output_fps = yaml.Read<double>(base + ".output_fps").value_or(default_fps);
+    config.check_interval = yaml.Read<double>(base + ".check_interval").value_or(0.1);
+    config.replan_interval = yaml.Read<double>(base + ".replan_interval").value_or(1.0);
+    config.running_replan_interval =
+        yaml.Read<double>(base + ".running_replan_interval").value_or(0.1);
+    config.crawling_replan_interval =
+        yaml.Read<double>(base + ".crawling_replan_interval").value_or(0.2);
+    config.lookahead = yaml.Read<double>(base + ".lookahead").value_or(0.04);
+    config.default_height = yaml.Read<double>(base + ".default_height").value_or(0.788740);
+    config.facing_horizon = yaml.Read<double>(base + ".facing_horizon").value_or(1.0);
+    config.command_epsilon = yaml.Read<double>(base + ".command_epsilon").value_or(1.0e-3);
+    config.slow_walk_max_speed = yaml.Read<double>(base + ".slow_walk_max_speed").value_or(0.8);
+    config.walk_max_speed = yaml.Read<double>(base + ".walk_max_speed").value_or(2.5);
+    config.mode = yaml.Read<int>(base + ".mode").value_or(-1);
+    config.random_seed = yaml.Read<int>(base + ".random_seed").value_or(1234);
+    config.allowed_pred_num_tokens = yaml.Read<std::vector<int>>(
+        base + ".allowed_pred_num_tokens").value_or(
+            std::vector<int>{0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0});
+    return config;
+}
 
 SonicMotionFrame SampleSonicPlannerMotion(const SonicPlannerMotion &motion,
     double time_s, double fps) {
@@ -259,25 +328,13 @@ SonicPlannerBlend BlendSonicPlannerMotion(const SonicPlannerMotion &current,
 
 class SonicPlanner::Impl {
 public:
-    Impl(const SonicPlannerConfig &config,
-        const rl_policy::PolicyExecutorConfig &tracker_policy_config)
+    Impl(const SonicPlannerConfig &config, std::vector<int> model_to_mujoco)
         : config_(config),
-            planner_policy_config_(BuildPlannerPolicyConfig(config)) {
-        const int model_dof_count = tracker_policy_config.action_joint_index.empty()
-            ? static_cast<int>(tracker_policy_config.rl_default_pos.size())
-            : static_cast<int>(tracker_policy_config.action_joint_index.size());
-        if (model_dof_count != kPlannerDofCount) {
+            planner_policy_config_(BuildPlannerPolicyConfig(config)),
+            model_to_mujoco_(std::move(model_to_mujoco)) {
+        if (static_cast<int>(model_to_mujoco_.size()) != kPlannerDofCount) {
             throw std::runtime_error(
                 "[sonic_planner] model requires a 29-joint tracker");
-        }
-
-        model_to_mujoco_.resize(kPlannerDofCount);
-        for (int model_joint = 0; model_joint < kPlannerDofCount;
-            ++model_joint) {
-            model_to_mujoco_[model_joint] =
-                tracker_policy_config.action_joint_index.empty()
-                ? model_joint
-                : tracker_policy_config.action_joint_index[model_joint];
         }
         ValidateConfig();
         ValidateJointMapping();
@@ -288,20 +345,30 @@ public:
 
     ~Impl() { Stop(); }
 
-    void Reset(const robot_base::RobotData &robot) {
+    void Reset(const robot_base::RobotData &robot, double start_time_s) {
+        if (!std::isfinite(start_time_s) || start_time_s < 0.0) {
+            throw std::runtime_error("[sonic_planner] start time is invalid");
+        }
         Stop();
         // The model is loaded once; a previous Stop() must not cancel new plans.
         planner_policy_.ClearInferenceTermination();
         {
+            auto seed = std::make_shared<const SonicPlannerMotion>(
+                BuildSeedMotion(robot, start_time_s));
+            auto reference = BuildReference(*seed);
             std::lock_guard<std::mutex> lock(mutex_);
-            motion_ = std::make_shared<const SonicPlannerMotion>(BuildSeedMotion(robot));
+            motion_ = std::move(seed);
             tracker_motion_ = motion_;
+            reference_ = std::move(reference);
+            tracker_reference_ = reference_;
             latest_robot_ = robot;
             latest_command_ = {};
-            latest_elapsed_s_ = 0.0;
+            latest_elapsed_s_ = start_time_s;
             has_snapshot_ = true;
             request_generation_ = 1;
             plan_count_ = 0;
+            stats_plan_count_.store(0, std::memory_order_relaxed);
+            stats_plan_ms_.store(0.0, std::memory_order_relaxed);
             published_generation_ = 0;
             idle_ = false;
             idle_ready_at_s_ = 0.0;
@@ -342,6 +409,22 @@ public:
         return tracker_motion_;
     }
 
+    std::shared_ptr<const motion_planner::PlannerOutput> Reference() const {
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (lock.owns_lock()) {
+            if (!error_.empty()) throw std::runtime_error(error_);
+            tracker_reference_ = reference_;
+        }
+        return tracker_reference_;
+    }
+
+    motion_planner::PlannerStats Stats() const {
+        motion_planner::PlannerStats stats;
+        stats.plan_count = stats_plan_count_.load(std::memory_order_relaxed);
+        stats.last_plan_ms = stats_plan_ms_.load(std::memory_order_relaxed);
+        return stats;
+    }
+
     // Called from the control thread when the policy exits; must not wait
     // for the low-priority planner thread to release mutex_. A wakeup lost
     // to the race costs the worker at most one bounded wait (kStopPoll).
@@ -355,6 +438,19 @@ public:
         std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
         return lock.owns_lock() && idle_ && published_generation_ == request_generation_ &&
             latest_elapsed_s_ >= idle_ready_at_s_;
+    }
+
+    // Non-realtime callers only (Reset, destruction, planner host): joins the worker.
+    void Stop() {
+        RequestStop();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            running_ = false;
+        }
+        condition_.notify_all();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
     }
 
 private:
@@ -372,6 +468,7 @@ private:
                 planner_policy_.Init(planner_policy_config_);
                 load_s = std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - start).count();
+                if (config_.on_warmup) config_.on_warmup();
                 warmup_ms = Warmup();
             } catch (...) {
                 failure = std::current_exception();
@@ -467,7 +564,7 @@ private:
     }
 
     SonicPlannerMotion BuildSeedMotion(
-        const robot_base::RobotData &robot) const {
+        const robot_base::RobotData &robot, double start_time_s = 0.0) const {
         if (robot.joint_pos.size() < kPlannerDofCount) {
             throw std::runtime_error(
                 "[sonic_planner] 机器人关节状态不足 29 维");
@@ -493,8 +590,37 @@ private:
 
         SonicPlannerMotion seed;
         seed.frames.assign(100, frame);
-        seed.start_time_s = 0.0;
+        seed.start_time_s = start_time_s;
         return seed;
+    }
+
+    // Flat copy of a published motion in robot joint order, built off the tracker thread.
+    std::shared_ptr<const motion_planner::PlannerOutput> BuildReference(
+        const SonicPlannerMotion &motion) const {
+        auto output = std::make_shared<motion_planner::PlannerOutput>();
+        auto &trajectory = output->trajectory;
+        const std::size_t frames = motion.frames.size();
+        trajectory.num_dof = kPlannerDofCount;
+        trajectory.fps = config_.output_fps;
+        trajectory.start_time_s = motion.start_time_s;
+        trajectory.frame = motion_planner::ReferenceTrajectory::Frame::WORLD;
+        trajectory.joint_pos.resize(frames * kPlannerDofCount);
+        trajectory.joint_vel.resize(frames * kPlannerDofCount);
+        trajectory.root_pos.resize(frames * 3);
+        trajectory.root_quat.resize(frames * 4);
+        for (std::size_t frame = 0; frame < frames; ++frame) {
+            const auto &source = motion.frames[frame];
+            for (int model_joint = 0; model_joint < kPlannerDofCount; ++model_joint) {
+                const std::size_t index = frame * kPlannerDofCount + model_to_mujoco_[model_joint];
+                trajectory.joint_pos[index] = source.dof_pos[model_joint];
+                trajectory.joint_vel[index] = source.dof_vel[model_joint];
+            }
+            std::copy(source.root_pos.begin(), source.root_pos.end(),
+                trajectory.root_pos.begin() + frame * 3);
+            std::copy(source.root_quat.begin(), source.root_quat.end(),
+                trajectory.root_quat.begin() + frame * 4);
+        }
+        return output;
     }
 
     SonicMotionFrame SampleMotion(const SonicPlannerMotion &motion,
@@ -776,14 +902,18 @@ private:
                 if (!blend.expired) {
                     auto next_motion = std::make_shared<const SonicPlannerMotion>(
                         std::move(blend.motion));
+                    auto next_reference = BuildReference(*next_motion);
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (!Running()) return;
                     motion_ = std::move(next_motion);
+                    reference_ = std::move(next_reference);
                     idle_ = SelectMode(command) == 0;
                     idle_ready_at_s_ = MotionEndTime(*motion_, config_.output_fps);
                     published_generation_ = handled_generation;
                 }
                 ++plan_count_;
+                stats_plan_count_.store(plan_count_, std::memory_order_relaxed);
+                stats_plan_ms_.store(infer_ms, std::memory_order_relaxed);
                 RecordPlan(command, elapsed_s, publish_time_s, infer_ms, generated, blend,
                     source_idle);
             } catch (const std::exception &error) {
@@ -885,19 +1015,6 @@ private:
         last_late_report_ = now;
     }
 
-    // Non-realtime callers only (Reset, destruction): joins the worker.
-    void Stop() {
-        RequestStop();
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            running_ = false;
-        }
-        condition_.notify_all();
-        if (worker_.joinable()) {
-            worker_.join();
-        }
-    }
-
     bool Running() const {
         return running_ && !stop_requested_.load(std::memory_order_acquire);
     }
@@ -928,18 +1045,25 @@ private:
     // own cached snapshot, avoiding shared_ptr atomic operations' internal lock.
     std::shared_ptr<const SonicPlannerMotion> motion_;
     mutable std::shared_ptr<const SonicPlannerMotion> tracker_motion_;
+    std::shared_ptr<const motion_planner::PlannerOutput> reference_;
+    mutable std::shared_ptr<const motion_planner::PlannerOutput> tracker_reference_;
+    std::atomic<std::uint64_t> stats_plan_count_{0};
+    std::atomic<double> stats_plan_ms_{0.0};
     // Declared last: stops before the members its formatter reads are destroyed.
     std::unique_ptr<runtime_logging::SnapshotWorker<PlanRecord, 16>> plan_log_;
 };
 
 SonicPlanner::SonicPlanner(const SonicPlannerConfig &config,
     const rl_policy::PolicyExecutorConfig &tracker_policy_config)
-    : impl_(std::make_unique<Impl>(config, tracker_policy_config)) {}
+    : impl_(std::make_unique<Impl>(config, TrackerJointMapping(tracker_policy_config))) {}
+
+SonicPlanner::SonicPlanner(const SonicPlannerConfig &config)
+    : impl_(std::make_unique<Impl>(config, RobotJointMapping())) {}
 
 SonicPlanner::~SonicPlanner() = default;
 
-void SonicPlanner::Reset(const robot_base::RobotData &robot) {
-    impl_->Reset(robot);
+void SonicPlanner::Reset(const robot_base::RobotData &robot, double start_time_s) {
+    impl_->Reset(robot, start_time_s);
 }
 
 void SonicPlanner::Update(const robot_base::RobotData &robot,
@@ -952,12 +1076,24 @@ std::shared_ptr<const SonicPlannerMotion> SonicPlanner::Motion() const {
     return impl_->Motion();
 }
 
+std::shared_ptr<const motion_planner::PlannerOutput> SonicPlanner::Reference() const {
+    return impl_->Reference();
+}
+
 void SonicPlanner::RequestStop() {
     impl_->RequestStop();
 }
 
+void SonicPlanner::Stop() {
+    impl_->Stop();
+}
+
 bool SonicPlanner::Idle() const {
     return impl_->Idle();
+}
+
+motion_planner::PlannerStats SonicPlanner::Stats() const {
+    return impl_->Stats();
 }
 
 }  // namespace policy_adapter

@@ -35,8 +35,12 @@ reported by the operator service. `--renew-ms` defaults to 300 ms, accepts
 No tool switches robot state or policy, sends velocity commands, or preempts
 another owner's control lease. Execution requires an online control endpoint
 and an action present in both the current catalog and the configured allow-list
-(when supplied). A second action is rejected while one is running. Existing
-start timeouts, maximum-action cancellation and exit cleanup are unchanged.
+(when supplied). A second action is rejected while one is running. Actions are
+also rejected while a motion planner holds the tracker's reference; the planner
+is stopped from the terminal, web or gamepad client, as no tool starts or stops
+planners. The catalog lists only actions enabled in the current runtime
+environment. Existing start timeouts, maximum-action cancellation and exit
+cleanup are unchanged.
 The MCP client does not bypass operator-service or control-layer safety checks.
 
 Supported methods are `initialize`, `ping`, `tools/list` and `tools/call`.

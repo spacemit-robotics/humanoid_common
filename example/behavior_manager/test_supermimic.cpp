@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
@@ -20,11 +21,16 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
+#include "fake_planners.h"
+#include "motion_planner/motion_planner.h"
 #include "policy_adapter/policy_adapter.h"
 
 namespace {
@@ -689,6 +695,333 @@ void TestCatalog(const Fixture &fixture) {
         "duplicate catalog action must fail");
 }
 
+// A realtime planner with a moving root: it advances along its heading at 0.5 m/s while
+// yawing at 1 rad/s, 0.9 m high; joint 0 ramps at 0.5 rad/s from 0.6 and the others hold
+// 0.6. The planner named "overflow" publishes root positions whose differences overflow.
+class RootMotionPlanner final : public behavior_manager::motion_planner::RealtimePlanner {
+public:
+    explicit RootMotionPlanner(const behavior_manager::motion_planner::PlannerContext &context)
+        : num_dof_(context.num_dof), overflow_(context.name == "overflow") {}
+
+    void Start(const robot_base::RobotData &, double time_s) override {
+        constexpr int kFrames = 100;
+        auto output = std::make_shared<behavior_manager::motion_planner::PlannerOutput>();
+        auto &trajectory = output->trajectory;
+        trajectory.num_dof = num_dof_;
+        trajectory.fps = 50.0;
+        trajectory.start_time_s = time_s;
+        trajectory.joint_pos.assign(static_cast<std::size_t>(kFrames) * num_dof_, 0.6F);
+        trajectory.joint_vel.assign(static_cast<std::size_t>(kFrames) * num_dof_, 0.0F);
+        trajectory.root_pos.resize(kFrames * 3);
+        trajectory.root_quat.resize(kFrames * 4);
+        for (int frame = 0; frame < kFrames; ++frame) {
+            const float time = 0.02F * frame;
+            trajectory.joint_pos[static_cast<std::size_t>(frame) * num_dof_] = 0.6F + 0.5F * time;
+            trajectory.joint_vel[static_cast<std::size_t>(frame) * num_dof_] = 0.5F;
+            trajectory.root_pos[frame * 3] = 0.5F * std::sin(time);
+            trajectory.root_pos[frame * 3 + 1] = 0.5F * (1.0F - std::cos(time));
+            trajectory.root_pos[frame * 3 + 2] = 0.9F;
+            if (overflow_) trajectory.root_pos[frame * 3] = frame % 2 == 0 ? 3.0e38F : -3.0e38F;
+            trajectory.root_quat[frame * 4] = std::cos(0.5F * time);
+            trajectory.root_quat[frame * 4 + 3] = std::sin(0.5F * time);
+        }
+        output_ = std::move(output);
+    }
+
+    void Update(const behavior_manager::motion_planner::PlannerInput &) override {}
+    std::shared_ptr<const behavior_manager::motion_planner::PlannerOutput> Output() override { return output_; }
+    void Stop() override { output_.reset(); }
+
+private:
+    int num_dof_;
+    bool overflow_;
+    std::shared_ptr<const behavior_manager::motion_planner::PlannerOutput> output_;
+};
+
+// Steps the adapter like the inference thread: one 20 ms policy step per call.
+class PlannerProbe {
+public:
+    PlannerProbe(const behavior_manager::policy_adapter::Config &config, const Fixture &fixture)
+        : policy_(Policy(fixture.model)) {
+        adapter = Create(config, policy_);
+        executor_.Init(policy_);
+        robot_ = robot_base::RobotData::Create(28);
+        robot_.base_quat = {1, 0, 0, 0};
+        robot_.joint_pos.assign(28, 0.1);
+        robot_.environment = robot_base::RuntimeEnvironment::SIMULATION;
+        adapter->Reset(robot_);
+    }
+
+    const std::vector<float> &Tick() {
+        static_cast<void>(adapter->SelectExecutor(command, executor_));
+        if (!switching) adapter->HandleInteractionRequest(interaction, time);
+        adapter->HandlePlannerRequest(request);
+        adapter->PreparePolicySwitch(switching, time);
+        adapter->PrepareInputs(robot_, time, executor_);
+        Eigen::VectorXf observation;
+        std::vector<double> action;
+        executor_.AssembleObs(robot_.gyro, robot_.rpy, 0, 0, 0,
+            robot_.joint_pos, robot_.joint_vel, robot_.base_quat, {}, 0.02, observation);
+        executor_.Infer(observation, action);
+        adapter->OnAction(action);
+        goal = executor_.GetModelOutput("seen_goal");
+        last_time = time;
+        time += 0.02;
+        return goal;
+    }
+
+    bool Until(const std::function<bool()> &done, int timeout_ms = 5000) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (true) {
+            Tick();
+            if (done()) return true;
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    bool UntilPhase(robot_base::PlannerStatus::Phase phase) {
+        return Until([&] { return planner().phase == phase; });
+    }
+
+    // Ticks through a reference change: joint 0 of the first goal frame must move in small
+    // steps and end on the target.
+    bool Settles(double target, double max_step = 0.12, int ticks = 12) {
+        double previous = goal[0];
+        for (int index = 0; index < ticks; ++index) {
+            const double value = Tick()[0];
+            if (std::abs(value - previous) > max_step) return false;
+            previous = value;
+        }
+        return std::abs(previous - target) < 1e-5;
+    }
+
+    void Start(const std::string &name, const std::string &argument = "") {
+        request = {request.sequence + 1, robot_base::PlannerRequest::Operation::START, name, argument};
+    }
+
+    void Stop() { request = {request.sequence + 1, robot_base::PlannerRequest::Operation::STOP, "", ""}; }
+
+    void Action(const std::string &name) {
+        interaction = {interaction.sequence + 1, robot_base::InteractionRequest::Operation::START, name};
+    }
+
+    void Restart() {
+        adapter->OnInferenceStopped();
+        adapter->Reset(robot_);
+        request = {};
+        interaction = {};
+        command = {};
+        switching = false;
+        time = 0.0;
+    }
+
+    const robot_base::PlannerStatus &planner() const { return *adapter->PlannerStatus(); }
+    robot_base::InteractionStatus action() const { return adapter->GetInteractionStatus(); }
+
+    std::unique_ptr<behavior_manager::policy_adapter::PolicyAdapter> adapter;
+    std::array<double, 3> command{};
+    robot_base::PlannerRequest request;
+    robot_base::InteractionRequest interaction;
+    bool switching = false;
+    double time = 0.0;
+    double last_time = 0.0;
+    std::vector<float> goal;
+
+private:
+    rl_policy::PolicyExecutorConfig policy_;
+    rl_policy::PolicyExecutor executor_;
+    robot_base::RobotData robot_;
+};
+
+// Planners registered for a SuperMimic policy: trajectories, catalog actions selected by a
+// decision planner and generated motions all replace the goal without touching the
+// interaction status, and return to the standby reference.
+void TestPlanners(const Fixture &fixture) {
+    using behavior_manager::motion_planner::Category;
+    using behavior_manager::motion_planner::Kind;
+    using behavior_manager::motion_planner::PlannerContext;
+    using PlannerPhase = robot_base::PlannerStatus::Phase;
+    using ActionPhase = robot_base::InteractionStatus::Phase;
+    fake_planners::Register();
+    behavior_manager::motion_planner::RegisterPlannerType("supermimic_root_motion",
+        {Category::REALTIME, Kind::MODEL,
+            [](const PlannerContext &context) -> std::unique_ptr<behavior_manager::motion_planner::Planner> {
+                return std::make_unique<RootMotionPlanner>(context);
+            }});
+    auto &script = fake_planners::GetScript();
+    script.Reset();
+    fixture.WriteMotion();
+    fixture.WriteStill("standby.npz", 0.3F, 0.8F);
+    const auto write = [&](const std::string &robot_dof, const std::string &adapter) {
+        std::ofstream output(fixture.yaml);
+        output << "robot_base: {num_dof: " << robot_dof << "}\n"
+            "motion_planners:\n"
+            "  walker: {type: fake_trajectory}\n"
+            "  mover: {type: supermimic_root_motion}\n"
+            "  overflow: {type: supermimic_root_motion}\n"
+            "  chooser: {type: fake_choice}\n"
+            "  writer: {type: fake_generator, category: offline}\n"
+            "rl_policy:\n  rl_dt: 0.02\n  onnx_infer:\n    policies:\n      probe:\n"
+            "        infer_decimation: 1\n        policy_adapter:\n          type: supermimic\n"
+            "          anchor_body_index: 1\n" << adapter <<
+            "probe_actions:\n  default_action: idle\n  transition_duration: 0.1\n"
+            "  motion_fps: 25\n  action_names: [idle, gesture]\n  actions:\n"
+            "    idle: {file: standby.npz}\n    gesture: {file: motion.npz}\n";
+        Require(output.good(), "cannot write planner configuration");
+    };
+    const std::string directory = std::filesystem::path(fixture.yaml).parent_path().string();
+    const std::string catalog = "          catalog: probe_actions\n";
+    const std::string planners = "          planners: [walker, mover, overflow, chooser, writer]\n";
+    write("28", "          reference_file: motion.npz\n" + planners);
+    Reject([&] { LoadConfig(fixture.yaml, "probe", directory); },
+        "planners need a catalog that provides the standby reference");
+    write("29", catalog + planners);
+    Reject([&] { Create(LoadConfig(fixture.yaml, "probe", directory), Policy(fixture.model)); },
+        "planner trajectories must match the policy joints");
+    write("28", catalog + planners);
+    const auto config = LoadConfig(fixture.yaml, "probe", directory);
+    Require(config.planners.planners.size() == 5 && config.planners.planners[4].category == Category::OFFLINE,
+        "planners of a SuperMimic policy come from YAML");
+    PlannerProbe probe(config, fixture);
+    const auto idle = [&] { return probe.planner().phase == PlannerPhase::READY ||
+        probe.planner().phase == PlannerPhase::IDLE; };
+
+    // Model trajectory: crossfade in, in-place replacement of consecutive plans, crossfade out.
+    probe.Tick();
+    Near(probe.goal[0], 0.2, "the standby reference before any planner");
+    Near(probe.goal[65], 0.8, "the standby height");
+    Require(probe.planner().phase == PlannerPhase::IDLE && probe.adapter->ReadyForPolicySwitch(),
+        "no planner is loaded until one is requested");
+    probe.Start("walker");
+    Require(probe.UntilPhase(PlannerPhase::RUNNING), "the planner did not start: " + probe.planner().detail);
+    Require(!probe.adapter->ReadyForPolicySwitch(), "a running planner blocks a policy switch");
+    Require(probe.Settles(0.4), "the planner trajectory must be blended in");
+    Near(probe.goal[1], 0.401, "trajectory joints use the policy joint order");
+    Near(probe.goal[28], 0, "a constant trajectory has no joint velocity");
+    Near(probe.goal[58], -1, "an upright trajectory root");
+    Near(probe.goal[65], 0, "the root height comes from the trajectory");
+    Require(probe.action().phase == ActionPhase::IDLE && probe.action().action.empty(),
+        "a planner reference is not an operator action");
+    probe.Action("gesture");
+    probe.Tick();
+    Require(!probe.action().request_accepted && probe.action().phase == ActionPhase::REJECTED &&
+        probe.action().sequence == 1, "actions wait until the planner stops");
+    Near(probe.goal[0], 0.4, "a rejected action leaves the planner reference");
+    probe.command = {0.3, 0.0, 0.0};
+    Require(probe.Until([&] { return script.last_vx == 0.3F; }), "the command did not reach the planner");
+    probe.Tick();
+    Near(probe.goal[0], 0.7, "consecutive plans replace each other without a new blend");
+    probe.command = {0.0, 0.0, 0.0};
+    Require(probe.Until([&] { return script.last_vx == 0.0F; }) && probe.Settles(0.4, 0.31),
+        "the zero command did not reach the planner");
+    probe.Stop();
+    Require(probe.Until(idle), "the planner did not stop");
+    Require(probe.Settles(0.2), "stopping must blend back to the standby reference");
+    Near(probe.goal[65], 0.8, "the standby height after the planner");
+    Require(probe.adapter->ReadyForPolicySwitch() && probe.action().phase == ActionPhase::REJECTED,
+        "returning to standby is not an action result");
+    probe.Action("gesture");
+    probe.Tick();
+    Require(probe.action().request_accepted && probe.action().phase == ActionPhase::BLEND_IN,
+        "actions are available again once the planner has stopped");
+    probe.Start("walker");
+    probe.Tick();
+    Require(!probe.planner().request_accepted && probe.planner().phase == PlannerPhase::READY,
+        "a planner cannot start while an action plays");
+
+    // Root pose: velocities are derived from the trajectory and sampled on its time axis.
+    probe.Restart();
+    probe.Start("mover");
+    Require(probe.UntilPhase(PlannerPhase::RUNNING), "the root-motion planner did not start");
+    double start = probe.last_time;
+    for (int index = 0; index < 8; ++index) probe.Tick();
+    // The first goal frame is one policy step ahead of the tick.
+    const auto expected = [&] { return 0.5 + 0.5 * (probe.last_time + 0.02 - start); };
+    Require(std::abs(probe.goal[0] - expected()) < 0.012,
+        "a continuous trajectory keeps the time axis it was planned on");
+    Require(std::abs(probe.goal[28] - 0.5) < 1e-4, "the joint velocity of the trajectory");
+    Near(probe.goal[1], 0.5, "the joints that hold still");
+    Require(std::abs(probe.goal[56]) < 1e-5 && std::abs(probe.goal[58] + 1) < 1e-5, "yaw does not tilt gravity");
+    Require(std::abs(probe.goal[59]) < 1e-3 && std::abs(probe.goal[61] - 1) < 1e-3,
+        "the root angular velocity is derived in the root frame");
+    Require(std::abs(probe.goal[62] - 0.5) < 1e-2 && std::abs(probe.goal[63]) < 1e-2 &&
+        std::abs(probe.goal[64]) < 1e-3, "the root linear velocity is derived in the heading frame");
+    Require(std::abs(probe.goal[65] - 0.9) < 1e-5, "the root height of the trajectory");
+    Require(std::abs(probe.goal[9 * 66] - (expected() + 0.5 * 0.18)) < 0.012,
+        "the goal horizon looks ahead along the trajectory");
+    // Past its last frame the trajectory is held still.
+    Require(probe.Until([&] { return probe.last_time - start > 2.2; }), "the trajectory did not run out");
+    Near(probe.goal[28], 0, "a held trajectory has no joint velocity");
+    Near(probe.goal[62], 0, "a held trajectory has no root velocity");
+    Require(std::abs(probe.goal[0] - (0.5 + 0.5 * 1.98)) < 1e-4 &&
+        probe.planner().phase == PlannerPhase::RUNNING, "the last frame is held while the planner runs");
+    // The policy leaves through the standby reference.
+    probe.switching = true;
+    Require(probe.Until([&] { return probe.adapter->ReadyForPolicySwitch(); }),
+        "a policy switch must release the planner reference");
+    Near(probe.goal[0], 0.2, "the policy switch ends on the standby reference");
+    Require(probe.action().phase == ActionPhase::IDLE, "a planner release is not an action result");
+
+    // A trajectory the tracker cannot convert fails the planner and keeps the standby.
+    probe.Restart();
+    probe.Start("overflow");
+    Require(probe.UntilPhase(PlannerPhase::FAILED) &&
+        probe.planner().detail.find("not finite") != std::string::npos,
+        "an unusable trajectory must fail the planner: " + probe.planner().detail);
+    probe.Tick();
+    Near(probe.goal[0], 0.2, "the standby reference is kept after a planner failure");
+    Require(probe.adapter->ReadyForPolicySwitch(), "a failed planner does not hold the reference");
+
+    // Decision planner: selects catalog actions; the tracker loads, blends and plays them.
+    probe.Restart();
+    probe.Start("chooser");
+    Require(probe.UntilPhase(PlannerPhase::RUNNING), "the decision planner did not start");
+    probe.command = {0.4, 0.0, 0.0};
+    Require(probe.Until([&] { return probe.planner().progress > 0.3F; }),
+        "the selected action did not play");
+    Require(probe.goal[0] > -1e-6 && probe.goal[0] < 0.2 && probe.goal[65] > 0.99,
+        "the goal follows the selected catalog action");
+    Require(probe.action().phase == ActionPhase::IDLE, "a selected action is not an operator action");
+    // The action is replayed while the command holds, then the planner returns to idle.
+    bool replayed = false;
+    float previous = probe.planner().progress;
+    Require(probe.Until([&] {
+        replayed = replayed || probe.planner().progress < previous;
+        previous = probe.planner().progress;
+        return replayed;
+    }), "the decision planner did not replay its action");
+    probe.command = {0.0, 0.0, 0.0};
+    probe.Stop();
+    Require(probe.Until(idle) && probe.Settles(0.2), "the decision planner did not return to standby");
+    probe.Start("chooser", "missing");
+    Require(probe.UntilPhase(PlannerPhase::FAILED) &&
+        probe.planner().detail.find("not in the catalog") != std::string::npos,
+        "an action outside the catalog must fail the planner: " + probe.planner().detail);
+
+    // Offline planner: one generated motion, played once, then back to standby.
+    probe.Restart();
+    probe.Start("writer", "wave");
+    Require(probe.UntilPhase(PlannerPhase::RUNNING), "the generated motion did not start");
+    // A 0.4 rad change over the 0.1 s cosine blend moves at most 0.124 rad per step.
+    Require(probe.Settles(0.6, 0.13, 8), "the generated motion must be blended in");
+    Require(probe.Until([&] { return probe.planner().progress > 0.5F; }), "playback progress was not reported");
+    Require(probe.Until(idle), "the generated motion did not finish");
+    Require(probe.Settles(0.2, 0.13), "a finished motion returns to the standby reference");
+    Require(probe.action().phase == ActionPhase::IDLE && script.generated == 1,
+        "a generated motion is not an operator action");
+
+    // Leaving RL unloads the planner; the next session starts on the standby reference.
+    probe.Start("walker");
+    Require(probe.UntilPhase(PlannerPhase::RUNNING), "the planner did not start again");
+    probe.Restart();
+    probe.Tick();
+    Near(probe.goal[0], 0.2, "a new RL session starts on the standby reference");
+    Require(probe.planner().sequence == 0 && !probe.adapter->PlannerStatus()->request_accepted,
+        "a new RL session starts without planner requests");
+    script.Reset();
+}
+
 }  // namespace
 
 int main() {
@@ -698,7 +1031,8 @@ int main() {
         TestInvalidConfiguration(fixture);
         TestReferencePlayback(fixture);
         TestCatalog(fixture);
-        std::cout << "SuperMimic history, reference playback, catalog and static goal tests passed\n";
+        TestPlanners(fixture);
+        std::cout << "SuperMimic history, reference playback, catalog, planner and static goal tests passed\n";
         return 0;
     } catch (const std::exception &error) {
         std::cerr << "SuperMimic test failed: " << error.what() << '\n';

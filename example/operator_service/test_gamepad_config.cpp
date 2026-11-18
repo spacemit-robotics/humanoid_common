@@ -51,6 +51,8 @@ operator_gamepad:
         - {buttons: [Y], operation: preset, value: toggle, trigger: tap, policy: walk}
         - {buttons: [RT, A], operation: action, value: shake_hand, trigger: tap, policy: walk}
         - {buttons: [RT, A], operation: action, value: rhythm_1, hold_ms: 1000, policy: dance}
+        - {buttons: [LT, UP], operation: planner, value: walker, hold_ms: 1000, policy: walk}
+        - {buttons: [LT, DOWN], operation: planner, value: writer}
 operator_service:
     teleop:
         deadzone: 0.06
@@ -61,6 +63,10 @@ operator_service:
 rl_policy:
     onnx_infer:
         policy_names: [walk, dance]
+        policies:
+            walk:
+                policy_adapter: {type: sonic, planners: [walker, writer]}
+            dance: {}
 )");
     const auto config = operator_gamepad::ReadConfig(root);
     assert(config.input.buttons.at(317) == "CAPTURE");
@@ -87,6 +93,10 @@ rl_policy:
         "[{buttons: [Y], operation: preset, value: toggle, policy: [walk]}]",
         "[{buttons: [Y], operation: policy, value: absent}]",
         "[{buttons: [Y], operation: preset, value: turbo}]",
+        "[{buttons: [Y], operation: planner, value: ghost, policy: walk}]",
+        "[{buttons: [Y], operation: planner, value: walker, policy: dance}]",
+        "[{buttons: [Y], operation: planner, value: ghost}]",
+        "[{buttons: [Y], operation: planner}]",
         "[{buttons: [Y], operation: ack}, {buttons: [Y], operation: ack, policy: walk}]",
         "[{buttons: [Y], operation: ack, policy: walk}, {buttons: [Y], operation: ack}]",
         "[{buttons: [Y], operation: ack, policy: walk}, {buttons: [Y], operation: ack, policy: walk}]"})
@@ -99,5 +109,5 @@ rl_policy:
         "{enabled: true, backend: ds4_usb, device: /dev/null, strength: 256}",
         "{enabled: true, backend: ds4_usb, device: /dev/null, duration_ms: 0}"})
         rejects(YAML::Load(yaml), "rumble");
-    std::puts("gamepad config: tap/hold replay, context overlap and invalid mappings passed");
+    std::puts("gamepad config: tap/hold replay, planner bindings, context overlap and invalid mappings passed");
 }

@@ -241,7 +241,8 @@ void TestAdministrator() {
     assert(service.Catalog().at("admin_required"));
     assert(service.Catalog().dump().find(config.admin_password_hash) == std::string::npos);
     assert(call(browser, "status").at("ok"));
-    for (const auto *op : {"acquire", "stop", "cancel", "ack", "velocity", "interaction"})
+    for (const auto *op : {"acquire", "stop", "cancel", "ack", "velocity", "interaction", "planner",
+            "planner_stop"})
         assert(call(browser, op).at("code") == "admin_required");
     assert(call(browser, "state", {{"state", "POWER_OFF"}}).at("code") == "admin_required");
     assert(call(terminal, "acquire").at("ok"));
@@ -393,6 +394,357 @@ void TestTrajectory() {
     assert(Service(modes).Catalog().at("policies").size() == 1);
     std::filesystem::remove_all(root);
 }
+// The catalog and the request checks follow the environment reported by the driver.
+void TestEnvironment() {
+    using namespace operator_service;  // NOLINT(build/namespaces)
+    using Environment = robot_base::RuntimeEnvironment;
+    const auto root = std::filesystem::temp_directory_path() /
+        ("operator_environment_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(root);
+    const auto path = root / "config.yaml";
+    std::ofstream(path) << "rl_policy:\n  onnx_infer:\n"
+        "    policy_names: [walk, show]\n    policies:\n"
+        "      walk:\n        policy_adapter: {type: sonic, catalog: walk_actions}\n"
+        "      show:\n        enabled_in: [sim]\n        switch_group: whole_body\n"
+        "        policy_actions:\n          idle_policy: walk\n          action_names: [wave]\n"
+        "          actions:\n            wave: {policy: wave_model}\n"
+        "      wave_model: {}\n"
+        "walk_actions:\n  action_names: [stand, flip]\n  actions:\n"
+        "    stand: {display_name: Stand}\n    flip: {display_name: Flip, enabled_in: [sim]}\n";
+    auto config = LoadConfig(path.string());
+    std::filesystem::remove_all(root);
+    assert(config.policies.size() == 2 && config.policies[0].actions.size() == 2);
+    config.token = "environment-test";
+    config.status_timeout = 5;
+    config.lease_ms = 5000;
+    Service service(config);
+    // Until the driver reports its backend only unrestricted entries are listed.
+    auto catalog = service.Catalog();
+    assert(catalog.at("environment") == "unknown" && catalog.at("policies").size() == 1);
+    assert(catalog.at("policies")[0].at("name") == "walk" && catalog.at("policies")[0].at("actions").size() == 1);
+    robot_base::ControlStatus status;
+    status.active_policy = "walk";
+    status.hmi_connected = true;
+    status.environment = Environment::REAL;
+    const auto revision = service.CatalogRevision();
+    service.UpdateStatus(status, {});
+    service.UpdateStatus(status, {});
+    assert(service.CatalogRevision() == revision + 1);
+    catalog = service.Catalog();
+    assert(catalog.at("environment") == "real" && catalog.at("policies").size() == 1);
+    assert(catalog.at("policies")[0].at("actions").size() == 1 &&
+        catalog.at("policies")[0].at("actions")[0].at("key") == "stand");
+    assert(service.Snapshot().environment == "real");
+    const auto session = service.Open();
+    uint64_t id = 0;
+    const auto call = [&](const std::string &op, const Json &args = Json::object()) {
+        return service.Handle(session, {{"v", 1}, {"id", ++id}, {"op", op}, {"args", args}});
+    };
+    assert(call("hello", {{"token", config.token}}).at("data").at("catalog").at("policies").size() == 1);
+    assert(call("acquire").at("ok"));
+    auto reply = call("policy", {{"policy", "show"}});
+    assert(!reply.at("ok") && reply.at("code") == "unavailable");
+    status.mode = robot_base::ControlMode::RL;
+    service.UpdateStatus(status, {});
+    reply = call("interaction", {{"action", "flip"}});
+    assert(!reply.at("ok") && reply.at("code") == "unavailable");
+    assert(service.Command().interaction.operation == robot_base::InteractionRequest::Operation::NONE);
+    status.environment = Environment::SIMULATION;
+    service.UpdateStatus(status, {});
+    assert(service.CatalogRevision() == revision + 2);
+    catalog = service.Catalog();
+    assert(catalog.at("environment") == "sim" && catalog.at("policies").size() == 2);
+    assert(catalog.at("policies")[0].at("actions").size() == 2);
+    assert(DecodeStatus(service.StatusMessage(session)).environment == "sim");
+    assert(call("interaction", {{"action", "flip"}}).at("ok"));
+    assert(service.Command().interaction.action == "flip");
+    // A selected policy that the environment disables cannot enter RL.
+    status.mode = robot_base::ControlMode::ZERO;
+    status.zero_ready = true;
+    status.active_policy = "show";
+    status.environment = Environment::REAL;
+    service.UpdateStatus(status, {});
+    call("stop");  // Cancels the pending action request and releases control.
+    assert(call("acquire").at("ok"));
+    reply = call("state", {{"state", "RL"}});
+    assert(!reply.at("ok") && reply.at("code") == "unavailable");
+}
+void TestPlanner() {
+    using namespace operator_service;  // NOLINT(build/namespaces)
+    using Environment = robot_base::RuntimeEnvironment;
+    using Phase = robot_base::PlannerStatus::Phase;
+    using Operation = robot_base::PlannerRequest::Operation;
+    const auto root = std::filesystem::temp_directory_path() /
+        ("operator_planner_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(root);
+    const auto path = root / "config.yaml";
+    const std::string yaml = "rl_policy:\n  onnx_infer:\n"
+        "    policy_names: [track, plain]\n    policies:\n"
+        "      track:\n"
+        "        command:\n          limits: {max_vx: 0.2, max_vy: 0.2, max_wz: 0.2}\n"
+        "        policy_adapter:\n          type: sonic\n          catalog: track_actions\n"
+        "          planners: [walker, writer, lab]\n          auto_planner: lab\n"
+        "      plain: {}\n"
+        "track_actions:\n  action_names: [wave]\n  actions:\n    wave: {display_name: Wave}\n"
+        "motion_planners:\n"
+        "  walker:\n    display_name: 行走规划\n    type: walker_model\n"
+        "    command:\n      limits: {min_vx: -0.3, max_vx: 0.8, max_vy: 0.5, max_wz: 1.0}\n"
+        "      teleop: {slow_limits: [0.4, 0.2, 0.5], fast_limits: [0.8, 0.5, 1.0]}\n"
+        "      smoothing: false\n"
+        "  writer: {type: text_to_motion, category: offline}\n"
+        "  lab: {type: lab_model, enabled_in: [sim]}\n";
+    const auto load = [&](const std::string &text) {
+        std::ofstream(path) << text;
+        return LoadConfig(path.string());
+    };
+    const auto rejected = [&](std::string text, const std::string &from, const std::string &to) {
+        const auto at = text.find(from);
+        assert(at != std::string::npos);
+        text.replace(at, from.size(), to);
+        try {
+            load(text);
+        } catch (const std::exception &) {
+            return true;
+        }
+        return false;
+    };
+    const auto near = [](double value, double expected) { return std::abs(value - expected) < 1e-6; };
+    assert(rejected(yaml, "[walker, writer, lab]", "[walker, ghost]"));   // Not registered.
+    assert(rejected(yaml, "[walker, writer, lab]", "[walker, walker]"));  // Listed twice.
+    assert(rejected(yaml, "[walker, writer, lab]", "walker"));            // Not a list.
+    assert(rejected(yaml, "category: offline", "category: sometimes"));
+    assert(rejected(yaml, "slow_limits: [0.4, 0.2, 0.5]", "slow_limits: [0.9, 0.2, 0.5]"));
+    assert(rejected(yaml, "min_vx: -0.3, max_vx: 0.8, max_vy: 0.5, max_wz: 1.0", "max_vx: 0.8"));
+    assert(rejected(yaml, "type: walker_model\n", ""));
+    auto config = load(yaml);
+    std::filesystem::remove_all(root);
+    assert(config.policies.size() == 2 && config.policies[1].planners.empty());
+    assert(config.policies[0].planners.size() == 3 && config.policies[0].auto_planner == "lab");
+    {
+        const auto &walker = config.policies[0].planners[0];
+        assert(walker.name == "walker" && walker.display_name == "行走规划");
+        assert(walker.category == "realtime" && walker.type == "walker_model" && !walker.client_smoothing);
+        assert(near(walker.minimum.vx, -0.3) && near(walker.maximum.vx, 0.8));
+        assert(near(walker.minimum.vy, -0.5) && near(walker.maximum.wz, 1.0));
+        assert(walker.slow_limits->vx == 0.4 && walker.fast_limits->wz == 1.0);
+        const auto &writer = config.policies[0].planners[1];
+        assert(writer.name == "writer" && writer.display_name == "writer" && writer.category == "offline");
+        assert(writer.client_smoothing && !writer.slow_limits && writer.maximum.vx == 0);
+    }
+    config.token = "planner-test";
+    config.status_timeout = 5;
+    config.lease_ms = 5000;
+    Service service(config);
+    const auto planners = [&] { return service.Catalog().at("policies")[0].at("planners"); };
+    const auto auto_planner = [&] {
+        return service.Catalog().at("policies")[0].at("auto_planner").get<std::string>();
+    };
+    // Until the driver reports its backend the simulation-only planner is hidden.
+    assert(planners().size() == 2 && auto_planner().empty());
+    assert(service.Catalog().at("policies")[1].at("planners").empty());
+    robot_base::ControlStatus status;
+    status.active_policy = "plain";
+    status.hmi_connected = true;
+    status.environment = Environment::SIMULATION;
+    const auto update = [&] { service.UpdateStatus(status, {}); };
+    update();
+    update();
+    assert(planners().size() == 3 && auto_planner() == "lab");
+    {
+        const auto decoded = DecodePolicy(service.Catalog().at("policies")[0]);
+        assert(decoded.planners.size() == 3 && decoded.auto_planner == "lab");
+        const auto &walker = decoded.planners[0];
+        assert(walker.name == "walker" && walker.display_name == "行走规划");
+        assert(walker.category == "realtime" && walker.type == "walker_model" && !walker.client_smoothing);
+        assert(near(walker.minimum.vx, -0.3) && near(walker.maximum.vx, 0.8) && walker.HasSpeedModes());
+        assert(walker.slow_limits->vx == 0.4 && walker.fast_limits->vx == 0.8);
+        assert(decoded.planners[1].category == "offline" && !decoded.planners[1].HasSpeedModes());
+        assert(decoded.planners[2].name == "lab");
+        // Catalogs of older services carry no planner fields.
+        auto legacy = service.Catalog().at("policies")[0];
+        legacy.erase("planners");
+        legacy.erase("auto_planner");
+        assert(DecodePolicy(legacy).planners.empty() && DecodePolicy(legacy).auto_planner.empty());
+        Json status_message = Encode(service.Snapshot());
+        status_message.erase("planner");
+        assert(DecodeStatus(status_message).planner.phase == "IDLE" && !DecodeStatus(status_message).planner.Engaged());
+    }
+    const auto session = service.Open();
+    uint64_t id = 0;
+    const auto call = [&](const std::string &op, const Json &args = Json::object()) {
+        return service.Handle(session, {{"v", 1}, {"id", ++id}, {"op", op}, {"args", args}});
+    };
+    const auto refused = [&](const std::string &code, const std::string &op, const Json &args = Json::object()) {
+        const auto reply = call(op, args);
+        return !reply.at("ok").get<bool>() && reply.at("code") == code;
+    };
+    const auto snapshot = [&] { return DecodeStatus(Encode(service.Snapshot(session))); };
+    const auto idle = [&] { return service.Command().planner.operation == Operation::NONE &&
+        service.Command().planner.planner.empty() && service.Command().planner.argument.empty(); };
+    assert(call("hello", {{"token", config.token}}).at("ok"));
+    assert(call("acquire").at("ok"));
+    // Planners run inside RL and belong to the active policy.
+    assert(refused("not_ready", "planner", {{"name", "walker"}}));
+    assert(refused("not_ready", "planner_stop"));
+    status.mode = robot_base::ControlMode::RL;
+    update();
+    assert(refused("bad_request", "planner", {{"name", "walker"}}));
+    status.active_policy = "track";
+    update();
+    assert(refused("bad_request", "planner"));
+    assert(refused("bad_request", "planner", {{"name", "ghost"}}));
+    assert(refused("bad_request", "planner",
+        {{"name", "writer"}, {"argument", std::string(robot_base::kPlannerArgumentMaxLength + 1, 'x')}}));
+    assert(refused("bad_request", "planner", {{"name", "writer"}, {"argument", "two\nlines"}}));
+    status.environment = Environment::REAL;
+    update();
+    assert(planners().size() == 2 && auto_planner().empty());
+    assert(refused("unavailable", "planner", {{"name", "lab"}}));
+    status.environment = Environment::SIMULATION;
+    status.interaction.phase = robot_base::InteractionStatus::Phase::PLAYING;
+    update();
+    assert(refused("not_ready", "planner", {{"name", "walker"}}));  // An action is playing.
+    status.interaction.phase = robot_base::InteractionStatus::Phase::IDLE;
+    update();
+    assert(idle() && service.Command().planner.sequence == 0);
+    // Stopping when nothing runs is answered without asking control.
+    auto reply = call("planner_stop");
+    assert(reply.at("ok") && reply.at("code") == "ok" && idle());
+
+    // Velocity follows the policy until the planner reports RUNNING.
+    const auto teleop = [&](double vx, double vy = 0, double wz = 0) {
+        return call("teleop", {{"vx", vx}, {"vy", vy}, {"wz", wz}}).at("data").at("target_velocity");
+    };
+    assert(near(teleop(1).at("vx"), 0.08));
+    reply = call("planner", {{"name", "walker"}});
+    assert(reply.at("ok") && reply.at("code") == "accepted");
+    assert(reply.at("data").at("request").at("operation") == "planner");
+    const auto start_sequence = service.Command().planner.sequence;
+    assert(start_sequence == 1 && service.Command().planner.operation == Operation::START);
+    assert(service.Command().planner.planner == "walker" && service.Command().planner.argument.empty());
+    assert(snapshot().request.phase == "accepted" && snapshot().request.operation == "planner");
+    assert(refused("busy", "planner_stop"));
+    status.planner.sequence = start_sequence;
+    status.planner.request_accepted = true;
+    status.planner.phase = Phase::LOADING;
+    status.planner.planner = "walker";
+    update();
+    assert(snapshot().request.phase == "completed" && idle());
+    assert(snapshot().planner.name == "walker" && snapshot().planner.phase == "LOADING");
+    assert(snapshot().planner.Engaged() && snapshot().planner.accepted &&
+        snapshot().planner.sequence == start_sequence);
+    assert(near(teleop(1).at("vx"), 0.08));
+    // The planner holds the reference: actions wait, another planner cannot start.
+    assert(refused("not_ready", "interaction", {{"action", "wave"}}));
+    assert(refused("not_ready", "cancel"));
+    assert(refused("not_ready", "planner", {{"name", "writer"}}));
+    assert(service.Command().interaction.operation == robot_base::InteractionRequest::Operation::NONE);
+    status.planner.phase = Phase::WARMING;
+    update();
+    assert(snapshot().planner.phase == "WARMING" && snapshot().planner.Engaged());
+    assert(call("preset", {{"name", "fast"}}).at("ok") && snapshot().teleop_preset == "fast");
+    const auto preset_sequence = snapshot().teleop_preset_sequence;
+
+    // RUNNING: velocity commands use the planner's range, presets and smoothing.
+    status.planner.phase = Phase::RUNNING;
+    status.planner.plan_count = 3;
+    status.planner.plan_rate_hz = 9.5F;
+    status.planner.last_plan_ms = 104.0F;
+    status.planner.reference_remaining_s = 1.25F;
+    update();
+    assert(service.Command().vx == 0);
+    assert(snapshot().teleop_preset == "slow" && snapshot().teleop_preset_sequence == preset_sequence + 1);
+    assert(snapshot().planner.phase == "RUNNING" && snapshot().planner.plan_count == 3);
+    assert(snapshot().planner.plan_rate_hz == 9.5 && snapshot().planner.last_plan_ms == 104.0);
+    assert(snapshot().planner.reference_remaining_s == 1.25);
+    auto target = teleop(1, -1);
+    assert(near(target.at("vx"), 0.4) && near(target.at("vy"), -0.2));
+    assert(near(service.Command().vx, 0.4) && near(service.Command().vy, -0.2));  // Not ramped.
+    assert(call("preset", {{"name", "fast"}}).at("ok"));
+    assert(near(teleop(1).at("vx"), 0.8) && near(teleop(-1).at("vx"), -0.3));
+    reply = call("velocity", {{"vx", 9}, {"vy", 0}, {"wz", -9}});
+    assert(near(reply.at("data").at("target_velocity").at("vx"), 0.8));
+    assert(near(reply.at("data").at("target_velocity").at("wz"), -1.0));
+    assert(refused("not_ready", "interaction", {{"action", "wave"}}));
+    // A realtime planner keeps running on a zero command when control is released.
+    assert(call("release").at("ok"));
+    assert(idle() && service.Command().vx == 0 && service.Command().wz == 0);
+    assert(service.Command().interaction.operation == robot_base::InteractionRequest::Operation::CANCEL);
+    update();
+    assert(call("acquire").at("ok"));
+
+    reply = call("planner_stop");
+    assert(reply.at("ok") && reply.at("code") == "accepted");
+    assert(service.Command().planner.operation == Operation::STOP &&
+        service.Command().planner.sequence == start_sequence + 1 && service.Command().planner.planner.empty());
+    status.planner.sequence = start_sequence + 1;
+    status.planner.phase = Phase::STOPPING;
+    update();
+    assert(snapshot().request.phase == "completed" && snapshot().request.operation == "planner_stop" && idle());
+    assert(snapshot().planner.Engaged() && refused("not_ready", "interaction", {{"action", "wave"}}));
+    assert(near(teleop(1).at("vx"), 0.08));  // The policy's range again.
+    status.planner.phase = Phase::READY;
+    status.planner.plan_count = 0;
+    update();
+    assert(!snapshot().planner.Engaged());
+    reply = call("planner_stop");
+    assert(reply.at("ok") && reply.at("code") == "ok" && idle());
+    // Actions are available again; a planner cannot start while one plays.
+    assert(call("interaction", {{"action", "wave"}}).at("ok"));
+    status.interaction.sequence = service.Command().interaction.sequence;
+    status.interaction.request_accepted = true;
+    status.interaction.phase = robot_base::InteractionStatus::Phase::PLAYING;
+    update();
+    assert(refused("not_ready", "planner", {{"name", "walker"}}));
+    status.interaction.phase = robot_base::InteractionStatus::Phase::FINISHED;
+    update();
+
+    // Control rejects a start: the request reports control's reason.
+    assert(call("planner", {{"name", "walker"}}).at("ok"));
+    status.planner.sequence = service.Command().planner.sequence;
+    status.planner.request_accepted = false;
+    status.planner.detail = "planner thread is busy";
+    update();
+    assert(snapshot().request.phase == "rejected" && snapshot().request.message == "planner thread is busy" && idle());
+    assert(!snapshot().planner.accepted && snapshot().planner.detail == "planner thread is busy");
+
+    // A failed planner is not engaged; a stop request clears the failure.
+    status.planner.phase = Phase::FAILED;
+    status.planner.detail = "model file not found";
+    update();
+    assert(snapshot().planner.phase == "FAILED" && !snapshot().planner.Engaged());
+    assert(snapshot().planner.detail == "model file not found");
+    reply = call("planner_stop");
+    assert(reply.at("code") == "accepted" && service.Command().planner.operation == Operation::STOP);
+    status.planner = {};
+    status.planner.sequence = service.Command().planner.sequence;
+    status.planner.request_accepted = true;
+    update();
+    assert(snapshot().request.phase == "completed" && snapshot().planner.phase == "IDLE" && idle());
+
+    // Offline planner: the argument travels with the request; the generated
+    // motion ends when the operator's control ends.
+    const std::string text(robot_base::kPlannerArgumentMaxLength, 'x');
+    assert(call("planner", {{"name", "writer"}, {"argument", text}}).at("ok"));
+    const auto generate_sequence = service.Command().planner.sequence;
+    assert(service.Command().planner.operation == Operation::START &&
+        service.Command().planner.planner == "writer" && service.Command().planner.argument == text);
+    status.planner.sequence = generate_sequence;
+    status.planner.phase = Phase::GENERATING;
+    status.planner.planner = "writer";
+    update();
+    assert(snapshot().request.phase == "completed" && snapshot().planner.phase == "GENERATING" && idle());
+    assert(refused("not_ready", "planner", {{"name", "writer"}, {"argument", "again"}}));
+    assert(call("release").at("ok"));
+    assert(service.Command().planner.operation == Operation::STOP &&
+        service.Command().planner.sequence == generate_sequence + 1);
+    // The pending stop is dropped once control leaves RL.
+    status.mode = robot_base::ControlMode::DAMP;
+    status.planner = {};
+    update();
+    service.Tick();
+    assert(idle() && snapshot().planner.phase == "IDLE");
+}
 } // namespace
 
 int main(int argc, char **argv) {
@@ -400,6 +752,8 @@ int main(int argc, char **argv) {
     TestTeleop();
     TestAdministrator();
     TestTrajectory();
+    TestEnvironment();
+    TestPlanner();
     using operator_service::Config;
     using operator_service::DecodeStatus;
     using operator_service::Encode;
@@ -604,5 +958,6 @@ int main(int argc, char **argv) {
         assert(operator_service::DecodePolicy(live.Catalog()["policies"][0]).switch_group == "compatible");
     }
     std::puts(
-        "operator service tests passed: auth, stale cache, lease, readiness, limits, disconnect, stop, replay, QR");
+        "operator service tests passed: auth, stale cache, lease, readiness, limits, disconnect, stop, replay, QR, "
+        "planners");
 }

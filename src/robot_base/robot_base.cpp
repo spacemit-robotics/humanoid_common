@@ -78,6 +78,18 @@ const char *FaultCodeName(FaultCode code) {
     return "unknown";
 }
 
+const char *RuntimeEnvironmentName(RuntimeEnvironment environment) {
+    switch (environment) {
+        case RuntimeEnvironment::UNKNOWN:
+            return "unknown";
+        case RuntimeEnvironment::SIMULATION:
+            return "sim";
+        case RuntimeEnvironment::REAL:
+            return "real";
+    }
+    return "unknown";
+}
+
 namespace {
 
 std::vector<std::string> SplitPath(const std::string &path) {
@@ -204,6 +216,31 @@ std::string YamlFile::ToAbsPath(const std::string &path) const {
 }
 
 // ==================== RobotData 工厂方法 ====================
+
+EnvironmentSet EnvironmentSet::FromYaml(const YamlFile &yaml_file, const std::string &path) {
+    const auto names = yaml_file.Read<std::vector<std::string>>(path);
+    if (!names) {
+        // A scalar or map here would otherwise silently enable every environment.
+        if (yaml_file.Read<std::string>(path)) {
+            throw std::runtime_error(path + " 必须是 sim / real 组成的列表");
+        }
+        return {};
+    }
+    EnvironmentSet result{false, false};
+    for (const auto &name : *names) {
+        if (name == RuntimeEnvironmentName(RuntimeEnvironment::SIMULATION)) {
+            result.simulation = true;
+        } else if (name == RuntimeEnvironmentName(RuntimeEnvironment::REAL)) {
+            result.real = true;
+        } else {
+            throw std::runtime_error(path + " 只支持 sim 和 real，当前值: " + name);
+        }
+    }
+    if (!result.simulation && !result.real) {
+        throw std::runtime_error(path + " 不能为空列表");
+    }
+    return result;
+}
 
 RobotData RobotData::FromYaml(const std::string &yaml_path) {
     robot_base::YamlFile yaml_file = robot_base::YamlFile::Load(yaml_path);

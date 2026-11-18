@@ -104,6 +104,7 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_interaction_status_);
             interaction_status_ = {};
+            planner_status_ = {};
         }
 
         running_.store(false, std::memory_order_release);
@@ -141,6 +142,7 @@ public:
         policy_apply_trace_header_.clear();
         entry_interaction_sequence_ = command_
             ? command_->interaction.sequence : 0;
+        entry_planner_sequence_ = command_ ? command_->planner.sequence : 0;
         if (config_.rl_freq_hz) {
             config_.rl_freq_hz->store(0.0, std::memory_order_relaxed);
         }
@@ -163,6 +165,11 @@ public:
             infer_executor_action_.reserve(policy_.ActionDim());
             cached_action_.reserve(policy_.ActionDim());
             sample_interaction_request_.action.reserve(128);
+            // Planner requests cross both threads by value; sized once.
+            for (auto *request : {&sample_planner_request_, &infer_planner_request_}) {
+                request->planner.reserve(128);
+                request->argument.reserve(robot_base::kPlannerArgumentMaxLength);
+            }
             ConfigurePolicyTrace();
             runtime_logging::RecordArtifact(
                 "policy_model", config_.policy_name, config_.policy.model_path);
@@ -280,6 +287,12 @@ public:
                         sample_interaction_request_.operation =
                             robot_base::InteractionRequest::Operation::NONE;
                     }
+                    sample_planner_request_ = command_->planner;
+                    if (sample_planner_request_.sequence == entry_planner_sequence_) {
+                        sample_planner_request_.operation =
+                            robot_base::PlannerRequest::Operation::NONE;
+                    }
+                    sample_environment_ = sensor_->environment;
                     sample_rl_dt_ = rl_dt;
                     new_data_ready_ = true;
                 }
@@ -436,6 +449,11 @@ public:
         return interaction_status_;
     }
 
+    robot_base::PlannerStatus CurrentPlannerStatus() const override {
+        std::lock_guard<std::mutex> lock(mutex_interaction_status_);
+        return planner_status_;
+    }
+
 private:
     bool runtime_prepared_ = false;
     std::atomic<bool> switch_ready_{false};
@@ -466,6 +484,12 @@ private:
             }
         }
         infer_loop_.Stop();
+        try {
+            if (policy_adapter_) policy_adapter_->OnInferenceStopped();
+        } catch (const std::exception &error) {
+            std::cerr << "[StateRL] 策略适配器停止后处理失败: "
+                << error.what() << std::endl;
+        }
     }
 
     void ApplyEntryTargetTransition(std::vector<double> &target,
@@ -556,6 +580,7 @@ private:
         InferenceDiagnostics diagnostics;
         double device_time;
         float rl_dt;
+        robot_base::RuntimeEnvironment environment = robot_base::RuntimeEnvironment::UNKNOWN;
         std::uint64_t release_sequence = 0;
         RLRuntimeClock::time_point release_time;
         RLRuntimeClock::time_point inference_start;
@@ -590,6 +615,8 @@ private:
             cmd_vy = sample_cmd_vy_;
             cmd_wz = sample_cmd_wz_;
             diagnostics.request = sample_interaction_request_;
+            infer_planner_request_ = sample_planner_request_;
+            environment = sample_environment_;
             rl_dt = sample_rl_dt_;
         }
         auto stage_start = RLRuntimeClock::now();
@@ -623,8 +650,10 @@ private:
                         "manual reference playback started", false);
                 }
                 if (!switching) policy_adapter_->HandleInteractionRequest(diagnostics.request, elapsed);
+                policy_adapter_->HandlePlannerRequest(infer_planner_request_);
                 policy_adapter_->PreparePolicySwitch(switching, elapsed);
                 auto &snapshot = infer_snapshot_;
+                snapshot.environment = environment;
                 snapshot.time = device_time;
                 snapshot.num_dof = static_cast<int>(joint_pos.size());
                 snapshot.base_pos = base_pos;
@@ -682,8 +711,10 @@ private:
                 policy_adapter_->ApplyJointGains(joint_kp, joint_kd);
                 diagnostics.model_variant = policy_adapter_->ActiveModelName();
                 diagnostics.interaction = policy_adapter_->GetInteractionStatus();
+                const robot_base::PlannerStatus *planner = policy_adapter_->PlannerStatus();
                 std::lock_guard<std::mutex> lock(mutex_interaction_status_);
                 interaction_status_ = diagnostics.interaction;
+                if (planner) planner_status_ = *planner;
             }
         } catch (const std::exception &error) {
             RecordProgress(ProgressStage::ABORTED, release_sequence, RLRuntimeClock::now());
@@ -777,8 +808,9 @@ private:
     std::atomic<bool> safety_triggered_{false};
     mutable std::mutex mutex_fault_;
     robot_base::FaultStatus fault_;
-    mutable std::mutex mutex_interaction_status_;
+    mutable std::mutex mutex_interaction_status_;  // Guards both status snapshots below.
     robot_base::InteractionStatus interaction_status_;
+    robot_base::PlannerStatus planner_status_;
 
     // 策略输入协议适配器（policy_adapter.type 为空则不启用）
     std::unique_ptr<policy_adapter::PolicyAdapter> policy_adapter_;
@@ -811,6 +843,10 @@ private:
     double sample_cmd_wz_ = 0;
     robot_base::InteractionRequest sample_interaction_request_;
     uint64_t entry_interaction_sequence_ = 0;
+    robot_base::PlannerRequest sample_planner_request_;
+    robot_base::PlannerRequest infer_planner_request_;  // 推理线程私有副本
+    uint64_t entry_planner_sequence_ = 0;
+    robot_base::RuntimeEnvironment sample_environment_ = robot_base::RuntimeEnvironment::UNKNOWN;
     float sample_rl_dt_ = 0.02f;
 
     // 动作缓存（推理线程写，主线程读）

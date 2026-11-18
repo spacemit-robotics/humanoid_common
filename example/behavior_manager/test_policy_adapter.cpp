@@ -6,6 +6,8 @@
  * @brief 验证通用 motion tracker 从上层策略配置获取动态维度
  */
 
+#include "behavior_manager.h"
+#include "fake_planners.h"
 #include "policy_adapter/policy_adapter.h"
 #include "policy_adapter/sonic_planner.h"
 #include "rl_test_model.h"
@@ -22,8 +24,10 @@
 #include <cstring>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iostream>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -884,111 +888,215 @@ void TestSonicReferenceAndConfig() {
         "未正确加载 SONIC 多动作目录");
 }
 
+// YAML for a SONIC tracker with a standby catalog; `planners` is appended to motion_planners
+// and `adapter` to the tracker's policy_adapter node.
+std::string SonicPlannerYaml(const fs::path &reference,
+    const std::string &planners, const std::string &adapter, const std::string &threads = "") {
+    return "robot_base:\n"
+        "  num_dof: 29\n" + threads +
+        "motion_planners:\n" + planners +
+        "sonic_actions:\n"
+        "  action_names: [idle]\n"
+        "  default_action: idle\n"
+        "  actions:\n"
+        "    idle: {file: " + reference.string() + "}\n"
+        "rl_policy:\n"
+        "  onnx_infer:\n"
+        "    policies:\n"
+        "      tracker:\n"
+        "        policy_adapter:\n"
+        "          type: sonic\n"
+        "          catalog: sonic_actions\n"
+        "          future_frames: 10\n"
+        "          future_step: 5\n" + adapter;
+}
+
+bool LoadConfigRejected(const std::string &name, const std::string &yaml, const std::string &policy = "tracker") {
+    const TempReference file(name, yaml);
+    try {
+        static_cast<void>(LoadConfig(file.Path().string(), policy, fs::temp_directory_path().string()));
+    } catch (const std::runtime_error &) {
+        return true;
+    }
+    return false;
+}
+
 void TestSonicPlannerConfig() {
-    const TempReference yaml("sonic_planner_yaml",
-        "robot_base:\n"
+    using behavior_manager::motion_planner::Category;
+    using behavior_manager::policy_adapter::LoadSonicPlannerConfig;
+    const TempSonicReference reference(29);
+    const std::string robot_dir = fs::temp_directory_path().string();
+    const std::string walker =
+        "  walker:\n"
+        "    display_name: Walker\n"
+        "    type: sonic_planner\n"
+        "    command: {limits: {min_vx: -0.3, max_vx: 0.8, max_vy: 0.5, max_wz: 0.8}}\n"
+        "    model_path: planner.onnx\n"
+        "    check_interval: 0.2\n"
+        "    lookahead: 0.8\n"
+        "    replan_interval: 0.5\n"
+        "    runtime: {provider: cpu, threads: 4, ort_spinning: false, "
+        "worker_sched: other, worker_priority: 0, ep_options: {SPACEMIT_EP_DISABLE_OP_TYPE_FILTER: Softmax}}\n";
+    const std::string encoder =
+        "          encoder:\n"
+        "            model_path: encoder.onnx\n"
+        "            runtime: {provider: cpu, threads: 2, ort_spinning: false, "
+        "worker_sched: fifo, worker_priority: 55, ep_options: {SPACEMIT_EP_DENSE_ACCURACY_LEVEL: '2'}}\n";
+    const std::string threads =
         "  threads:\n"
         "    motion_planner:\n"
         "      cpu_affinity: [0, 3]\n"
         "      sched: fifo\n"
         "      priority: 40\n"
-        "      lock_memory: true\n"
-        "rl_policy:\n"
-        "  onnx_infer:\n"
-        "    policies:\n"
-        "      planner:\n"
-        "        policy_adapter:\n"
-        "          type: sonic\n"
-        "          future_frames: 10\n"
-        "          future_step: 5\n"
-        "          encoder:\n"
-        "            model_path: encoder.onnx\n"
-        "            runtime: {provider: cpu, threads: 2, ort_spinning: false, "
-        "worker_sched: fifo, worker_priority: 55, ep_options: {SPACEMIT_EP_DENSE_ACCURACY_LEVEL: '2'}}\n"
-        "          planner:\n"
-        "            enabled: true\n"
-        "            model_path: planner.onnx\n"
-        "            check_interval: 0.2\n"
-        "            lookahead: 0.8\n"
-        "            replan_interval: 0.5\n"
-        "            runtime: {provider: cpu, threads: 4, ort_spinning: false, "
-        "worker_sched: other, worker_priority: 0, ep_options: {SPACEMIT_EP_DISABLE_OP_TYPE_FILTER: Softmax}}\n");
-    auto config = LoadConfig(yaml.Path().string(), "planner",
-        fs::temp_directory_path().string());
-    Require(config.reference_file.empty() && config.sonic_planner.Enabled(),
-        "planner should not require a recorded reference");
-    Require(config.sonic_planner.runtime.threads == 4 &&
-        !config.sonic_planner.runtime.ort_spinning &&
-        config.sonic_planner.runtime.worker_sched == "other" &&
-        config.sonic_planner.runtime.worker_priority == 0 &&
-        config.sonic_planner.lookahead == 0.8 && config.sonic_planner.check_interval == 0.2 &&
-        config.sonic_planner.replan_interval == 0.5,
-        "planner runtime and timing must come from YAML");
-    Require(config.sonic_encoder.Enabled() && config.sonic_encoder.latent_dim == 64 &&
-        config.sonic_encoder.runtime.provider == "cpu" && config.sonic_encoder.runtime.threads == 2 &&
-        config.sonic_encoder.runtime.worker_sched == "fifo" &&
-        config.sonic_encoder.runtime.worker_priority == 55 &&
-        !config.sonic_encoder.runtime.ort_spinning,
-        "encoder runtime must come from YAML");
-    Require(config.sonic_planner.runtime.ep_options.at("SPACEMIT_EP_DISABLE_OP_TYPE_FILTER") == "Softmax" &&
-        config.sonic_encoder.runtime.ep_options.at("SPACEMIT_EP_DENSE_ACCURACY_LEVEL") == "2",
-        "nested model EP options must come from YAML");
-    const auto &thread = config.sonic_planner.thread;
+        "      lock_memory: true\n";
+    const TempReference yaml("sonic_planner_yaml", SonicPlannerYaml(reference.Path(), walker,
+        "          planners: [walker]\n" + encoder, threads));
+    const auto config = LoadConfig(yaml.Path().string(), "tracker", robot_dir);
+    Require(config.planners.Enabled() && config.planners.planners.size() == 1 &&
+        config.planners.auto_start.empty(), "tracker must list its registered planner");
+    const auto &planner = config.planners.planners.front();
+    Require(planner.name == "walker" && planner.type == "sonic_planner" &&
+        planner.category == Category::REALTIME && !planner.preload && planner.keep_loaded &&
+        planner.stop_timeout_s == 10.0 && planner.environments.simulation && planner.environments.real,
+        "planner entry defaults: on-demand load, kept after stop, every environment");
+    Require(planner.context.name == "walker" && planner.context.config_base == "motion_planners.walker" &&
+        planner.context.num_dof == 29 && planner.context.reference_fps == config.motion_fps &&
+        planner.context.robot_dir == robot_dir && planner.context.yaml_path == yaml.Path().string(),
+        "planner context must locate its own YAML node and the robot");
+    const auto &thread = planner.context.thread;
     Require(thread.name == "motion_planner" && thread.cpu_id == -1 &&
         thread.cpu_affinity == std::vector<int>({0, 3}) && thread.sched == "fifo" &&
         thread.priority == 40 && thread.lock_memory,
         "planner must use the shared YAML thread configuration");
+    Require(config.sonic_encoder.Enabled() && config.sonic_encoder.latent_dim == 64 &&
+        config.sonic_encoder.runtime.provider == "cpu" && config.sonic_encoder.runtime.threads == 2 &&
+        config.sonic_encoder.runtime.worker_sched == "fifo" &&
+        config.sonic_encoder.runtime.worker_priority == 55 &&
+        !config.sonic_encoder.runtime.ort_spinning &&
+        config.sonic_encoder.runtime.ep_options.at("SPACEMIT_EP_DENSE_ACCURACY_LEVEL") == "2",
+        "encoder runtime must come from YAML");
 
-    const auto bare_yaml = std::string(
-        "rl_policy:\n  onnx_infer:\n    policies:\n      planner:\n"
-        "        policy_adapter:\n          type: sonic\n"
-        "          planner: {model_path: planner.onnx}\n");
-    const TempReference default_yaml("planner_default_thread", bare_yaml);
-    const auto defaults = LoadConfig(default_yaml.Path().string(), "planner",
-        fs::temp_directory_path().string());
-    Require(!defaults.sonic_encoder.Enabled() && defaults.sonic_planner.lookahead == 0.04 &&
-        defaults.sonic_planner.check_interval == 0.1 &&
-        defaults.sonic_planner.replan_interval == 1.0 &&
-        defaults.sonic_planner.running_replan_interval == 0.1 &&
-        defaults.sonic_planner.crawling_replan_interval == 0.2 &&
-        defaults.sonic_planner.allowed_pred_num_tokens == std::vector<int>({0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0}),
+    // Type-specific parameters are read by the planner type from its own node.
+    const auto file = robot_base::YamlFile::Load(yaml.Path().string());
+    const auto sonic = LoadSonicPlannerConfig(file, planner.context.config_base, robot_dir, 50.0);
+    Require(sonic.runtime.threads == 4 && !sonic.runtime.ort_spinning &&
+        sonic.runtime.worker_sched == "other" && sonic.runtime.worker_priority == 0 &&
+        sonic.lookahead == 0.8 && sonic.check_interval == 0.2 && sonic.replan_interval == 0.5 &&
+        sonic.runtime.ep_options.at("SPACEMIT_EP_DISABLE_OP_TYPE_FILTER") == "Softmax",
+        "planner runtime and timing must come from YAML");
+
+    const std::string bare = "  walker: {type: sonic_planner, model_path: planner.onnx}\n";
+    const TempReference default_yaml("planner_default_thread",
+        SonicPlannerYaml(reference.Path(), bare, "          planners: [walker]\n"));
+    const auto defaults = LoadConfig(default_yaml.Path().string(), "tracker", robot_dir);
+    const auto default_sonic = LoadSonicPlannerConfig(robot_base::YamlFile::Load(default_yaml.Path().string()),
+        "motion_planners.walker", robot_dir, 50.0);
+    Require(!defaults.sonic_encoder.Enabled() && default_sonic.lookahead == 0.04 &&
+        default_sonic.check_interval == 0.1 && default_sonic.replan_interval == 1.0 &&
+        default_sonic.running_replan_interval == 0.1 && default_sonic.crawling_replan_interval == 0.2 &&
+        default_sonic.allowed_pred_num_tokens == std::vector<int>({0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0}),
         "planner defaults must preserve the deployment timing and 9-11 token range");
-    Require(defaults.sonic_planner.thread.sched == "other" &&
-        defaults.sonic_planner.thread.priority == 0 &&
-        defaults.sonic_planner.thread.cpu_affinity ==
-            robot_base::ThreadLoop::Background("probe").cpu_affinity,
+    const auto &default_thread = defaults.planners.planners.front().context.thread;
+    Require(default_thread.sched == "other" && default_thread.priority == 0 &&
+        default_thread.cpu_affinity == robot_base::ThreadLoop::Background("probe").cpu_affinity,
         "planner defaults must restore background scheduling and launch affinity");
-    const TempReference single_yaml("planner_single_cpu",
-        "robot_base:\n  threads:\n    motion_planner: {cpu_id: 1}\n" + bare_yaml);
-    const auto single = LoadConfig(single_yaml.Path().string(), "planner",
-        fs::temp_directory_path().string());
-    Require(single.sonic_planner.thread.cpu_id == 1 &&
-        single.sonic_planner.thread.cpu_affinity.empty(),
+    const TempReference single_yaml("planner_single_cpu", SonicPlannerYaml(reference.Path(), bare,
+        "          planners: [walker]\n", "  threads:\n    motion_planner: {cpu_id: 1}\n"));
+    const auto single = LoadConfig(single_yaml.Path().string(), "tracker", robot_dir);
+    Require(single.planners.planners.front().context.thread.cpu_id == 1 &&
+        single.planners.planners.front().context.thread.cpu_affinity.empty(),
         "planner single-CPU configuration must not be overridden by defaults");
-    // Construction loads the planner, so a missing model fails during preparation.
+
+    const TempReference options_yaml("planner_options", SonicPlannerYaml(reference.Path(),
+        "  walker: {type: sonic_planner, model_path: planner.onnx, preload: true, keep_loaded: false, "
+        "stop_timeout: 0, prepare_time: 20.5, enabled_in: [sim], thread: rl_infer}\n"
+        "  spare: {type: sonic_planner, model_path: planner.onnx}\n",
+        "          planners: [walker, spare]\n          auto_planner: spare\n",
+        "  threads:\n    rl_infer: {cpu_id: 2}\n"));
+    const auto options = LoadConfig(options_yaml.Path().string(), "tracker", robot_dir);
+    Require(options.planners.planners.size() == 2 && options.planners.auto_start == "spare" &&
+        options.planners.planners[0].preload && !options.planners.planners[0].keep_loaded &&
+        options.planners.planners[0].stop_timeout_s == 0.0 &&
+        options.planners.planners[0].prepare_time_s == 20.5 &&
+        options.planners.planners[1].prepare_time_s == 0.0 &&
+        options.planners.planners[0].environments.simulation && !options.planners.planners[0].environments.real &&
+        options.planners.planners[0].context.thread.cpu_id == 2 &&
+        options.planners.planners[1].name == "spare",
+        "planner options and the policy's auto_planner must come from YAML");
+
+    const auto rejected = [&](const std::string &name, const std::string &planners,
+            const std::string &adapter) {
+        return LoadConfigRejected(name, SonicPlannerYaml(reference.Path(), planners, adapter));
+    };
+    Require(rejected("planner_unregistered", bare, "          planners: [absent]\n"),
+        "a planner missing from motion_planners must be rejected");
+    Require(rejected("planner_unknown_type", "  walker: {type: unknown_type}\n",
+        "          planners: [walker]\n"), "an unregistered planner type must be rejected");
+    Require(rejected("planner_category", "  walker: {type: sonic_planner, category: offline, "
+        "model_path: planner.onnx}\n", "          planners: [walker]\n"),
+        "a category that differs from the registered type must be rejected");
+    Require(rejected("planner_duplicate", bare, "          planners: [walker, walker]\n"),
+        "a planner listed twice must be rejected");
+    Require(rejected("planner_two_preloads",
+        "  walker: {type: sonic_planner, model_path: planner.onnx, preload: true}\n"
+        "  spare: {type: sonic_planner, model_path: planner.onnx, preload: true}\n",
+        "          planners: [walker, spare]\n"), "only one planner may preload");
+    Require(rejected("planner_auto_unlisted", bare,
+        "          planners: [walker]\n          auto_planner: spare\n"),
+        "auto_planner must be one of the listed planners");
+    Require(rejected("planner_auto_alone", bare, "          auto_planner: walker\n"),
+        "auto_planner requires the planners list");
+    Require(rejected("planner_stop_timeout", "  walker: {type: sonic_planner, model_path: planner.onnx, "
+        "stop_timeout: -1}\n", "          planners: [walker]\n"), "a negative stop_timeout must be rejected");
+    Require(rejected("planner_prepare_time", "  walker: {type: sonic_planner, model_path: planner.onnx, "
+        "prepare_time: -1}\n", "          planners: [walker]\n"), "a negative prepare_time must be rejected");
+    Require(rejected("planner_legacy", bare,
+        "          planners: [walker]\n          planner: {model_path: planner.onnx}\n"),
+        "the removed policy_adapter.planner node must be rejected with a migration hint");
+    Require(LoadConfigRejected("planner_without_catalog",
+        "robot_base: {num_dof: 29}\n"
+        "motion_planners:\n" + bare +
+        "rl_policy:\n  onnx_infer:\n    policies:\n      tracker:\n        policy_adapter:\n"
+        "          type: sonic\n          reference_file: " + reference.Path().string() + "\n"
+        "          planners: [walker]\n"), "planners need a catalog that provides the standby reference");
+    Require(LoadConfigRejected("planner_other_adapter",
+        "robot_base: {num_dof: 29}\n"
+        "motion_planners:\n" + bare +
+        "rl_policy:\n  onnx_infer:\n    policies:\n      tracker:\n        policy_adapter:\n"
+        "          type: mjlab\n          planners: [walker]\n"),
+        "planners on an adapter that does not embed the host must be rejected");
+    Require(LoadConfigRejected("planner_without_dof",
+        "motion_planners:\n" + bare +
+        "sonic_actions:\n  action_names: [idle]\n  default_action: idle\n"
+        "  actions:\n    idle: {file: " + reference.Path().string() + "}\n"
+        "rl_policy:\n  onnx_infer:\n    policies:\n      tracker:\n        policy_adapter:\n"
+        "          type: sonic\n          catalog: sonic_actions\n          planners: [walker]\n"),
+        "planners need robot_base.num_dof");
+
+    // preload loads during policy preparation, so a missing model fails there.
+    auto preloaded = defaults;
+    preloaded.planners.planners.front().preload = true;
     auto policy = MakeSonicPolicyConfig(29);
     bool missing_rejected = false;
     try {
-        static_cast<void>(Create(config, policy));
+        static_cast<void>(Create(preloaded, policy));
     } catch (const std::runtime_error &) {
         missing_rejected = true;
     }
-    Require(missing_rejected, "a missing planner model must fail policy preparation");
-    config.sonic_encoder.model_path.clear();
-    const TempSonicOnnx model(kPlannerContextRepeatOnnx);
-    config.sonic_planner.model_path = model.Path().string();
-    config.sonic_planner.thread = robot_base::ThreadLoop::Background("motion_planner");
-    auto adapter = Create(config, policy);
-    Require(adapter && !adapter->ReadyForPolicySwitch(),
-        "planner handoff must wait for a published idle trajectory");
-    policy.action_joint_index[1] = policy.action_joint_index[0];
-    bool rejected = false;
+    Require(missing_rejected, "a missing preloaded planner model must fail policy preparation");
+    // Loaded on demand, the same planner leaves policy preparation unaffected.
+    auto adapter = Create(defaults, policy);
+    Require(adapter && adapter->PlannerStatus() &&
+        adapter->PlannerStatus()->phase == robot_base::PlannerStatus::Phase::IDLE,
+        "an on-demand planner must not load during policy preparation");
+    policy.action_joint_index[1] = 29;
+    bool rejected_mapping = false;
     try {
-        static_cast<void>(Create(config, policy));
+        static_cast<void>(Create(defaults, policy));
     } catch (const std::runtime_error &) {
-        rejected = true;
+        rejected_mapping = true;
     }
-    Require(rejected, "planner must reject a non-permutation joint mapping");
+    Require(rejected_mapping, "planners must reject a model joint outside the robot");
 }
 
 // Threads of this process, excluding background log formatters.
@@ -1492,6 +1600,556 @@ void TestSonicMotionCatalogPlayback() {
     Require(adapter->ReadyForPolicySwitch(), "SONIC handoff did not return to its idle reference");
 }
 
+// A SONIC tracker with a standby and a gesture action, stepped like the inference thread.
+// The probe model returns joint 0 of the second future frame as action[1]: 0 while the
+// standby holds its first frame and 0.1 while the gesture plays.
+class SonicPlannerTracker {
+public:
+    static constexpr int kJointCount = 29;
+    static constexpr double kStandby = 0.0;
+    static constexpr double kGesture = 0.1;
+
+    explicit SonicPlannerTracker(behavior_manager::motion_planner::HostConfig planners,
+        std::vector<int> joint_index = {})
+        : gesture_reference_(kJointCount, 0.1, 0.2) {
+        Config config;
+        config.type = "sonic";
+        config.reference_file = idle_reference_.Path().string();
+        config.future_frames = 10;
+        config.future_step = 5;
+        config.reference_motion_catalog.default_action = "idle";
+        config.reference_motion_catalog.transition_duration = 0.2;
+        behavior_manager::policy_adapter::ReferenceMotionConfig idle;
+        idle.name = "idle";
+        idle.file = idle_reference_.Path().string();
+        config.reference_motion_catalog.actions.push_back(idle);
+        behavior_manager::policy_adapter::ReferenceMotionConfig gesture;
+        gesture.name = "gesture";
+        gesture.file = gesture_reference_.Path().string();
+        config.reference_motion_catalog.actions.push_back(gesture);
+        for (auto &planner : planners.planners) planner.context.num_dof = kJointCount;
+        config.planners = std::move(planners);
+
+        auto policy_config = MakeSonicProbePolicyConfig(kJointCount, model_.Path());
+        if (!joint_index.empty()) policy_config.action_joint_index = std::move(joint_index);
+        adapter = Create(config, policy_config);
+        robot = robot_base::RobotData::Create(kJointCount);
+        robot.environment = robot_base::RuntimeEnvironment::SIMULATION;
+        adapter->Reset(robot);
+        policy_.Init(policy_config);
+    }
+
+    // One inference step at 50 Hz; returns the reference position the model receives for joint 0.
+    double Step() {
+        static_cast<void>(adapter->SelectExecutor(command, policy_));
+        if (!switching) adapter->HandleInteractionRequest(interaction, time_s);
+        adapter->HandlePlannerRequest(request);
+        adapter->PreparePolicySwitch(switching, time_s);
+        adapter->PrepareInputs(robot, time_s, policy_);
+        Eigen::VectorXf observation = Eigen::VectorXf::Zero(policy_.ObsDim());
+        std::vector<double> action;
+        policy_.Infer(observation, action);
+        for (const double value : action) Require(std::isfinite(value), "the reference is not finite");
+        time_s += 0.02;
+        reference = action[1];
+        return reference;
+    }
+
+    bool Until(const std::function<bool()> &done, int timeout_ms = 5000) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (true) {
+            Step();
+            if (done()) return true;
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    bool UntilPhase(robot_base::PlannerStatus::Phase phase, int timeout_ms = 5000) {
+        return Until([&] { return planner().phase == phase; }, timeout_ms);
+    }
+
+    // Steps through a reference change and checks that it is a crossfade, not a jump.
+    bool Settles(double target, double max_step = 0.12, int steps = 40) {
+        double previous = reference;
+        for (int index = 0; index < steps; ++index) {
+            const double value = Step();
+            if (std::abs(value - previous) > max_step) return false;
+            previous = value;
+        }
+        return std::abs(reference - target) < 1.0e-5;
+    }
+
+    void StartPlanner(const std::string &name, const std::string &argument = "") {
+        ++request.sequence;
+        request.operation = robot_base::PlannerRequest::Operation::START;
+        request.planner = name;
+        request.argument = argument;
+    }
+
+    void StopPlanner() {
+        ++request.sequence;
+        request.operation = robot_base::PlannerRequest::Operation::STOP;
+        request.planner.clear();
+        request.argument.clear();
+    }
+
+    void StartAction(const std::string &name) {
+        ++interaction.sequence;
+        interaction.operation = robot_base::InteractionRequest::Operation::START;
+        interaction.action = name;
+    }
+
+    const robot_base::PlannerStatus &planner() const { return *adapter->PlannerStatus(); }
+    robot_base::InteractionStatus action() const { return adapter->GetInteractionStatus(); }
+
+    std::unique_ptr<behavior_manager::policy_adapter::PolicyAdapter> adapter;
+    robot_base::RobotData robot;
+    std::array<double, 3> command{};
+    robot_base::PlannerRequest request;
+    robot_base::InteractionRequest interaction;
+    bool switching = false;
+    double time_s = 0.0;
+    double reference = 0.0;
+
+private:
+    TempSonicReference idle_reference_{kJointCount};
+    TempSonicReference gesture_reference_;
+    TempSonicOnnx model_;
+    rl_policy::PolicyExecutor policy_;
+};
+
+behavior_manager::motion_planner::HostConfig FakePlannerHost(const std::string &auto_start = "") {
+    using behavior_manager::motion_planner::Category;
+    behavior_manager::motion_planner::HostConfig host;
+    const auto add = [&](const std::string &name, const std::string &type, Category category) {
+        behavior_manager::motion_planner::PlannerConfig planner;
+        planner.name = name;
+        planner.type = type;
+        planner.category = category;
+        planner.context.name = name;
+        host.planners.push_back(std::move(planner));
+    };
+    add("walker", "fake_trajectory", Category::REALTIME);
+    add("chooser", "fake_choice", Category::REALTIME);
+    add("generator", "fake_generator", Category::OFFLINE);
+    host.auto_start = auto_start;
+    return host;
+}
+
+void TestSonicPlannerTrajectory() {
+    using Phase = robot_base::PlannerStatus::Phase;
+    using ActionPhase = robot_base::InteractionStatus::Phase;
+    fake_planners::GetScript().Reset();
+    SonicPlannerTracker tracker(FakePlannerHost());
+    Require(tracker.adapter->PlannerStatus() && tracker.planner().phase == Phase::IDLE,
+        "a tracker with planners must report their status");
+    Require(std::abs(tracker.Step() - SonicPlannerTracker::kStandby) < 1.0e-6,
+        "the tracker must hold its standby before a planner starts");
+
+    tracker.StartPlanner("walker");
+    Require(tracker.Until([&] {
+        Require(tracker.planner().phase == Phase::RUNNING ||
+            std::abs(tracker.reference - SonicPlannerTracker::kStandby) < 1.0e-6,
+            "the standby reference must be held while the planner loads");
+        return tracker.planner().phase == Phase::RUNNING;
+    }), "the planner did not start");
+    // Joint 0 of the planner trajectory holds 0.5; the tracker crossfades to it.
+    Require(tracker.Settles(0.5), "the tracker did not crossfade to the planner trajectory: " +
+        std::to_string(tracker.reference));
+    Require(!tracker.adapter->ReadyForPolicySwitch(), "a planner reference must block a policy switch");
+    Require(tracker.action().phase == ActionPhase::IDLE && tracker.action().action.empty(),
+        "a planner reference is not a catalog action");
+
+    // New plans replace the followed trajectory in place.
+    tracker.command = {0.2, 0.0, 0.0};
+    tracker.Step();
+    tracker.Step();
+    Require(std::abs(tracker.reference - 0.7) < 1.0e-5 && fake_planners::GetScript().last_vx == 0.2F,
+        "the velocity command must reach the planner and its plan the tracker: " +
+        std::to_string(tracker.reference));
+
+    // Actions wait until the planner has returned the reference.
+    tracker.StartAction("gesture");
+    tracker.Step();
+    Require(!tracker.action().request_accepted && tracker.action().phase == ActionPhase::REJECTED &&
+        tracker.action().action == "gesture" && std::abs(tracker.reference - 0.7) < 1.0e-5,
+        "an action must be refused while a planner holds the reference");
+
+    tracker.StopPlanner();
+    Require(tracker.UntilPhase(Phase::READY), "the planner did not stop");
+    Require(tracker.Settles(SonicPlannerTracker::kStandby),
+        "the tracker did not crossfade back to its standby: " + std::to_string(tracker.reference));
+    Require(tracker.adapter->ReadyForPolicySwitch(), "the standby reference must allow a policy switch");
+    tracker.command = {0.0, 0.0, 0.0};
+    tracker.StartAction("gesture");
+    tracker.Step();
+    Require(tracker.action().request_accepted && tracker.action().phase == ActionPhase::BLEND_IN,
+        "actions must work again once the planner has stopped");
+
+    // A planner cannot take the reference from a running action.
+    tracker.StartPlanner("walker");
+    tracker.Step();
+    Require(!tracker.planner().request_accepted && tracker.planner().phase == Phase::READY &&
+        tracker.planner().detail.find("tracker") != std::string::npos,
+        "a planner start must be refused while an action plays");
+
+    // The model joint order is mapped from the robot joint order of the trajectory.
+    fake_planners::GetScript().Reset();
+    std::vector<int> swapped(SonicPlannerTracker::kJointCount);
+    for (int joint = 0; joint < SonicPlannerTracker::kJointCount; ++joint) swapped[joint] = joint;
+    std::swap(swapped[0], swapped[5]);
+    SonicPlannerTracker mapped(FakePlannerHost(), swapped);
+    mapped.StartPlanner("walker");
+    Require(mapped.UntilPhase(Phase::RUNNING) && mapped.Settles(0.505),
+        "model joint 0 must read robot joint 5 of the planner trajectory: " +
+        std::to_string(mapped.reference));
+    std::cout << "SONIC planner trajectory: PASS" << std::endl;
+}
+
+void TestSonicPlannerActions() {
+    using Phase = robot_base::PlannerStatus::Phase;
+    using ActionPhase = robot_base::InteractionStatus::Phase;
+    fake_planners::GetScript().Reset();
+    SonicPlannerTracker tracker(FakePlannerHost());
+    tracker.StartPlanner("chooser");
+    Require(tracker.UntilPhase(Phase::RUNNING), "the decision planner did not start");
+    // The planner first selects "idle": played as an action, it ends on its last frame (0.01).
+    Require(tracker.Settles(0.01), "the tracker did not play the action the planner selected first: " +
+        std::to_string(tracker.reference));
+
+    // A velocity command makes the planner select the gesture from the tracker's catalog.
+    tracker.command = {0.3, 0.0, 0.0};
+    double peak = 0.0;
+    for (int step = 0; step < 30; ++step) peak = std::max(peak, tracker.Step());
+    Require(peak >= SonicPlannerTracker::kGesture - 1.0e-6,
+        "the tracker did not play the selected catalog action: " + std::to_string(peak));
+    Require(tracker.planner().phase == Phase::RUNNING && tracker.action().phase == ActionPhase::IDLE,
+        "an action selected by the planner is reported by the planner status only");
+    tracker.StartAction("gesture");
+    tracker.Step();
+    Require(tracker.action().phase == ActionPhase::REJECTED,
+        "operator actions must be refused while the planner chooses them");
+
+    // On a zero command the planner finishes the gesture and returns to the standby action.
+    tracker.command = {0.0, 0.0, 0.0};
+    tracker.StopPlanner();
+    Require(tracker.UntilPhase(Phase::READY), "the decision planner did not stop");
+    Require(tracker.Settles(SonicPlannerTracker::kStandby), "the tracker did not return to its standby");
+    Require(tracker.adapter->ReadyForPolicySwitch(), "the released tracker must allow a policy switch");
+
+    // An action that the catalog does not contain is a planner failure, not a tracker fault.
+    tracker.StartPlanner("chooser", "moonwalk");
+    Require(tracker.UntilPhase(Phase::FAILED) &&
+        tracker.planner().detail.find("moonwalk") != std::string::npos,
+        "an unknown action name must fail the planner");
+    Require(tracker.Settles(SonicPlannerTracker::kStandby), "a failed planner must leave the standby reference");
+    std::cout << "SONIC planner action selection: PASS" << std::endl;
+}
+
+void TestSonicPlannerOffline() {
+    using Phase = robot_base::PlannerStatus::Phase;
+    fake_planners::GetScript().Reset();
+    fake_planners::GetScript().generate_delay_ms = 60;
+    SonicPlannerTracker tracker(FakePlannerHost());
+    tracker.Step();
+    tracker.StartPlanner("generator", "raise both arms");
+    bool generating = false;
+    Require(tracker.Until([&] {
+        generating = generating || tracker.planner().phase == Phase::GENERATING;
+        return tracker.planner().phase == Phase::RUNNING;
+    }) && generating, "the offline planner did not generate a motion");
+    // The generated motion (0.5 s holding 0.7 on joint 0) plays once, then standby returns.
+    double peak = 0.0;
+    float progress = 0.0F;
+    Require(tracker.Until([&] {
+        peak = std::max(peak, tracker.reference);
+        progress = std::max(progress, tracker.planner().progress);
+        return tracker.planner().phase == Phase::READY;
+    }), "the generated motion did not finish");
+    Require(std::abs(peak - 0.7) < 1.0e-5 && progress > 0.5F,
+        "the generated motion was not played to its end: peak=" + std::to_string(peak));
+    Require(tracker.Settles(SonicPlannerTracker::kStandby), "the tracker did not return to its standby");
+
+    // An offline planner may also answer with a catalog action.
+    tracker.StartPlanner("generator", "action:gesture");
+    peak = 0.0;
+    Require(tracker.UntilPhase(Phase::RUNNING), "the offline planner did not select an action");
+    Require(tracker.Until([&] {
+        peak = std::max(peak, tracker.reference);
+        return tracker.planner().phase == Phase::READY;
+    }) && peak >= SonicPlannerTracker::kGesture - 1.0e-6,
+        "the selected action was not played once: " + std::to_string(peak));
+    Require(tracker.Settles(SonicPlannerTracker::kStandby), "the tracker did not return after the action");
+    std::cout << "SONIC offline planner playback: PASS" << std::endl;
+}
+
+void TestSonicPlannerPolicySwitch() {
+    using Phase = robot_base::PlannerStatus::Phase;
+    fake_planners::GetScript().Reset();
+    SonicPlannerTracker tracker(FakePlannerHost("walker"));
+    // The policy's auto planner starts without an operator request.
+    Require(tracker.UntilPhase(Phase::RUNNING) && tracker.Settles(0.5),
+        "the auto planner did not take the reference");
+    tracker.command = {0.3, 0.0, 0.0};
+    tracker.Step();
+
+    // A policy switch first returns the reference to standby, then reports ready.
+    fake_planners::GetScript().settled = false;
+    tracker.switching = true;
+    tracker.Step();
+    Require(tracker.planner().phase == Phase::STOPPING && !tracker.adapter->ReadyForPolicySwitch(),
+        "the switch must wait for the planner to settle");
+    tracker.StartPlanner("walker");
+    tracker.Step();
+    Require(tracker.planner().phase == Phase::STOPPING, "a start during the switch must not keep the planner");
+    fake_planners::GetScript().settled = true;
+    Require(tracker.Until([&] { return tracker.adapter->ReadyForPolicySwitch(); }),
+        "the tracker never became ready for the switch");
+    Require(std::abs(tracker.reference - SonicPlannerTracker::kStandby) < 1.0e-5 &&
+        !tracker.planner().request_accepted,
+        "the tracker must be back on its standby before another policy takes over");
+
+    // Leaving RL stops the inference thread first; the adapter then suspends the planner.
+    fake_planners::GetScript().Reset();
+    SonicPlannerTracker leaving(FakePlannerHost());
+    leaving.StartPlanner("walker");
+    Require(leaving.UntilPhase(Phase::RUNNING), "the planner did not start");
+    leaving.adapter->OnInferenceStopped();
+    Require(leaving.planner().phase != Phase::RUNNING, "leaving RL must release the planner");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (fake_planners::GetScript().destroyed == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Require(fake_planners::GetScript().destroyed == 1, "leaving RL must unload the planner");
+    // Entering RL again resets the adapter and accepts a fresh request sequence.
+    leaving.adapter->Reset(leaving.robot);
+    leaving.request = {};
+    leaving.time_s = 0.0;
+    Require(std::abs(leaving.Step() - SonicPlannerTracker::kStandby) < 1.0e-6 &&
+        leaving.planner().phase == Phase::IDLE, "a new RL session must start on the standby reference");
+    leaving.StartPlanner("walker");
+    Require(leaving.UntilPhase(Phase::RUNNING) && leaving.Settles(0.5),
+        "the planner must be usable in the next RL session");
+    std::cout << "SONIC planner policy switch: PASS" << std::endl;
+}
+
+// The registered SONIC planner type end to end: YAML, background load, plans in the tracker.
+void TestSonicPlannerPlugin() {
+    using Phase = robot_base::PlannerStatus::Phase;
+    const TempSonicReference reference(29);
+    const TempSonicOnnx planner_model(kPlannerContextRepeatOnnx);
+    const TempReference yaml("sonic_planner_plugin", SonicPlannerYaml(reference.Path(),
+        "  walker:\n"
+        "    type: sonic_planner\n"
+        "    model_path: " + planner_model.Path().string() + "\n"
+        "    replan_interval: 0.2\n"
+        "    runtime: {provider: cpu, threads: 1}\n",
+        "          planners: [walker]\n"));
+    const auto config = LoadConfig(yaml.Path().string(), "tracker", fs::temp_directory_path().string());
+    SonicPlannerTracker tracker(config.planners);
+    tracker.StartPlanner("walker");
+    Require(tracker.UntilPhase(Phase::RUNNING, 20000), "the SONIC planner did not start: " +
+        tracker.planner().detail);
+    Require(tracker.Until([&] { return tracker.planner().plan_count >= 1; }, 10000),
+        "the SONIC planner did not publish a plan");
+    const uint32_t plans = tracker.planner().plan_count;
+    tracker.command = {0.3, 0.0, 0.0};
+    Require(tracker.Until([&] { return tracker.planner().plan_count > plans; }, 10000),
+        "a velocity command did not trigger a new plan");
+    Require(tracker.planner().last_plan_ms > 0.0F && tracker.planner().phase == Phase::RUNNING,
+        "plan statistics must be reported");
+    tracker.command = {0.0, 0.0, 0.0};
+    tracker.StopPlanner();
+    Require(tracker.UntilPhase(Phase::READY, 15000), "the SONIC planner did not stop: " +
+        tracker.planner().detail);
+    // The model stays loaded, so the next start only reseeds it.
+    tracker.StartPlanner("walker");
+    Require(tracker.UntilPhase(Phase::RUNNING, 10000), "the SONIC planner did not restart");
+    tracker.adapter->OnInferenceStopped();
+    std::cout << "SONIC planner type: PASS" << std::endl;
+}
+
+// The planner path through the behavior manager: requests arrive in the command, the RL
+// state hands them to the tracker policy, and the manager reports the planner status.
+void TestPlannerRuntime() {
+    using Phase = robot_base::PlannerStatus::Phase;
+    using Operation = robot_base::PlannerRequest::Operation;
+    using State = behavior_manager::StateName;
+    auto &script = fake_planners::GetScript();
+    script.Reset();
+    const TempSonicReference reference(29);
+    const TempSonicOnnx model;
+    const auto row = [](const std::string &value) {
+        std::string text = "[" + value;
+        for (int joint = 1; joint < 29; ++joint) text += ", " + value;
+        return text + "]";
+    };
+    const TempReference yaml("planner_runtime",
+        "robot_base:\n"
+        "  name: planner_runtime_test\n"
+        "  robot_dir: .\n"
+        "  num_dof: 29\n"
+        "  default_joint_pos: " + row("0") + "\n"
+        "  kp: " + row("1") + "\n"
+        "  kd: " + row("0.1") + "\n"
+        "behavior_manager:\n"
+        "  damp_kd: " + row("0.1") + "\n"
+        "  home: {gain_ramp_duration: 0.01, move_duration: 0.01}\n"
+        "  zero: {move_duration: 0.01, settle_duration: 0.01}\n"
+        "motion_planners:\n"
+        "  walker: {type: fake_trajectory}\n"
+        "  generator: {type: fake_generator, category: offline}\n"
+        "sonic_actions:\n"
+        "  action_names: [idle]\n"
+        "  default_action: idle\n"
+        "  actions:\n"
+        "    idle: {file: " + reference.Path().string() + "}\n"
+        "rl_policy:\n"
+        "  type: onnx_infer\n"
+        "  rl_dt: 0.02\n"
+        "  onnx_infer:\n"
+        "    default_policy: tracker\n"
+        "    policy_names: [tracker]\n"
+        "    policies:\n"
+        "      tracker:\n"
+        "        model_path: " + model.Path().string() + "\n"
+        "        runtime: {provider: cpu}\n"
+        "        model_io:\n"
+        "          inputs: [{name: reference_obs, source: external}, {name: obs, source: observation}]\n"
+        "          outputs: [{name: action, target: action}]\n"
+        "        action_scale: [1.0]\n"
+        "        rl_default_pos: " + row("0") + "\n"
+        "        kp: " + row("1") + "\n"
+        "        kd: " + row("0.1") + "\n"
+        "        observation:\n"
+        "          segment_0_terms: [gravity]\n"
+        "        policy_adapter:\n"
+        "          type: sonic\n"
+        "          catalog: sonic_actions\n"
+        "          future_frames: 10\n"
+        "          future_step: 5\n"
+        "          planners: [walker, generator]\n");
+    behavior_manager::BehaviorManagerClass manager(yaml.Path().string());
+    manager.Init();
+    auto sensor = robot_base::RobotData::FromYaml(yaml.Path().string());
+    robot_base::Command command;
+    const auto step = [&] {
+        sensor.time += 0.001;
+        manager.SetSensorData(sensor);
+        manager.SetCommand(command);
+        manager.Step(0.001F, 0.02F);
+        Require(!manager.CurrentFault().latched, "unexpected fault: " + manager.CurrentFault().detail);
+        Require(transport::CanEncodePlannerStatus(manager.CurrentPlannerStatus()),
+            "the planner status cannot be transmitted");
+    };
+    const auto tick = [&](int count) {
+        for (int index = 0; index < count; ++index) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            step();
+        }
+    };
+    const auto until = [&](const std::function<bool()> &done, int timeout_ms = 5000) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (!done()) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            tick(1);
+        }
+        return true;
+    };
+    // Holds a state key until the state is entered: HOME and RL wait for the policy of
+    // the next RL session, which is prepared in the background.
+    const auto key = [&](int value, State expected) {
+        command.key = value;
+        const bool entered = until([&] { return manager.CurrentState() == expected; });
+        command.key = 0;
+        Require(entered, "the state request was blocked: key " + std::to_string(value));
+    };
+    const auto request = [&](uint64_t sequence, Operation operation, const std::string &planner = "",
+            const std::string &argument = "") {
+        command.planner = {sequence, operation, planner, argument};
+    };
+    const auto status = [&] { return manager.CurrentPlannerStatus(); };
+    const auto enter_rl = [&] {
+        key(1, State::DAMP);
+        key(4, State::HOME);
+        tick(30);
+        key(2, State::ZERO);
+        tick(30);
+        key(3, State::RL);
+        tick(50);
+    };
+
+    // Outside RL nothing can answer the request; the manager reports the rejection.
+    request(1, Operation::START, "walker");
+    step();
+    Require(status().sequence == 1 && !status().request_accepted && status().phase == Phase::IDLE &&
+        status().planner == "walker" && status().detail.find("RL state") != std::string::npos,
+        "a planner request outside RL must be rejected by the manager");
+    Require(script.constructed == 0, "a planner was created outside RL");
+
+    enter_rl();
+    Require(status().phase == Phase::IDLE && status().sequence == 0 && script.constructed == 0,
+        "entering RL must not start a planner that is not configured to start");
+    request(2, Operation::START, "walker");
+    Require(until([&] { return status().phase == Phase::RUNNING; }),
+        "the planner did not start in the RL state: " + status().detail);
+    Require(status().sequence == 2 && status().request_accepted && status().planner == "walker" &&
+        script.constructed == 1 && script.started == 1, "the start request was not reported");
+    // The reference of the planner reaches the joint targets; action[1] is joint 1.
+    Require(until([&] { return std::abs(manager.GetOutput().target_pos[1] - 0.5) < 1.0e-3; }),
+        "the planner reference did not reach the joint targets");
+    command.vx = 0.3F;
+    Require(until([&] { return script.last_vx == 0.3F &&
+            std::abs(manager.GetOutput().target_pos[1] - 0.8) < 1.0e-3; }),
+        "the velocity command did not reach the planner");
+    Require(status().plan_count >= 2, "plans were not counted");
+    // The same sequence is handled once; an action cannot start while the planner runs.
+    command.interaction = {1, robot_base::InteractionRequest::Operation::START, "idle"};
+    tick(60);
+    Require(status().phase == Phase::RUNNING && script.started == 1 &&
+        !manager.CurrentInteractionStatus().request_accepted &&
+        manager.CurrentInteractionStatus().sequence == 1, "an action started while the planner ran");
+    command.interaction = {};
+    command.vx = 0.0F;
+    request(3, Operation::STOP);
+    Require(until([&] { return status().phase == Phase::READY; }), "the planner did not stop");
+    Require(status().sequence == 3 && status().request_accepted && script.stopped == 1,
+        "the stop request was not reported");
+    Require(until([&] { return std::abs(manager.GetOutput().target_pos[1]) < 1.0e-3; }),
+        "the tracker did not return to its standby reference");
+
+    // Leaving RL unloads the planner; requests are rejected again.
+    request(4, Operation::START, "walker");
+    Require(until([&] { return status().phase == Phase::RUNNING; }), "the planner did not restart");
+    key(1, State::DAMP);
+    Require(until([&] { return script.destroyed == script.constructed; }),
+        "the planner survived the end of the RL state");
+    Require(status().phase == Phase::IDLE && status().sequence == 0,
+        "the planner status outlived the RL state");
+    request(5, Operation::STOP);
+    step();
+    Require(status().sequence == 5 && !status().request_accepted, "a stop outside RL must be rejected");
+
+    // An offline planner generates one motion from the request argument.
+    enter_rl();
+    Require(status().phase == Phase::IDLE, "a new RL session must start without a planner");
+    request(6, Operation::START, "generator", "wave twice");
+    Require(until([&] { return status().phase == Phase::RUNNING; }),
+        "the generated motion did not start: " + status().detail);
+    {
+        std::lock_guard<std::mutex> lock(script.mutex);
+        Require(script.argument == "wave twice", "the request argument did not reach the planner");
+    }
+    Require(status().sequence == 6 && status().planner == "generator" && script.generated == 1,
+        "the generation request was not reported");
+    Require(until([&] { return status().phase == Phase::READY; }), "the generated motion did not finish");
+    key(-1, State::POWER_OFF);
+    Require(until([&] { return script.destroyed == script.constructed; }),
+        "the planner survived power-off");
+    std::cout << "planner requests through the RL state: PASS" << std::endl;
+}
+
 void TestJointTrajectoryTakeover(bool column_major = false) {
     const TempJointTrajectory trajectory(column_major);
     Config config;
@@ -1872,6 +2530,7 @@ int main(int argc, char **argv) {
                 << " [YAML ROBOT_DIR POLICY_NAME]" << std::endl;
             return 2;
         }
+        fake_planners::Register();
         TestHistoryActorCommands();
         TestProtomotionsDynamicDimensions();
         TestMjlabZip64AndUnicodeMetadata();
@@ -1891,6 +2550,12 @@ int main(int argc, char **argv) {
         TestSonicPrepareInputs();
         TestSonicSplitInference();
         TestSonicMotionCatalogPlayback();
+        TestSonicPlannerTrajectory();
+        TestSonicPlannerActions();
+        TestSonicPlannerOffline();
+        TestSonicPlannerPolicySwitch();
+        TestSonicPlannerPlugin();
+        TestPlannerRuntime();
         TestJointTrajectoryTakeover();
         TestJointTrajectoryTakeover(true);
         TestJointTrajectoryBlendAndCancel();

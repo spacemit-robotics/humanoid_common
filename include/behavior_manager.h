@@ -146,6 +146,13 @@ public:
     robot_base::InteractionStatus CurrentInteractionStatus() const;
 
     /**
+     * @brief 获取 RL 状态内参考动作规划器的状态
+     *
+     * 当前状态或策略无法处理的规划器请求在这里以 request_accepted=false 回报。
+     */
+    robot_base::PlannerStatus CurrentPlannerStatus() const;
+
+    /**
      * @brief 是否正在运行
      */
     bool IsRunning() const;

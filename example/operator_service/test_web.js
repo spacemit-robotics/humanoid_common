@@ -87,6 +87,7 @@ function element(key) {
             classList: {toggle() {}, remove() {}, add() {}},
             querySelector: part => element(`${key} ${part}`), replaceChildren() {},
             setAttribute: (name, value) => attributes.set(name, value), getAttribute: name => attributes.get(name),
+                removeAttribute: name => attributes.delete(name),
             hasPointerCapture: () => false, setPointerCapture() {}, focus() {},
             getBoundingClientRect: () => ({left: 0, top: 0, width: 146, height: 146})});
     }

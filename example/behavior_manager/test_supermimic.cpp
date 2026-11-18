@@ -857,10 +857,10 @@ void TestPlanners(const Fixture &fixture) {
         std::ofstream output(fixture.yaml);
         output << "robot_base: {num_dof: " << robot_dof << "}\n"
             "motion_planners:\n"
-            "  walker: {type: fake_trajectory}\n"
+            "  walker: {type: fake_trajectory, command: {limits: {max_vx: 1, max_vy: 1, max_wz: 1}}}\n"
             "  mover: {type: supermimic_root_motion}\n"
             "  overflow: {type: supermimic_root_motion}\n"
-            "  chooser: {type: fake_choice}\n"
+            "  chooser: {type: fake_choice, command: {limits: {max_vx: 1, max_vy: 1, max_wz: 1}}}\n"
             "  writer: {type: fake_generator, category: offline}\n"
             "rl_policy:\n  rl_dt: 0.02\n  onnx_infer:\n    policies:\n      probe:\n"
             "        infer_decimation: 1\n        policy_adapter:\n          type: supermimic\n"
@@ -910,11 +910,11 @@ void TestPlanners(const Fixture &fixture) {
     Near(probe.goal[0], 0.4, "a rejected action leaves the planner reference");
     probe.command = {0.3, 0.0, 0.0};
     Require(probe.Until([&] { return script.last_vx == 0.3F; }), "the command did not reach the planner");
-    probe.Tick();
-    Near(probe.goal[0], 0.7, "consecutive plans replace each other without a new blend");
+    Require(probe.Until([&] { return std::abs(probe.goal[0] - 0.7) < 1e-5; }),
+        "consecutive plans replace each other without a new blend");
     probe.command = {0.0, 0.0, 0.0};
-    Require(probe.Until([&] { return script.last_vx == 0.0F; }) && probe.Settles(0.4, 0.31),
-        "the zero command did not reach the planner");
+    Require(probe.Until([&] { return script.last_vx == 0.0F && std::abs(probe.goal[0] - 0.4) < 1e-5; }),
+        "the zero command did not produce the stationary reference");
     probe.Stop();
     Require(probe.Until(idle), "the planner did not stop");
     Require(probe.Settles(0.2), "stopping must blend back to the standby reference");
@@ -934,7 +934,7 @@ void TestPlanners(const Fixture &fixture) {
     probe.Restart();
     probe.Start("mover");
     Require(probe.UntilPhase(PlannerPhase::RUNNING), "the root-motion planner did not start");
-    double start = probe.last_time;
+    const double start = probe.last_time + probe.planner().reference_remaining_s - 1.98;
     for (int index = 0; index < 8; ++index) probe.Tick();
     // The first goal frame is one policy step ahead of the tick.
     const auto expected = [&] { return 0.5 + 0.5 * (probe.last_time + 0.02 - start); };

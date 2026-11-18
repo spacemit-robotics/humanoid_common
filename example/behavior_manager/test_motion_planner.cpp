@@ -12,6 +12,7 @@
 #include "motion_planner/planner_host.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -58,6 +59,8 @@ PlannerConfig MakePlanner(const std::string &name, const std::string &type,
     config.name = name;
     config.type = type;
     config.category = category;
+    config.minimum_command = {-1.0F, -1.0F, -1.0F};
+    config.maximum_command = {1.0F, 1.0F, 1.0F};
     config.context.name = name;
     config.context.config_base = "motion_planners." + name;
     config.context.num_dof = kDof;
@@ -215,8 +218,7 @@ void TestRealtimeLifecycle() {
             tracker.status().reference_remaining_s > 1.0F, "planner statistics must reach the status");
 
         tracker.command.vx = 0.4F;
-        tracker.Step();
-        Require(script.last_vx == 0.4F && tracker.host.Output() != first &&
+        Require(tracker.Until([&] { return tracker.host.Output() != first; }) && script.last_vx == 0.4F &&
             tracker.host.Output()->trajectory.joint_pos[0] == 0.9F,
             "the motion command must reach the planner and its new plan must be published");
         {
@@ -416,8 +418,7 @@ void TestFailures() {
     Require(tracker.UntilPhase(Phase::RUNNING), "the planner did not restart");
     script.invalid_output = true;
     tracker.command.vx = 0.2F;
-    tracker.Step();
-    Require(tracker.phase() == Phase::FAILED && Contains(tracker.status().detail, "invalid reference") &&
+    Require(tracker.UntilPhase(Phase::FAILED) && Contains(tracker.status().detail, "invalid reference") &&
         !tracker.host.Output(), "an invalid publication must never reach the tracker");
 
     script.invalid_output = false;
@@ -843,8 +844,10 @@ public:
     }
 
     std::string FollowTrajectory(const behavior_manager::motion_planner::ReferenceTrajectory &trajectory,
+        const behavior_manager::motion_planner::InstallReference &install,
         bool finite, bool replace, double) override {
         if (reject_trajectory) return "scripted rejection";
+        if (install) install();
         calls.push_back(std::string(finite ? "finite" : "continuous") + (replace ? ":replace" : ""));
         value = trajectory.joint_pos[0];
         return {};
@@ -912,6 +915,36 @@ public:
 
 // The contract between the binding and a tracker: which reference change each publication
 // of the planner turns into.
+void TestTrajectoryHandoff() {
+    auto &script = GetScript();
+    script.Reset();
+    auto planner = MakePlanner("fixed", "fake_trajectory");
+    planner.minimum_command = {};
+    planner.maximum_command = {};
+    auto config = MakeHost({planner});
+    const auto inference = std::this_thread::get_id();
+    std::atomic<bool> prepared{false};
+    std::atomic<bool> release{false};
+    bool installed = false;
+    config.prepare_trajectory = [&](const auto &) {
+        Require(std::this_thread::get_id() != inference, "conversion ran on the inference thread");
+        prepared = true;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!release && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        return [&] { installed = std::this_thread::get_id() == inference; };
+    };
+    BoundTracker tracker(std::move(config));
+    tracker.command.vx = 0.8F;
+    tracker.Start("fixed");
+    Require(tracker.Until([&] { return prepared.load(); }), "worker did not receive the trajectory");
+    tracker.Step();
+    Require(!tracker.binding.Following() && !installed && script.last_vx == 0.0F,
+        "a zero-speed planner must stay still, with the tracker in standby until the trajectory is ready");
+    release = true;
+    Require(tracker.Until([&] { return installed && tracker.binding.Following(); }),
+        "ready trajectory was not installed on the inference thread");
+}
+
 void TestBinding() {
     using Calls = std::vector<std::string>;
     auto &script = GetScript();
@@ -1072,6 +1105,7 @@ int main() {
         TestOfflinePlanner();
         TestSuspendAndReset();
         TestPreparationProgress();
+        TestTrajectoryHandoff();
         TestBinding();
     } catch (const std::exception &error) {
         std::cerr << "motion planner test failed: " << error.what() << std::endl;

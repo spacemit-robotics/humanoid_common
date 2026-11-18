@@ -926,6 +926,12 @@ void TestSonicPlannerConfig() {
     using behavior_manager::policy_adapter::LoadSonicPlannerConfig;
     const TempSonicReference reference(29);
     const std::string robot_dir = fs::temp_directory_path().string();
+    auto restricted = SonicPlannerYaml(reference.Path(), "", "");
+    const auto idle = restricted.find("idle: {file:");
+    restricted.insert(idle + 7, "enabled_in: [sim], ");
+    Require(LoadConfigRejected("restricted_standby", restricted), "a real tracker cannot enter a sim-only standby");
+    restricted.insert(restricted.find("        policy_adapter:"), "        enabled_in: [sim]\n");
+    Require(!LoadConfigRejected("simulation_standby", restricted), "a sim-only tracker may use that standby");
     const std::string walker =
         "  walker:\n"
         "    display_name: Walker\n"
@@ -1727,6 +1733,8 @@ behavior_manager::motion_planner::HostConfig FakePlannerHost(const std::string &
         planner.name = name;
         planner.type = type;
         planner.category = category;
+        planner.minimum_command = {-1.0F, -1.0F, -1.0F};
+        planner.maximum_command = {1.0F, 1.0F, 1.0F};
         planner.context.name = name;
         host.planners.push_back(std::move(planner));
     };
@@ -1763,9 +1771,7 @@ void TestSonicPlannerTrajectory() {
 
     // New plans replace the followed trajectory in place.
     tracker.command = {0.2, 0.0, 0.0};
-    tracker.Step();
-    tracker.Step();
-    Require(std::abs(tracker.reference - 0.7) < 1.0e-5 && fake_planners::GetScript().last_vx == 0.2F,
+    Require(tracker.Until([&] { return std::abs(tracker.reference - 0.7) < 1.0e-5; }) && fake_planners::GetScript().last_vx == 0.2F,
         "the velocity command must reach the planner and its plan the tracker: " +
         std::to_string(tracker.reference));
 
@@ -1942,6 +1948,7 @@ void TestSonicPlannerPlugin() {
     const TempReference yaml("sonic_planner_plugin", SonicPlannerYaml(reference.Path(),
         "  walker:\n"
         "    type: sonic_planner\n"
+        "    command: {limits: {max_vx: 1, max_vy: 1, max_wz: 1}}\n"
         "    model_path: " + planner_model.Path().string() + "\n"
         "    replan_interval: 0.2\n"
         "    runtime: {provider: cpu, threads: 1}\n",
@@ -1998,7 +2005,7 @@ void TestPlannerRuntime() {
         "  home: {gain_ramp_duration: 0.01, move_duration: 0.01}\n"
         "  zero: {move_duration: 0.01, settle_duration: 0.01}\n"
         "motion_planners:\n"
-        "  walker: {type: fake_trajectory}\n"
+        "  walker: {type: fake_trajectory, command: {limits: {max_vx: 1, max_vy: 1, max_wz: 1}}}\n"
         "  generator: {type: fake_generator, category: offline}\n"
         "sonic_actions:\n"
         "  action_names: [idle]\n"

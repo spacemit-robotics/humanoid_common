@@ -72,7 +72,7 @@ void PlannerBinding::Step(const robot_base::RobotData &robot,
     // planner blends them itself.
     const bool replace = !named && !finite && following_ && continuous_;
     const std::string error = named ? sink_.FollowAction(output->action, time_s)
-        : sink_.FollowTrajectory(output->trajectory, finite, replace, time_s);
+        : sink_.FollowTrajectory(output->trajectory, host_.PreparedReference(), finite, replace, time_s);
     if (!error.empty()) {
         host_.Fail("the tracker cannot follow the published reference: " + error);
         output_.reset();

@@ -94,6 +94,7 @@ private:
     Json ReplyTo(uint64_t id, bool ok, const std::string &code, const std::string &message,
         const Json &data = Json::object()) const;
     bool Online() const;
+    void CancelPendingPlannerStart();
     void ClearInput(const std::string &reason, bool immediate = false);
     void ClearVelocity(bool immediate);
     void AdvanceVelocity(double now);

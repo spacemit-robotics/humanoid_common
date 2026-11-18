@@ -211,12 +211,12 @@ const motion_planner::PlannerTypeRegistration kGaitSelector("gait_selector", {
 | `ReferenceSink` | 跟踪策略的处理 |
 | --- | --- |
 | `FollowAction(action, t)` | 从当前参考过渡到目录动作并从首帧起播；目录中没有时返回原因 |
-| `FollowTrajectory(trajectory, finite, replace, t)` | `replace` 为 true 时原位替换上一段连续轨迹；否则从当前参考过渡到该轨迹。`finite` 为 true 时从首帧播放一遍，否则按 `start_time_s` 的时间轴取帧 |
+| `FollowTrajectory(trajectory, install, finite, replace, t)` | `replace` 为 true 时原位替换上一段连续轨迹；否则从当前参考过渡到该轨迹。`finite` 为 true 时从首帧播放一遍，否则按 `start_time_s` 的时间轴取帧 |
 | `FollowStandby(t)` | 从当前参考过渡回待命参考 |
 | `Playback(t)` | 目录动作或有限轨迹的播放进度和是否播完 |
 
 `FollowAction` / `FollowTrajectory` 返回非空字符串表示无法采用这次发布，此时须保持原有
-参考不变。
+参考不变。整段轨迹在宿主后台校验；需要转换帧格式的策略配置 `prepare_trajectory`，返回一个只交换缓冲区的 `install` 操作。跟踪线程在保留过渡起点后调用它，旧缓冲区由后台回收。
 
 adapter 中的调用点：
 

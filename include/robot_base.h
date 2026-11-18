@@ -117,6 +117,7 @@ public:
      * @throws std::runtime_error 文件不存在或解析失败时抛出异常
      */
     static YamlFile Load(const std::string &yaml_path);
+    bool Contains(const std::string &path) const;
 
     /**
      * @brief 读取指定类型的配置
@@ -313,6 +314,18 @@ struct PlannerRequest {
     Operation operation = Operation::NONE;
     std::string planner;    ///< START 对应的 YAML 规划器名
     std::string argument;   ///< START 附带的任务描述（如离线生成使用的文本），可为空
+
+    void ClearOperation() {
+        operation = Operation::NONE;
+        planner.clear();
+        argument.clear();
+    }
+    void StopAfter(uint64_t observed) {
+        ClearOperation();
+        sequence = (sequence > observed ? sequence : observed) + 1;
+        if (!sequence) ++sequence;
+        operation = Operation::STOP;
+    }
 };
 
 /**

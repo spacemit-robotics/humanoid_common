@@ -320,6 +320,12 @@ public:
             planner_clip_ = clips_.size();
             clips_.emplace_back();
             // The conversion to the private base is only accessible inside the class.
+            config_.planners.prepare_trajectory =
+                [target = &clips_[planner_clip_].frames](const motion_planner::ReferenceTrajectory &trajectory) {
+                    std::vector<ReferenceFrame> frames;
+                    ConvertTrajectory(trajectory, &frames);
+                    return [target, frames = std::move(frames)]() mutable { target->swap(frames); };
+                };
             motion_planner::ReferenceSink &sink = *this;
             planner_ = std::make_unique<motion_planner::PlannerBinding>(config_.planners, sink);
         }
@@ -556,12 +562,10 @@ private:
     }
 
     std::string FollowTrajectory(const motion_planner::ReferenceTrajectory &trajectory,
+        const motion_planner::InstallReference &install,
         bool finite,
         bool replace,
         double elapsed_s) override {
-        if (!ConvertTrajectory(trajectory)) {
-            return "root velocities derived from the trajectory are not finite";
-        }
         if (!replace) {
             TakePlannerReference();
             // Freezes the current goal as the crossfade source; the planner clip may then change.
@@ -569,7 +573,7 @@ private:
             planner_transition_ = true;
         }
         Clip &clip = clips_[planner_clip_];
-        clip.frames.swap(planner_frames_);
+        install();
         clip.config.motion_fps = trajectory.fps;
         clip.config.playback_speed = 1.0;
         clip.config.loop = false;
@@ -615,10 +619,8 @@ private:
         status_.action.clear();
     }
 
-    // Converts a planner trajectory into reference frames held in planner_frames_. Root
-    // velocities come from finite differences of the root pose. Returns false when a
-    // derived value is not finite; the planner clip is not touched.
-    bool ConvertTrajectory(const motion_planner::ReferenceTrajectory &trajectory) {
+    static void ConvertTrajectory(const motion_planner::ReferenceTrajectory &trajectory,
+            std::vector<ReferenceFrame> *converted) {
         const std::size_t frames = trajectory.FrameCount();
         const float fps = static_cast<float>(trajectory.fps);
         const auto position = [&](std::size_t frame) {
@@ -628,12 +630,12 @@ private:
             const float *quat = &trajectory.root_quat[frame * 4];
             return Eigen::Quaternionf(quat[0], quat[1], quat[2], quat[3]).normalized();
         };
-        planner_frames_.resize(frames);
+        converted->resize(frames);
         bool finite = std::isfinite(fps);
         for (std::size_t frame = 0; frame < frames; ++frame) {
-            ReferenceFrame &out = planner_frames_[frame];
-            const auto joint = static_cast<std::ptrdiff_t>(frame * joints_);
-            const auto count = static_cast<std::ptrdiff_t>(joints_);
+            ReferenceFrame &out = (*converted)[frame];
+            const auto count = static_cast<std::ptrdiff_t>(trajectory.num_dof);
+            const auto joint = static_cast<std::ptrdiff_t>(frame) * count;
             out.joint_pos.assign(trajectory.joint_pos.begin() + joint,
                 trajectory.joint_pos.begin() + joint + count);
             out.joint_vel.assign(trajectory.joint_vel.begin() + joint,
@@ -650,7 +652,7 @@ private:
             finite = finite && out.linear_velocity.allFinite() && out.angular_velocity.allFinite() &&
                 out.orientation.coeffs().allFinite();
         }
-        return finite;
+        if (!finite) throw std::runtime_error("root velocities derived from the trajectory are not finite");
     }
 
     std::vector<ReferenceFrame> LoadReference(const ReferenceMotionConfig &reference) const {
@@ -956,7 +958,6 @@ private:
     bool switch_requested_ = false;
     std::unique_ptr<motion_planner::PlannerBinding> planner_;
     std::size_t planner_clip_ = 0;                // Extra clip filled from planner trajectories.
-    std::vector<ReferenceFrame> planner_frames_;  // Conversion buffer, swapped into that clip.
     bool planner_owned_ = false;       // The active clip was selected by the planner.
     bool planner_continuous_ = false;  // Following a realtime trajectory on the RL time axis.
     bool planner_transition_ = false;  // The active transition was started by the planner.
@@ -1905,7 +1906,14 @@ private:
         // Holds explicit planner trajectories; not selectable as a catalog action.
         planner_clip_index_ = clips_.size();
         clips_.emplace_back();
-        // The conversion to the private base is only accessible inside the class.
+        clips_.back().config.loop = false;
+        clips_.back().config.loop_pause = 0.0;
+        config_.planners.prepare_trajectory =
+            [target = &clips_[planner_clip_index_].frames, mapping = model_to_robot_](
+                const motion_planner::ReferenceTrajectory &trajectory) {
+                auto frames = ConvertTrajectory(trajectory, mapping);
+                return [target, frames = std::move(frames)]() mutable { target->swap(frames); };
+            };
         motion_planner::ReferenceSink &sink = *this;
         planner_ = std::make_unique<motion_planner::PlannerBinding>(config_.planners, sink);
     }
@@ -1930,17 +1938,20 @@ private:
     }
 
     std::string FollowTrajectory(const motion_planner::ReferenceTrajectory &trajectory,
+        const motion_planner::InstallReference &install,
         bool finite,
         bool replace,
         double elapsed_s) override {
+        auto &clip = clips_[planner_clip_index_];
+        clip.config.motion_fps = trajectory.fps;
         if (replace) {
-            FillPlannerClip(trajectory);
+            install();
             playback_start_elapsed_ = trajectory.start_time_s;
             return {};
         }
         // Sample the crossfade source before the planner clip is overwritten.
         const SonicFrame source = CurrentReference(elapsed_s);
-        FillPlannerClip(trajectory);
+        install();
         TakePlannerReference();
         planner_continuous_ = !finite;
         SwitchReference(source, planner_clip_index_, elapsed_s, true);
@@ -1974,26 +1985,23 @@ private:
         return state;
     }
 
-    void FillPlannerClip(const motion_planner::ReferenceTrajectory &trajectory) {
-        auto &clip = clips_[planner_clip_index_];
-        clip.config.motion_fps = trajectory.fps;
-        clip.config.playback_speed = 1.0;
-        clip.config.loop = false;
-        clip.config.loop_pause = 0.0;
+    static std::vector<SonicFrame> ConvertTrajectory(const motion_planner::ReferenceTrajectory &trajectory,
+            const std::vector<int> &mapping) {
         const std::size_t dof = static_cast<std::size_t>(trajectory.num_dof);
-        clip.frames.resize(trajectory.FrameCount());
-        for (std::size_t index = 0; index < clip.frames.size(); ++index) {
-            auto &frame = clip.frames[index];
-            frame.dof_pos.resize(model_dof_count_);
-            frame.dof_vel.resize(model_dof_count_);
-            for (int joint = 0; joint < model_dof_count_; ++joint) {
-                const std::size_t source = index * dof + model_to_robot_[joint];
+        std::vector<SonicFrame> frames(trajectory.FrameCount());
+        for (std::size_t index = 0; index < frames.size(); ++index) {
+            auto &frame = frames[index];
+            frame.dof_pos.resize(mapping.size());
+            frame.dof_vel.resize(mapping.size());
+            for (std::size_t joint = 0; joint < mapping.size(); ++joint) {
+                const std::size_t source = index * dof + mapping[joint];
                 frame.dof_pos[joint] = trajectory.joint_pos[source];
                 frame.dof_vel[joint] = trajectory.joint_vel[source];
             }
             const float *quat = &trajectory.root_quat[index * 4];
             frame.root_quat = Eigen::Quaternionf(quat[0], quat[1], quat[2], quat[3]).normalized();
         }
+        return frames;
     }
 
     // The interaction status describes catalog actions started by the operator;
@@ -2673,6 +2681,11 @@ Config LoadConfig(const std::string &yaml_path,
                     yaml.Read<std::string>(
                         catalog_base + ".default_action")
                             .value_or(action_names.front()));
+            const auto standby_path = catalog_base + ".actions." + motion_catalog.default_action + ".enabled_in";
+            if (!robot_base::EnvironmentSet::FromYaml(yaml, standby_path).Covers(
+                    robot_base::EnvironmentSet::FromYaml(yaml, policy_base + ".enabled_in"))) {
+                throw std::runtime_error(standby_path + " must cover every environment of " + policy_name);
+            }
             for (const auto &name : action_names) {
                 const std::string action_base =
                     catalog_base + ".actions." + name;

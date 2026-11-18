@@ -555,6 +555,13 @@ int main(int argc, char *argv[]) {
             cmd.switch_policy.clear();
             cmd.policy_request_sequence = 0;
             if (hmi_just_disconnected) {
+                const auto planner = bm.CurrentPlannerStatus();
+                using Phase = robot_base::PlannerStatus::Phase;
+                if (cmd.planner.operation == robot_base::PlannerRequest::Operation::START ||
+                    (planner.phase != Phase::IDLE && planner.phase != Phase::READY &&
+                        planner.phase != Phase::FAILED && planner.phase != Phase::STOPPING)) {
+                    cmd.planner.StopAfter(planner.sequence);
+                }
                 ++cmd.interaction.sequence;
                 if (cmd.interaction.sequence == 0) {
                     ++cmd.interaction.sequence;

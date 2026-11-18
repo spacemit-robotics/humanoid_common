@@ -51,7 +51,8 @@ std::string ValidateOutput(const PlannerOutput &output, int num_dof) {
     const auto &trajectory = output.trajectory;
     const std::size_t frames = trajectory.FrameCount();
     if (!output.action.empty()) {
-        return frames == 0 ? "" : "output names an action and also carries a trajectory";
+        return trajectory.joint_pos.empty() && trajectory.joint_vel.empty() && trajectory.root_pos.empty() &&
+            trajectory.root_quat.empty() ? "" : "output names an action and also carries a trajectory";
     }
     if (trajectory.num_dof != num_dof) {
         return "trajectory has " + std::to_string(trajectory.num_dof) + " joints, robot has " +
@@ -75,6 +76,7 @@ std::string ValidateOutput(const PlannerOutput &output, int num_dof) {
         const float *quat = &trajectory.root_quat[frame * 4];
         const float norm_squared =
             quat[0] * quat[0] + quat[1] * quat[1] + quat[2] * quat[2] + quat[3] * quat[3];
+        if (!std::isfinite(norm_squared)) return "trajectory root quaternion norm is not finite";
         if (norm_squared < 1.0e-6F) return "trajectory contains a zero root quaternion";
     }
     return {};

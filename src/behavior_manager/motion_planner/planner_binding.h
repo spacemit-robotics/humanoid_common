@@ -43,6 +43,7 @@ public:
      * @param replace 正在跟随同一规划器的上一段连续轨迹：原位替换，不做过渡
      */
     virtual std::string FollowTrajectory(const ReferenceTrajectory &trajectory,
+        const InstallReference &install,
         bool finite,
         bool replace,
         double time_s) = 0;

@@ -112,7 +112,7 @@ YAML::Node GetNodeByPath(const YAML::Node &root, const std::string &path) {
     YAML::Node cur = root;
     for (const auto &seg : SplitPath(path)) {
         if (!cur) {
-            return YAML::Node();
+            return YAML::Node(YAML::NodeType::Undefined);
         }
 
         std::size_t pos = 0;
@@ -123,29 +123,30 @@ YAML::Node GetNodeByPath(const YAML::Node &root, const std::string &path) {
         }
 
         if (!key.empty()) {
+            if (!cur.IsMap()) return YAML::Node(YAML::NodeType::Undefined);
             const YAML::Node current = cur;
             YAML::Node next = current[key];
             if (!next || !next.IsDefined()) {
-                return YAML::Node();
+                return YAML::Node(YAML::NodeType::Undefined);
             }
             cur.reset(next);
         }
 
         while (pos < seg.size()) {
             if (seg[pos] != '[') {
-                return YAML::Node();
+                return YAML::Node(YAML::NodeType::Undefined);
             }
             std::size_t close = seg.find(']', pos);
             if (close == std::string::npos || close == pos + 1) {
-                return YAML::Node();
+                return YAML::Node(YAML::NodeType::Undefined);
             }
             const std::string idx_str = seg.substr(pos + 1, close - pos - 1);
             if (!cur || !cur.IsSequence()) {
-                return YAML::Node();
+                return YAML::Node(YAML::NodeType::Undefined);
             }
             const std::size_t idx = static_cast<std::size_t>(std::stoul(idx_str));
             if (idx >= cur.size()) {
-                return YAML::Node();
+                return YAML::Node(YAML::NodeType::Undefined);
             }
             const YAML::Node current = cur;
             cur.reset(current[idx]);
@@ -178,6 +179,10 @@ YamlFile YamlFile::Load(const std::string &yaml_path) {
         throw std::runtime_error("YAML 解析失败: " + std::string(e.what()));
     }
     return yaml_file;
+}
+
+bool YamlFile::Contains(const std::string &path) const {
+    return GetNodeByPath(impl_->root, path).IsDefined();
 }
 
 template <typename T>
@@ -221,7 +226,7 @@ EnvironmentSet EnvironmentSet::FromYaml(const YamlFile &yaml_file, const std::st
     const auto names = yaml_file.Read<std::vector<std::string>>(path);
     if (!names) {
         // A scalar or map here would otherwise silently enable every environment.
-        if (yaml_file.Read<std::string>(path)) {
+        if (yaml_file.Contains(path)) {
             throw std::runtime_error(path + " 必须是 sim / real 组成的列表");
         }
         return {};

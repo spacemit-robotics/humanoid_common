@@ -516,6 +516,8 @@ void TestPlanner() {
     assert(rejected(yaml, "slow_limits: [0.4, 0.2, 0.5]", "slow_limits: [0.9, 0.2, 0.5]"));
     assert(rejected(yaml, "min_vx: -0.3, max_vx: 0.8, max_vy: 0.5, max_wz: 1.0", "max_vx: 0.8"));
     assert(rejected(yaml, "type: walker_model\n", ""));
+    assert(rejected(yaml, "[walker, writer, lab]", "{walker: true}"));
+    assert(rejected(yaml, "[walker, writer, lab]", "[walker, [writer]]"));
     auto config = load(yaml);
     std::filesystem::remove_all(root);
     assert(config.policies.size() == 2 && config.policies[1].planners.empty());
@@ -607,6 +609,31 @@ void TestPlanner() {
     status.interaction.phase = robot_base::InteractionStatus::Phase::IDLE;
     update();
     assert(idle() && service.Command().planner.sequence == 0);
+    for (const bool sent : {false, true}) {
+        for (const bool expired : {false, true}) {
+            auto pending_config = config;
+            pending_config.request_timeout = 0;
+            Service pending(pending_config);
+            pending.UpdateStatus(status, {});
+            pending.UpdateStatus(status, {});
+            const auto peer = pending.Open();
+            const auto invoke = [&](uint64_t id, const std::string &op, const Json &args) {
+                return pending.Handle(peer, {{"v", 1}, {"id", id}, {"op", op}, {"args", args}}).at("ok");
+            };
+            assert(invoke(1, "hello", {{"token", config.token}}));
+            assert(invoke(2, "acquire", Json::object()));
+            assert(invoke(3, "planner", {{"name", "writer"}}));
+            const auto start = pending.Command().planner.sequence;
+            if (sent) pending.MarkCommandSent();
+            if (expired) pending.Tick();
+            else pending.Disconnect(peer);
+            const auto cancelled = pending.Command().planner;
+            assert(cancelled.operation == (sent ? Operation::STOP : Operation::NONE));
+            assert(cancelled.planner.empty() && cancelled.argument.empty());
+            assert(!sent || cancelled.sequence > start);
+            assert(pending.Snapshot().request.phase == (expired ? "expired" : "cancelled"));
+        }
+    }
     // Stopping when nothing runs is answered without asking control.
     auto reply = call("planner_stop");
     assert(reply.at("ok") && reply.at("code") == "ok" && idle());

@@ -126,7 +126,8 @@ int main(int argc, char *argv[]) {
             const std::string path = "/tmp/robot_base_environment_" + std::to_string(::getpid()) + ".yaml";
             std::ofstream(path) << "sim_only: {enabled_in: [sim]}\nboth: {enabled_in: [real, sim]}\n"
                 "unrestricted: {}\nscalar: {enabled_in: sim}\nempty: {enabled_in: []}\n"
-                "unknown: {enabled_in: [hardware]}\n";
+                "unknown: {enabled_in: [hardware]}\nmap: {enabled_in: {sim: true}}\n"
+                "mixed: {enabled_in: [sim, [real]]}\nnull_value: {enabled_in: null}\n";
             const YamlFile environments = YamlFile::Load(path);
             std::remove(path.c_str());
             const auto sim_only = EnvironmentSet::FromYaml(environments, "sim_only.enabled_in");
@@ -137,7 +138,7 @@ int main(int argc, char *argv[]) {
                 both.Allows(RuntimeEnvironment::REAL) && both.Allows(RuntimeEnvironment::UNKNOWN) &&
                 unrestricted.Allows(RuntimeEnvironment::REAL) && unrestricted.Covers(sim_only) &&
                 !sim_only.Covers(unrestricted) && sim_only.Covers(sim_only);
-            for (const char *invalid : {"scalar", "empty", "unknown"}) {
+            for (const char *invalid : {"scalar", "empty", "unknown", "map", "mixed", "null_value"}) {
                 try {
                     (void)EnvironmentSet::FromYaml(environments, std::string(invalid) + ".enabled_in");
                     ok = false;

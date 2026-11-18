@@ -80,7 +80,7 @@ constexpr int kStageIdle = 0;
 constexpr int kStagePosted = 1;
 constexpr int kStageDone = 2;
 
-enum class JobKind { NONE, LOAD, START, GENERATE, STOP };
+enum class JobKind { NONE, LOAD, START, GENERATE, PREPARE, STOP };
 
 const char *PhaseName(Phase phase) {
     switch (phase) {
@@ -101,6 +101,7 @@ struct Job {
     int index = -1;        // LOAD: planner to create
     bool destroy = false;  // STOP: also release the planner
     double time_s = 0.0;   // START
+    std::shared_ptr<const PlannerOutput> publication;  // PREPARE
     std::string argument;  // GENERATE
     robot_base::RobotData robot;
     std::shared_ptr<std::atomic<bool>> cancelled;  // GENERATE
@@ -108,6 +109,7 @@ struct Job {
 
 // State of the worker-owned planner after a job, plus the job's own outcome.
 struct JobResult {
+    InstallReference install;
     std::string error;
     Planner *planner = nullptr;
     int loaded_index = -1;
@@ -167,6 +169,8 @@ HostConfig LoadHostConfig(const std::string &yaml_path,
         config.type = entry.type;
         config.category = type->category;
         config.environments = entry.environments;
+        config.minimum_command = {entry.limits.min_vx, entry.limits.min_vy, entry.limits.min_wz};
+        config.maximum_command = {entry.limits.max_vx, entry.limits.max_vy, entry.limits.max_wz};
         config.preload = yaml.Read<bool>(entry.base + ".preload").value_or(false);
         config.keep_loaded = yaml.Read<bool>(entry.base + ".keep_loaded").value_or(true);
         config.stop_timeout_s = yaml.Read<double>(entry.base + ".stop_timeout").value_or(10.0);
@@ -303,6 +307,8 @@ public:
     }
 
     const std::shared_ptr<const PlannerOutput> &Output() const { return output_; }
+
+    const InstallReference &PreparedReference() const { return install_; }
 
     bool OutputFinite() const {
         return output_ && active_ >= 0 && Active().category == Category::OFFLINE;
@@ -483,18 +489,29 @@ private:
 
         auto *planner = static_cast<RealtimePlanner *>(planner_);
         try {
-            const PlannerInput input{robot, releasing_ ? MotionCommand{} : command, time_s_,
+            const auto &lo = config.minimum_command;
+            const auto &hi = config.maximum_command;
+            const MotionCommand limited{runtime_config::ClampVelocity(command.vx, lo.vx, hi.vx),
+                runtime_config::ClampVelocity(command.vy, lo.vy, hi.vy),
+                runtime_config::ClampVelocity(command.wz, lo.wz, hi.wz)};
+            const PlannerInput input{robot, releasing_ ? MotionCommand{} : limited, time_s_,
                 playback, argument_, argument_sequence_};
             planner->Update(input);
             auto output = planner->Output();
-            if (output && output != seen_output_) {
+            if (output && output != seen_output_ && job_kind_ == JobKind::NONE) {
                 seen_output_ = output;
-                const std::string error = ValidateOutput(*output, num_dof_);
-                if (!error.empty()) {
-                    Fail("published an invalid reference: " + error);
-                    return;
+                if (output->action.empty()) {
+                    job_.kind = JobKind::PREPARE;
+                    job_.publication = std::move(output);
+                    Post();
+                } else {
+                    const auto error = ValidateOutput(*output, num_dof_);
+                    if (!error.empty()) {
+                        Fail("published an invalid reference: " + error);
+                        return;
+                    }
+                    output_ = std::move(output);
                 }
-                output_ = std::move(output);
             }
             UpdateStats(planner->Stats(), playback);
             if (!releasing_) return;
@@ -532,7 +549,7 @@ private:
             status_.progress = 0.0F;
         } else {
             status_.reference_remaining_s = 0.0F;
-            status_.progress = playback.active ? UnitInterval(playback.progress) : 0.0F;
+            if (output_) status_.progress = playback.active ? UnitInterval(playback.progress) : 0.0F;
         }
     }
 
@@ -614,7 +631,7 @@ private:
         }
         const JobKind kind = job_kind_;
         job_kind_ = JobKind::NONE;
-        JobResult result = std::move(result_);
+        JobResult &result = result_;  // Retired buffers are destroyed by the next worker job.
         job_.cancelled.reset();
         stage_.store(kStageIdle, std::memory_order_release);
 
@@ -623,6 +640,16 @@ private:
         started_ = result.started;
         // Always reconcile the worker-owned slot, but never publish an old request's result.
         if (job_start_id_ != start_id_) return;
+        if (kind == JobKind::PREPARE) {
+            if (!running_) return;
+            if (!result.error.empty()) {
+                Fail(result.error);
+            } else {
+                output_ = result.output;
+                install_.swap(result.install);
+            }
+            return;
+        }
         if (!result.error.empty()) {
             const std::string name = kind == JobKind::LOAD
                 ? config_.planners[job_.index].name : status_.planner;
@@ -652,7 +679,8 @@ private:
         } else if (kind == JobKind::GENERATE && result.output) {
             start_pending_ = false;
             running_ = true;
-            output_ = std::move(result.output);
+            output_ = result.output;
+            install_.swap(result.install);
         }
     }
 
@@ -685,7 +713,10 @@ private:
             }
             return Phase::LOADING;
         }
-        if (running_) return releasing_ ? Phase::STOPPING : Phase::RUNNING;
+        if (running_) {
+            if (releasing_) return Phase::STOPPING;
+            return output_ ? Phase::RUNNING : Phase::WARMING;
+        }
         if (job_kind_ != JobKind::NONE) return Phase::STOPPING;
         if (loaded_ < 0) return Phase::IDLE;
         // A planner left started, or one that is not kept, is stopped by Advance().
@@ -766,7 +797,19 @@ private:
                     break;
                 case JobKind::GENERATE:
                     result.output = Generate(background);
+                    if (result.output && result.output->action.empty() && config_.prepare_trajectory) {
+                        result.install = config_.prepare_trajectory(result.output->trajectory);
+                    }
                     break;
+                case JobKind::PREPARE: {
+                    result.output = std::move(job_.publication);
+                    const auto error = ValidateOutput(*result.output, num_dof_);
+                    if (!error.empty()) throw std::runtime_error("published an invalid reference: " + error);
+                    if (config_.prepare_trajectory) {
+                        result.install = config_.prepare_trajectory(result.output->trajectory);
+                    }
+                    break;
+                }
                 case JobKind::STOP:
                     StopOwned(job_.destroy);
                     break;
@@ -779,7 +822,7 @@ private:
             result.error = "unknown error";
         }
         // A planner that failed to load, start or stop is not used again.
-        if (!result.error.empty() && job_.kind != JobKind::GENERATE) ReleaseOwned();
+        if (!result.error.empty() && job_.kind != JobKind::GENERATE && job_.kind != JobKind::PREPARE) ReleaseOwned();
         result.planner = owned_.get();
         result.loaded_index = owned_index_;
         result.started = owned_started_;
@@ -866,6 +909,7 @@ private:
         owned_.reset();
     }
 
+    InstallReference install_;
     HostConfig config_;
     int num_dof_ = 0;
 
@@ -937,6 +981,8 @@ void PlannerHost::Step(const robot_base::RobotData &robot,
 const std::shared_ptr<const PlannerOutput> &PlannerHost::Output() const {
     return impl_->Output();
 }
+
+const InstallReference &PlannerHost::PreparedReference() const { return impl_->PreparedReference(); }
 
 bool PlannerHost::OutputFinite() const { return impl_->OutputFinite(); }
 

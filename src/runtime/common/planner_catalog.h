@@ -54,7 +54,7 @@ inline std::vector<PlannerEntry> LoadPolicyPlanners(
     const std::string list = PolicyPlannerList(policy);
     const auto names = yaml.Read<std::vector<std::string>>(list);
     if (!names) {
-        if (yaml.Read<std::string>(list)) {
+        if (yaml.Contains(list)) {
             throw std::runtime_error("[runtime] " + list + " 必须是规划器名组成的列表");
         }
         return result;
@@ -91,7 +91,7 @@ inline PolicyCommandLimitMap LoadPlannerCommandLimits(const robot_base::YamlFile
     for (const auto &policy : yaml.Read<std::vector<std::string>>(
             "rl_policy.onnx_infer.policy_names").value_or(std::vector<std::string>{})) {
         for (const auto &planner : LoadPolicyPlanners(yaml, policy)) {
-            if (planner.limits.Enabled()) result.emplace(planner.name, planner.limits);
+            result.emplace(planner.name, planner.limits);
         }
     }
     return result;

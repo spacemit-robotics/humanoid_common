@@ -32,11 +32,17 @@ struct PlannerConfig {
     /// 加载并完成首次启动的预计耗时 (s)，只用于估计上报的准备进度；0 表示未知。
     /// 同一进程内完成过一次加载后改用实测值。
     double prepare_time_s = 0.0;
+    MotionCommand minimum_command;
+    MotionCommand maximum_command;
     PlannerContext context;
 };
 
+using InstallReference = std::function<void()>;
+
 /** @brief 一个跟踪策略可选用的规划器 */
 struct HostConfig {
+    // Worker converts the trajectory; the returned operation only swaps ready buffers on the tracker.
+    std::function<InstallReference(const ReferenceTrajectory &)> prepare_trajectory;
     std::vector<PlannerConfig> planners;
     std::string auto_start;  ///< 进入策略后自动启动的实时规划器；为空时等待操作端请求
     std::map<std::string, robot_base::EnvironmentSet> action_environments;
@@ -99,6 +105,7 @@ public:
 
     /** @brief 当前发布来自离线规划器：只播放一遍，起播时刻由跟踪策略决定。 */
     bool OutputFinite() const;
+    const InstallReference &PreparedReference() const;
 
     /** @brief 规划器正在准备、运行或交还参考；期间跟踪策略不接受交互动作。 */
     bool Engaged() const;

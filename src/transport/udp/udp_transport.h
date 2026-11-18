@@ -39,6 +39,7 @@ struct UdpConfig {
     Role role = Role::SERVER;  ///< 通信角色
 
     int timeout_ms = 10;  ///< 接收超时（毫秒）
+    bool reuse_address = true;
 };
 
 /**

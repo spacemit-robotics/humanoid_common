@@ -17,6 +17,117 @@
 #include "service.h"
 
 namespace {
+void TestRobotFeedback() {
+    using namespace operator_service;  // NOLINT(build/namespaces)
+    Config config;
+    config.token = "feedback-test";
+    config.joint_names = {"joint_a", "joint_b"};
+    config.feedback_frame_id = "base_link";
+    Service service(config);
+    const auto observer = service.Open();
+    uint64_t id = 0;
+    const auto call = [&](const std::string &op, const Json &args = Json::object()) {
+        return service.Handle(observer, {{"v", 1}, {"id", ++id}, {"op", op}, {"args", args}});
+    };
+    assert(!call("subscribe_robot_feedback").at("ok"));
+    assert(call("hello", {{"token", config.token}}).at("ok"));
+    assert(call("subscribe_robot_feedback").at("ok") && service.FeedbackSubscribed(observer));
+    assert(!service.FeedbackSnapshot().available && service.Snapshot(observer).owner.empty());
+    robot_base::ControlStatus status;
+    status.hmi_connected = true;
+    robot_base::RobotFeedback sample;
+    sample.available = true;
+    sample.fresh = true;
+    sample.stream_id = static_cast<uint64_t>(UnixTimeSeconds() * 1.0e6) - 1000000;
+    sample.packet_sequence = 102;
+    sample.sequence = 11;
+    sample.num_dof = 2;
+    sample.source_time_s = 25;
+    sample.has_joint_effort = sample.has_base_imu = sample.has_acceleration = true;
+    sample.received_at_unix_s = std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    sample.joint_pos[1] = 0.5;
+    sample.joint_vel[1] = 0.1;
+    sample.joint_torque[1] = 0.2;
+    sample.acceleration[2] = 9.81;
+    service.UpdateFeedback(sample);
+    service.UpdateStatus(status, {});
+    service.UpdateStatus(status, {});
+    const auto feedback = DecodeRobotFeedback(Encode(service.FeedbackSnapshot()));
+    assert(feedback.available && feedback.fresh && feedback.sequence == 11 &&
+        feedback.stream_id == sample.stream_id);
+    assert(feedback.joint_names == config.joint_names && feedback.joint_positions.size() == 2);
+    assert(feedback.joint_positions[1] == 0.5 && feedback.joint_velocities[1] == 0.1);
+    assert(feedback.joint_efforts[1] == 0.2 && feedback.acceleration[2] == 9.81);
+    assert(feedback.orientation[0] == 1 && feedback.frame_id == "base_link");
+    assert(feedback.source_time_s == 25 && feedback.received_at_unix_s == sample.received_at_unix_s);
+    assert(service.Snapshot(observer).owner.empty() && service.Command().key == 0);
+    assert(!Encode(service.Snapshot()).contains("joint_positions"));
+    auto late = sample;
+    late.packet_sequence = 101;
+    late.sequence = 10;
+    late.joint_pos[1] = 2.5;
+    service.UpdateFeedback(late);
+    service.UpdateFeedback({});  // Invalid transport frames do not erase the last good sample.
+    assert(service.FeedbackSnapshot().sequence == 11 && service.FeedbackSnapshot().joint_positions[1] == 0.5);
+    sample.stream_id += 1000;
+    sample.packet_sequence = 1;
+    sample.sequence = 1;
+    sample.source_time_s = 0.01;
+    service.UpdateFeedback(sample);
+    service.UpdateFeedback(late);
+    assert(service.FeedbackSnapshot().stream_id == sample.stream_id && service.FeedbackSnapshot().sequence == 1);
+    assert(service.FeedbackSnapshot().fresh);
+    auto fault_sample = sample;
+    fault_sample.packet_sequence++;
+    fault_sample.fresh = false;
+    service.UpdateFeedback(fault_sample);
+    service.UpdateFeedback(sample);  // An old healthy publication cannot undo a new fault.
+    assert(!service.FeedbackSnapshot().fresh && service.Snapshot(observer).online);
+    sample.packet_sequence = fault_sample.packet_sequence + 1;
+    sample.sequence++;
+    sample.has_joint_effort = sample.has_base_imu = sample.has_acceleration = false;
+    sample.received_at_unix_s -= config.status_timeout + 1;
+    service.UpdateFeedback(sample);
+    const auto delayed = service.FeedbackSnapshot();
+    assert(!delayed.fresh && delayed.joint_efforts.empty() && !delayed.has_base_imu && !delayed.has_acceleration);
+    assert(Encode(delayed).at("orientation").is_null() && Encode(delayed).at("acceleration").is_null());
+    sample.received_at_unix_s = feedback.received_at_unix_s;
+    sample.age_s = config.status_timeout + 1;
+    ++sample.packet_sequence;
+    service.UpdateFeedback(sample);
+    assert(service.FeedbackSnapshot().available && !service.FeedbackSnapshot().fresh);
+    sample.age_s = 0;
+    ++sample.packet_sequence;
+    service.UpdateFeedback(sample);
+    assert(!service.FeedbackSnapshot().fresh);
+    sample.num_dof = 3;
+    ++sample.packet_sequence;
+    service.UpdateFeedback(sample);
+    assert(!service.FeedbackSnapshot().available);
+    Service wrap(config);
+    sample.num_dof = 2;
+    sample.packet_sequence = UINT32_MAX;
+    wrap.UpdateFeedback(sample);
+    sample.packet_sequence = 0;
+    ++sample.sequence;
+    wrap.UpdateFeedback(sample);
+    assert(wrap.FeedbackSnapshot().sequence == sample.sequence);
+    assert(call("subscribe_robot_feedback", {{"enabled", false}}).at("ok"));
+    assert(!service.FeedbackSubscribed(observer));
+    service.Disconnect(observer);
+    assert(!service.FeedbackSubscribed(observer));
+    for (const auto &names : {std::vector<std::string>{}, std::vector<std::string>{"a", "a"}}) {
+        config.joint_names = names;
+        Service invalid(config);
+        const auto session = invalid.Open();
+        assert(invalid.Handle(session, {{"v", 1}, {"id", 1U}, {"op", "hello"},
+            {"args", {{"token", config.token}}}}).at("ok"));
+        assert(invalid.Handle(session, {{"v", 1}, {"id", 2U}, {"op", "subscribe_robot_feedback"},
+            {"args", Json::object()}}).at("code") == "unavailable");
+    }
+}
+
 void TestTeleop() {
     using namespace operator_service;  // NOLINT(build/namespaces)
     Config config;
@@ -285,6 +396,7 @@ void TestTrajectory() {
 } // namespace
 
 int main(int argc, char **argv) {
+    TestRobotFeedback();
     TestTeleop();
     TestAdministrator();
     TestTrajectory();

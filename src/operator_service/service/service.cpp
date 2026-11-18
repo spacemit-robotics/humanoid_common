@@ -192,6 +192,9 @@ Config LoadConfig(const std::string &path) {
     c.web_root =
         configured_web.value_or(std::filesystem::exists(installed + "/index.html") ? installed : OPERATOR_WEB_ROOT);
     c.heartbeat_hz = yaml.Read<double>("hmi.command_heartbeat_hz").value_or(20);
+    c.joint_names = yaml.Read<std::vector<std::string>>("robot_base.joint_names")
+        .value_or(std::vector<std::string>{});
+    c.feedback_frame_id = yaml.Read<std::string>("operator_service.feedback.frame_id").value_or("");
     c.status_timeout = yaml.Read<double>("hmi.status_timeout").value_or(0.6);
     c.request_timeout = yaml.Read<double>("hmi.request_timeout").value_or(15);
     c.lease_ms = yaml.Read<int>("operator_service.lease_ms").value_or(1000);
@@ -455,6 +458,64 @@ void Service::UpdateStatus(const robot_base::ControlStatus &status, const robot_
         Finish("rejected", fault.detail);
 }
 robot_base::Command Service::Command() const { return command_; }
+void Service::UpdateFeedback(const robot_base::RobotFeedback &sample) {
+    if (sample.stream_id == 0) return;
+    const double now = Now();
+    const double unix_now = UnixTimeSeconds();
+    const double transit_age = unix_now - sample.received_at_unix_s;
+    const bool same_stream = sample.stream_id == feedback_.stream_id;
+    if (same_stream) {
+        const uint32_t advance = sample.packet_sequence - feedback_.packet_sequence;
+        if (advance == 0 || advance >= (1U << 31)) return;
+    } else {
+        if (sample.stream_id / 1.0e6 > unix_now) return;
+        // If the wall clock stepped back across a restart, wait for the old stream
+        // to expire and require a current sample before accepting the lower ID.
+        if (sample.stream_id < feedback_.stream_id &&
+            (feedback_.stream_id / 1.0e6 <= unix_now || now - feedback_at_ <= config_.status_timeout ||
+                !sample.available || !sample.fresh || transit_age < 0 ||
+                std::max(sample.age_s, transit_age) > config_.status_timeout)) return;
+    }
+    const bool same_sample = same_stream && sample.available && feedback_.available &&
+        sample.sequence == feedback_.sequence;
+    const double previous_age = same_sample ? feedback_.age_s + std::max(0.0, now - feedback_at_) : 0.0;
+    feedback_ = sample;
+    if (sample.available)
+        feedback_.age_s = std::max({sample.age_s, transit_age, previous_age});
+    feedback_at_ = now;
+}
+RobotFeedback Service::FeedbackSnapshot() const {
+    RobotFeedback result;
+    result.frame_id = config_.feedback_frame_id;
+    result.stale_after_ms = config_.status_timeout * 1000;
+    const auto &sample = feedback_;
+    result.stream_id = sample.stream_id;
+    if (!sample.available || sample.num_dof <= 0 || sample.num_dof > static_cast<int>(sample.kMaxJoints) ||
+        config_.joint_names.size() != static_cast<std::size_t>(sample.num_dof)) return result;
+    result.available = true;
+    result.sequence = sample.sequence;
+    result.source_time_s = sample.source_time_s;
+    result.received_at_unix_s = sample.received_at_unix_s;
+    result.age_ms = (sample.age_s + std::max(0.0, Now() - feedback_at_)) * 1000;
+    result.fresh = sample.fresh && Online() && result.age_ms <= result.stale_after_ms;
+    result.joint_names = config_.joint_names;
+    result.joint_positions.assign(sample.joint_pos.begin(), sample.joint_pos.begin() + sample.num_dof);
+    result.joint_velocities.assign(sample.joint_vel.begin(), sample.joint_vel.begin() + sample.num_dof);
+    if (fault_.active && fault_.code == robot_base::FaultCode::STATE_TIMEOUT) result.fresh = false;
+    AccountForTransit(&result);
+    if (sample.has_joint_effort)
+        result.joint_efforts.assign(sample.joint_torque.begin(), sample.joint_torque.begin() + sample.num_dof);
+    result.has_base_imu = sample.has_base_imu;
+    result.has_acceleration = sample.has_acceleration;
+    result.orientation = sample.orientation;
+    result.angular_velocity = sample.angular_velocity;
+    result.acceleration = sample.acceleration;
+    return result;
+}
+bool Service::FeedbackSubscribed(uint64_t session) const {
+    const auto it = sessions_.find(session);
+    return it != sessions_.end() && it->second.authenticated && it->second.feedback_subscribed;
+}
 Status Service::Snapshot(uint64_t session) const {
     Status s;
     s.online = Online();
@@ -546,6 +607,19 @@ Json Service::Handle(uint64_t session, const Json &request) {
                 id, true, "ok", "authenticated", {{"catalog", Catalog()}, {"status", StatusMessage(session)}});
         }
         if (!it->second.authenticated) return fail("unauthorized", "authenticate first");
+        if (op == "subscribe_robot_feedback") {
+            const bool enabled = args.value("enabled", true);
+            if (enabled) {
+                auto names = config_.joint_names;
+                std::sort(names.begin(), names.end());
+                if (names.empty() || names.front().empty() ||
+                    names.size() > robot_base::RobotFeedback::kMaxJoints ||
+                    std::adjacent_find(names.begin(), names.end()) != names.end())
+                    return fail("unavailable", "robot_base.joint_names must contain unique joint names");
+            }
+            it->second.feedback_subscribed = enabled;
+            return ReplyTo(id, true, "ok", "", {{"enabled", enabled}});
+        }
         if (op == "client_event") {
             const auto event = args.value("event", "");
             auto detail = args.value("detail", "");

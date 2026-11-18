@@ -45,6 +45,10 @@ public:
     bool Read(void* data, std::size_t max_len, std::size_t& actual_len);
     void Close();
     bool IsOpen() const { return shm_ptr_ != nullptr; }
+    bool IsLinked() const {
+        struct stat status {};
+        return shm_fd_ >= 0 && fstat(shm_fd_, &status) == 0 && status.st_nlink > 0;
+    }
 
 private:
     ShmConfig cfg_;
@@ -244,6 +248,9 @@ void Shm::Close() {
 }
 bool Shm::IsOpen() const {
     return impl_->IsOpen();
+}
+bool Shm::IsLinked() const {
+    return impl_->IsLinked();
 }
 
 }  // namespace transport_shm

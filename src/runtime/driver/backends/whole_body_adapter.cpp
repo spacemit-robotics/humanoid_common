@@ -70,6 +70,10 @@ bool ConvertWholeBodyState(
     if (destination->num_dof != static_cast<int>(source.num_dof) || !destination->IsValid())
         *destination = robot_base::RobotData::Create(source.num_dof);
     auto &result = *destination;
+    result.has_joint_feedback = true;
+    result.has_base_imu = imu_configured;
+    result.has_acceleration = imu_configured;
+    result.has_joint_effort = true;
     result.base_pos = {};
     result.base_vel = {};
     for (size_t i = 0; i < source.num_dof; ++i) {

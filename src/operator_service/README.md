@@ -209,6 +209,7 @@ WebSocket 路径 `/api/v1/ws`；JSON UTF-8 文本，版本 `v: 1`。建立连接
 | --- | --- | --- |
 | acquire / renew / release | `{}` | 申请、续租、释放控制权 |
 | status / catalog / pairing | `{}` | 当前状态、能力目录、固定入口二维码 |
+| subscribe_robot_feedback | `{"enabled":true}` | 订阅只读关节与 IMU 反馈；false 取消订阅，不申请控制权 |
 | admin_login / admin_logout | `{"password":"..."}` / `{}` | 验证管理员密码、退出管理并释放本会话控制权 |
 | state | `{"state":"ZERO"}` | 请求状态切换，返回请求序号 |
 | policy | `{"policy":"name"}` | 请求切换策略 |
@@ -229,6 +230,41 @@ WebSocket 路径 `/api/v1/ws`；JSON UTF-8 文本，版本 `v: 1`。建立连接
 control 确认状态或接受动作请求，不代表整个动作播放结束；播放状态见 `interaction`。
 `reference_start` 现有内部协议无独立开始确认，返回 `sent`，不伪造完成回执。
 一次只能有一个待确认的状态、策略或动作请求；速度、续租和安全停止不被它阻塞。
+
+### 只读机器人反馈
+
+导航或监视客户端认证后可订阅 `event: "robot_feedback"`，无需申请控制权。配置
+`robot_base.joint_names` 时，名称和顺序须与 driver 的关节反馈一致，不可重复。
+使用 UDP 时还需设置 [反馈端口](../transport/README.md)。
+
+连接后调用一次 `client.SubscribeRobotFeedback()`，检查返回的 `ok`。首帧异步到达，
+在客户端定时回调中读取快照，例如：
+
+```cpp
+std::pair<uint64_t, uint64_t> last_frame{};
+auto poll_feedback = [&] {
+    const auto feedback = client.LatestRobotFeedback();
+    const auto frame = std::make_pair(feedback.stream_id, feedback.sequence);
+    if (!feedback.available || !feedback.fresh || frame == last_frame) return;
+    PublishJointState(feedback);  // 由调用方提供。
+    last_frame = frame;
+};
+```
+
+重连后重新订阅，并清空客户端的去重记录。JSON 事件的 `data` 字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `available` / `fresh` | 是否有反馈 / 是否仍可作为当前测量使用 |
+| `stream_id` / `sequence` | driver 发布会话编号 / 会话内的样本序号；用两者一起去重 |
+| `joint_names` / `joint_positions` / `joint_velocities` / `joint_efforts` | 同序的关节名、位置（rad）、速度（rad/s）、力矩（N·m）；未提供力矩时为空数组 |
+| `orientation` / `angular_velocity` / `acceleration` | 基座姿态四元数（wxyz）、角速度（rad/s）、加速度（m/s²）；遵循 driver 的坐标约定。缺失值为 JSON `null`，C++ 用 `has_base_imu` 和 `has_acceleration` 判断 |
+| `frame_id` | `operator_service.feedback.frame_id` 所配置的基座坐标系，默认留空 |
+| `source_time_s` / `received_at_unix_s` | driver 的源时间 / driver 首次收到该样本的系统时间，均以秒计。源时间可能是仿真时间或设备时间 |
+| `age_ms` / `stale_after_ms` | 反馈年龄 / 过期阈值（取 `hmi.status_timeout`，换算为毫秒） |
+
+跨机使用时须同步 driver、HMI 和客户端的系统时钟。只用 `available` 和 `fresh` 均为真的
+样本更新 TF；基座世界位置和 `map/odom` 由定位模块提供。
 
 ## 验证与兼容
 

@@ -51,6 +51,7 @@ enum class MsgType : uint16_t {
     ROBOT_STATE = 2,  ///< 机器人状态
     CONTROL_CMD = 3,  ///< 控制命令
     CONTROL_STATUS = 4,  ///< Control → HMI 运行状态
+    ROBOT_FEEDBACK = 5,  ///< Driver → HMI 只读反馈
 };
 
 // ==================== 数据包定义 ====================
@@ -145,9 +146,31 @@ struct PolicySwitchPacket {
     char detail[kFaultDetailLength] = {};
 };
 
-/**
- * @brief Control → HMI 运行状态数据包
- */
+struct RobotFeedbackJoint {
+    double position = 0;
+    double velocity = 0;
+    double effort = 0;
+};
+
+/** @brief Feedback uses fixed SHM slots and a per-joint prefix over UDP. */
+struct RobotFeedbackPacket {
+    PacketHeader header{};
+    uint64_t stream_id = 0;
+    uint8_t has_base_imu = 0, has_acceleration = 0, has_joint_effort = 0;
+    uint8_t available = 0;
+    uint8_t fresh = 0;
+    uint64_t sequence = 0;
+    int32_t num_dof = 0;
+    double source_time_s = 0;
+    double received_at_unix_s = 0;
+    double age_s = 0;
+    double orientation[4] = {1, 0, 0, 0};
+    double angular_velocity[3] = {};
+    double acceleration[3] = {};
+    RobotFeedbackJoint joints[kMaxDof]{};
+};
+
+/** @brief Control → HMI 运行状态数据包 */
 struct ControlStatusPacket {
     PacketHeader header{};
     int8_t control_mode = 0;
@@ -169,6 +192,14 @@ struct ControlStatusPacket {
 };
 
 #pragma pack(pop)
+
+static_assert(sizeof(ControlStatusPacket) == 592, "Keep the v7 heartbeat wire layout");
+static_assert(kMaxDof == robot_base::RobotFeedback::kMaxJoints, "Feedback joint capacity must match");
+
+inline std::size_t FeedbackPacketSize(int num_dof) {
+    if (num_dof < 0 || num_dof > kMaxDof) return 0;
+    return offsetof(RobotFeedbackPacket, joints) + num_dof * sizeof(RobotFeedbackJoint);
+}
 
 // ==================== 工具函数 ====================
 
@@ -201,6 +232,77 @@ inline bool AllFinite(const std::array<T, Size> &values) {
     return std::all_of(values.begin(), values.end(), [](T value) {
         return std::isfinite(static_cast<double>(value));
     });
+}
+
+inline bool CanEncodeFeedback(const robot_base::RobotFeedback &value) {
+    if (!value.available) return !value.fresh;
+    if (value.num_dof <= 0 || value.num_dof > kMaxDof || value.sequence == 0 ||
+        !std::isfinite(value.source_time_s) || value.source_time_s < 0 ||
+        !std::isfinite(value.received_at_unix_s) || value.received_at_unix_s < 0 ||
+        !std::isfinite(value.age_s) || value.age_s < 0 ||
+        !AllFinite(value.orientation) || !AllFinite(value.angular_velocity) ||
+        !AllFinite(value.acceleration)) return false;
+    for (int i = 0; i < value.num_dof; ++i) {
+        if (!std::isfinite(value.joint_pos[i]) || !std::isfinite(value.joint_vel[i]) ||
+            !std::isfinite(value.joint_torque[i])) return false;
+    }
+    double norm = 0;
+    for (const auto component : value.orientation) norm += component * component;
+    return std::isfinite(norm) && norm > 1e-12;
+}
+
+inline void EncodeFeedback(const robot_base::RobotFeedback &value, RobotFeedbackPacket *packet) {
+    *packet = {};
+    packet->header.type = static_cast<uint16_t>(MsgType::ROBOT_FEEDBACK);
+    packet->header.seq = value.packet_sequence;
+    packet->stream_id = value.stream_id;
+    if (!value.available || !CanEncodeFeedback(value)) return;
+    packet->has_base_imu = value.has_base_imu;
+    packet->has_acceleration = value.has_acceleration;
+    packet->has_joint_effort = value.has_joint_effort;
+    packet->available = 1;
+    packet->fresh = value.fresh ? 1 : 0;
+    packet->sequence = value.sequence;
+    packet->num_dof = value.num_dof;
+    packet->source_time_s = value.source_time_s;
+    packet->received_at_unix_s = value.received_at_unix_s;
+    packet->age_s = value.age_s;
+    for (int i = 0; i < value.num_dof; ++i)
+        packet->joints[i] = {value.joint_pos[i], value.joint_vel[i], value.joint_torque[i]};
+    std::memcpy(packet->orientation, value.orientation.data(), sizeof(packet->orientation));
+    std::memcpy(packet->angular_velocity, value.angular_velocity.data(), sizeof(packet->angular_velocity));
+    std::memcpy(packet->acceleration, value.acceleration.data(), sizeof(packet->acceleration));
+}
+
+inline robot_base::RobotFeedback DecodeFeedback(const RobotFeedbackPacket &packet) {
+    robot_base::RobotFeedback value;
+    if (!ValidHeader(packet.header, MsgType::ROBOT_FEEDBACK) || packet.stream_id == 0 ||
+        packet.available > 1 || packet.fresh > 1 || packet.num_dof < 0 || packet.num_dof > kMaxDof ||
+        packet.has_base_imu > 1 || packet.has_acceleration > 1 || packet.has_joint_effort > 1) return value;
+    if (!packet.available && (packet.fresh || packet.num_dof != 0)) return value;
+    if (packet.available && packet.num_dof == 0) return value;
+    value.stream_id = packet.stream_id;
+    value.packet_sequence = packet.header.seq;
+    if (!packet.available) return value;
+    value.has_base_imu = packet.has_base_imu;
+    value.has_acceleration = packet.has_acceleration;
+    value.has_joint_effort = packet.has_joint_effort;
+    value.available = true;
+    value.fresh = packet.fresh != 0;
+    value.sequence = packet.sequence;
+    value.num_dof = packet.num_dof;
+    value.source_time_s = packet.source_time_s;
+    value.received_at_unix_s = packet.received_at_unix_s;
+    value.age_s = packet.age_s;
+    for (int i = 0; i < value.num_dof; ++i) {
+        value.joint_pos[i] = packet.joints[i].position;
+        value.joint_vel[i] = packet.joints[i].velocity;
+        value.joint_torque[i] = packet.joints[i].effort;
+    }
+    std::memcpy(value.orientation.data(), packet.orientation, sizeof(packet.orientation));
+    std::memcpy(value.angular_velocity.data(), packet.angular_velocity, sizeof(packet.angular_velocity));
+    std::memcpy(value.acceleration.data(), packet.acceleration, sizeof(packet.acceleration));
+    return CanEncodeFeedback(value) ? value : robot_base::RobotFeedback{};
 }
 
 inline bool AllFinite(const std::vector<double> &values) {

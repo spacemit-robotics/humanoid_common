@@ -5,6 +5,9 @@
  * @brief Operator message serialization
  */
 #include "protocol.h"
+
+#include <algorithm>
+#include <chrono>
 namespace operator_service {
 namespace {
 Velocity ReadVelocity(const Json &v) { return {v.value("vx", 0.0), v.value("vy", 0.0), v.value("wz", 0.0)}; }
@@ -43,6 +46,51 @@ Json Encode(const Status &s) {
         {"fault",
             {{"active", f.active}, {"latched", f.latched}, {"sequence", f.sequence}, {"source", f.source},
                 {"code", f.code}, {"detail", f.detail}}}};
+}
+Json Encode(const RobotFeedback &s) {
+    return {{"available", s.available}, {"fresh", s.fresh}, {"sequence", s.sequence},
+        {"stream_id", s.stream_id},
+        {"source_time_s", s.source_time_s}, {"received_at_unix_s", s.received_at_unix_s},
+        {"age_ms", s.age_ms}, {"stale_after_ms", s.stale_after_ms}, {"frame_id", s.frame_id},
+        {"joint_names", s.joint_names}, {"joint_positions", s.joint_positions},
+        {"joint_velocities", s.joint_velocities}, {"joint_efforts", s.joint_efforts},
+        {"orientation", s.has_base_imu ? Json(s.orientation) : Json(nullptr)},
+        {"angular_velocity", s.has_base_imu ? Json(s.angular_velocity) : Json(nullptr)},
+        {"acceleration", s.has_acceleration ? Json(s.acceleration) : Json(nullptr)}};
+}
+double UnixTimeSeconds() {
+    return std::chrono::duration<double>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+void AccountForTransit(RobotFeedback *sample) {
+    const double elapsed = (UnixTimeSeconds() - sample->received_at_unix_s) * 1000.0;
+    if (elapsed < 0 || sample->received_at_unix_s <= 0) sample->fresh = false;
+    sample->age_ms = std::max(sample->age_ms, elapsed);
+    if (sample->age_ms > sample->stale_after_ms) sample->fresh = false;
+}
+RobotFeedback DecodeRobotFeedback(const Json &v) {
+    RobotFeedback s;
+    s.available = v.at("available");
+    s.fresh = v.at("fresh");
+    s.stream_id = v.at("stream_id");
+    s.sequence = v.at("sequence");
+    s.source_time_s = v.at("source_time_s");
+    s.received_at_unix_s = v.at("received_at_unix_s");
+    s.age_ms = v.at("age_ms");
+    s.stale_after_ms = v.at("stale_after_ms");
+    s.frame_id = v.at("frame_id");
+    s.joint_names = v.at("joint_names").get<std::vector<std::string>>();
+    s.joint_positions = v.at("joint_positions").get<std::vector<double>>();
+    s.joint_velocities = v.at("joint_velocities").get<std::vector<double>>();
+    s.joint_efforts = v.at("joint_efforts").get<std::vector<double>>();
+    s.has_base_imu = !v.at("orientation").is_null() && !v.at("angular_velocity").is_null();
+    if (s.has_base_imu) {
+        s.orientation = v.at("orientation").get<std::array<double, 4>>();
+        s.angular_velocity = v.at("angular_velocity").get<std::array<double, 3>>();
+    }
+    s.has_acceleration = !v.at("acceleration").is_null();
+    if (s.has_acceleration) s.acceleration = v.at("acceleration").get<std::array<double, 3>>();
+    return s;
 }
 Status DecodeStatus(const Json &v) {
     Status s;

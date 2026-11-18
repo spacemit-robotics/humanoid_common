@@ -23,6 +23,10 @@ public:
     bool Connected() const;
     std::string LastError() const;
     Status LatestStatus() const;
+    // Requires authentication, not a control lease. Re-subscribe after reconnecting.
+    Reply SubscribeRobotFeedback(bool enabled = true);
+    // Thread-safe snapshot; fresh becomes false on timeout, unsubscribe or disconnect.
+    RobotFeedback LatestRobotFeedback() const;
     std::vector<Policy> Policies() const;
     std::vector<Action> Actions() const;
     std::string RobotName() const;

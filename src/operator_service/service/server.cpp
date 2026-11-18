@@ -22,6 +22,7 @@
 #include <filesystem> // NOLINT(build/c++17): this module requires C++17.
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -160,6 +161,7 @@ public:
     ~Session();
     void Start();
     void Send(const Json &message, bool status = false);
+    void SendFeedback(const std::string &message);
     void Stop();
     uint64_t Id() const { return id_; }
     bool AuthenticationExpired() const { return std::chrono::steady_clock::now() - created_ > std::chrono::seconds(5); }
@@ -175,7 +177,11 @@ private:
     beast::flat_buffer buffer_;
     http::request<http::string_body> request_;
     http::request_parser<http::string_body> parser_;
-    std::deque<std::string> writes_;
+    struct Outgoing {
+        std::string message;
+        bool feedback;
+    };
+    std::deque<Outgoing> writes_;
     uint64_t id_ = 0;
     bool stopped_ = false;
     int request_count_ = 0;
@@ -218,6 +224,8 @@ public:
         robot_base::ControlStatus status;
         robot_base::FaultStatus fault;
         for (int i = 0; i < 32 && transport->RecvStatusV2(status, fault); ++i) service.UpdateStatus(status, fault);
+        robot_base::RobotFeedback feedback;
+        for (int i = 0; i < 32 && transport->RecvFeedback(feedback); ++i) service.UpdateFeedback(feedback);
         service.Tick();
         const bool sent = transport->SendCommandV2(service.Command(), service.AcknowledgeSequence());
         if (sent) service.MarkCommandSent();
@@ -230,6 +238,7 @@ public:
         const auto now = std::chrono::steady_clock::now();
         const bool publish = now - last_publish >= std::chrono::milliseconds(100);
         if (publish) last_publish = now;
+        std::optional<std::string> feedback_message;
         for (auto it = sessions.begin(); it != sessions.end();) {
             const auto session = it->lock();
             if (!session) {
@@ -240,6 +249,11 @@ public:
                 if (publish)
                     session->Send(
                         {{"v", 1}, {"event", "status"}, {"data", service.StatusMessage(session->Id())}}, true);
+                if (service.FeedbackSubscribed(session->Id())) {
+                    if (!feedback_message) feedback_message =
+                        Json{{"v", 1}, {"event", "robot_feedback"}, {"data", Encode(service.FeedbackSnapshot())}}.dump();
+                    session->SendFeedback(*feedback_message);
+                }
             } else if (session->AuthenticationExpired()) session->Stop();
             ++it;
         }
@@ -448,19 +462,27 @@ void Session::ReadWs() {
     });
 }
 void Session::Send(const Json &message, bool status) {
-    if (stopped_ || (status && writes_.size() >= 2)) return;
+    if (stopped_) return;
+    if (writes_.size() > 1 && writes_.back().feedback) writes_.pop_back();
+    if (status && writes_.size() >= 2) return;
     if (writes_.size() >= 16) {
         Stop();
         return;
     }
     const bool idle = writes_.empty();
-    writes_.push_back(message.dump());
+    writes_.push_back({message.dump(), false});
+    if (idle) Write();
+}
+void Session::SendFeedback(const std::string &message) {
+    if (stopped_ || writes_.size() >= 2) return;
+    const bool idle = writes_.empty();
+    writes_.push_back({message, true});
     if (idle) Write();
 }
 void Session::Write() {
     socket_->text(true);
     socket_->async_write(
-        net::buffer(writes_.front()), [self = shared_from_this()](boost::system::error_code ec, size_t) {
+        net::buffer(writes_.front().message), [self = shared_from_this()](boost::system::error_code ec, size_t) {
             if (ec) {
                 self->Stop();
                 return;

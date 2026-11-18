@@ -74,6 +74,7 @@ transport:
     control_port: 8801
     hmi_port: 8802
     status_port: 8803
+    feedback_port: 8804  # 可选，未配置或为 0 时禁用 UDP 反馈
 
   shm:
     prefix: "robot1"
@@ -82,7 +83,10 @@ transport:
 ```
 
 切换传输方式只需修改 `type` 字段，应用代码无需任何改动。
-SHM 会建立 `state`、`control`、`hmi`、`status` 四个独立通道。
+SHM 的控制通道为 `state`、`control`、`hmi`、`status`。
+关节和 IMU 反馈从 driver 发往 HMI，SHM 通道名为 `/hmrs_<prefix>_feedback`。
+使用 UDP 时，在两端配置 `transport.udp.feedback_port`，driver 向
+`hmi_ip:feedback_port` 发布反馈。该端口须与其他 UDP 通道的端口不同。
 
 ### 传输方式对比
 

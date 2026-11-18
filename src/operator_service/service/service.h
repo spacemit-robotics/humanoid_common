@@ -46,6 +46,8 @@ struct Config {
     std::vector<Policy> policies;
     bool trajectory_enabled = false;
     std::vector<Action> actions;
+    std::vector<std::string> joint_names;
+    std::string feedback_frame_id;
 };
 Config LoadConfig(const std::string &path);
 std::string DefaultConnectionFile(const std::string &robot);
@@ -59,9 +61,12 @@ public:
     void Disconnect(uint64_t session);
     Json Handle(uint64_t session, const Json &request);
     void Tick();
+    void UpdateFeedback(const robot_base::RobotFeedback &sample);
     void UpdateStatus(const robot_base::ControlStatus &status, const robot_base::FaultStatus &fault);
     Status Snapshot(uint64_t session = 0) const;
     Json StatusMessage(uint64_t session) const;
+    RobotFeedback FeedbackSnapshot() const;
+    bool FeedbackSubscribed(uint64_t session) const;
     Json Catalog() const;
     robot_base::Command Command() const;
     void MarkCommandSent() { command_sent_ = true; }
@@ -73,6 +78,7 @@ private:
     struct Session {
         bool authenticated = false;
         bool admin = false;
+        bool feedback_subscribed = false;
         std::string login_error;
         std::string name;
         uint64_t last_id = 0;
@@ -102,6 +108,8 @@ private:
     double request_until_ = 0;
     double reference_until_ = 0;
     robot_base::ControlStatus status_;
+    robot_base::RobotFeedback feedback_;
+    double feedback_at_ = 0;
     robot_base::FaultStatus fault_;
     robot_base::Command command_;
     uint64_t acknowledge_sequence_ = 0;

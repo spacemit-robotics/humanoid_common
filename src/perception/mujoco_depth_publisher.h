@@ -6,10 +6,11 @@
 
 #include <memory>
 #include <string>
+#include "sim_depth.h"
 namespace perception {
 class MujocoDepthPublisher {
     public:
-    explicit MujocoDepthPublisher(std::string endpoint);
+    explicit MujocoDepthPublisher(std::string endpoint, const SimDepthConfig &config = {});
     ~MujocoDepthPublisher();
     void Observe(double time, const void *model, const void *data);
 

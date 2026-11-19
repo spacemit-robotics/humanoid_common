@@ -20,6 +20,8 @@
 - SHM / UDP 两种通信后端（同机 / 跨机均可）
 - `driver_runtime` 通过 YAML 选择 MuJoCo 或 `whole_body` backend
 - HMI 常驻服务与独立终端客户端；实机支持网页、Android 和本机手柄接入
+- 策略、动作和规划器可按运行环境（仿真 / 实机）分别启用
+- 跟踪类策略（SONIC、SuperMimic）的参考动作规划器框架：机型 YAML 登记，操作端启动和停止
 - 可选离线音频播报，以及运行日志和故障前后数据采集
 - x86_64 与 riscv64（K3 板卡）双平台编译
 
@@ -222,6 +224,11 @@ backend 生命周期；MuJoCo 与整机硬件细节分别封装在私有 adapter
 按全零处理。SHM/UDP 使用同一版二进制协议，协议版本不匹配会拒绝数据包，
 不会静默按旧布局解析。
 
+每个 backend 在 `RobotData.environment` 中上报所处的运行环境：MuJoCo 为仿真，
+`whole_body` 为实机。control 把它随 `ControlStatus` 回传给操作服务，并据此执行
+策略、动作和规划器的 `enabled_in` 限制，见
+[运行环境与可用策略](#运行环境与可用策略)。
+
 driver 通过 `TransportBaseV2` 在机器人状态旁路发送硬件或仿真 backend 故障。control 会锁存
 driver、传输、安全监控和策略故障，阻止重新上电并通过 v2 状态旁路回传给 HMI；故障
 条件消失后，仍需先回到 `POWER_OFF`，再在 HMI 按 `x` 确认。活动故障不能确认，同一
@@ -244,7 +251,7 @@ POWER_OFF，不转发 HMI 上电命令，也不启动运行期 `driver_state_tim
 ### Runtime 日志
 
 日志落盘实现是 common 内部能力，不额外扩展对外数据接口；上节所述结构化故障由
-`TransportBaseV2` 在 SHM/UDP v7 协议中与原有数据并行传递。
+`TransportBaseV2` 在 SHM/UDP v8 协议中与原有数据并行传递。
 机型 YAML 可按需启用：
 
 ```yaml
@@ -458,11 +465,79 @@ HMI 只接受匹配当前请求的结果，同名策略重试使用新序号。
 前置策略已准备时可以返回 READY，此时实际运行策略名仍由 `active_policy` 表示，
 不把“已选择目标动作”混同于“目标动作已开始”。
 
-固定布局协议版本为 v7，`Command / ControlStatus` 的 C++ 布局包含策略切换状态。
+固定布局协议版本为 v8，`Command / ControlStatus` 的 C++ 布局包含策略切换状态、
+运行环境以及规划器的请求和状态。
 必须一起重新编译、重启 driver、control、HMI 及使用这些结构的程序；
 不能混用旧二进制或旧版外部遥控端。RL 推理组件和模型格式没有改动。
 回归测试 `policy_switch` 覆盖失败回滚、重试、过期结果和 FSM；
 `hmi_policy_switch` 用真实 HMI 终端和隔离的 SHM 通道验证失败反馈、前置链和掉电优先。
+
+### 运行环境与可用策略
+
+策略、动作和规划器可用 `enabled_in` 声明可用的运行环境，取值为 `sim`、`real` 的列表；
+省略表示两种环境都可用。
+
+```yaml
+rl_policy:
+  onnx_infer:
+    policies:
+      dance_mode:
+        enabled_in: [sim]          # 只在仿真后端可选
+
+motion_actions:                    # 策略的动作目录
+  actions:
+    high_kick:
+      enabled_in: [sim]            # 目录中的单个动作
+
+motion_planners:
+  text_to_motion:
+    enabled_in: [sim]              # 规划器
+```
+
+- 环境由 driver 后端上报，不由启动参数或 HMI 指定；control 收到首个状态包之前环境
+  未知，此时只放行未加限制的条目。
+- control 拒绝选择当前环境未启用的策略；已选中的策略未启用时拒绝从 ZERO 进入 RL，
+  并在 `events.log` 记录 `RL entry blocked`。未启用的动作和规划器请求被拒绝并返回原因。
+- 操作服务按回传的环境过滤目录，终端、网页和 MCP 不列出未启用的条目，手柄等客户端
+  对未启用条目的请求返回 `unavailable`；环境变化时目录版本号更新，客户端重新读取。
+- 经 `return_policy`、`prerequisite` 或 `policy_actions` 自动到达的策略，其 `enabled_in`
+  须覆盖来源策略或动作的环境，否则配置加载失败。
+
+### 参考动作规划器
+
+跟踪类策略（SONIC、SuperMimic）可以由规划器提供参考动作：实时规划器把遥控速度指令
+转换成参考（模型推理，或在已登记的参考动作之间做决策），离线规划器按任务描述生成
+一段动作。规划器类型在 common 中注册，机型 YAML 在 `motion_planners` 下登记并由
+跟踪策略的 `policy_adapter.planners` 引用；进入 RL 后由操作端选择启动，停止后回到
+待命参考，不切换策略、不重置观测历史。
+
+```yaml
+motion_planners:
+  sonic_planner:
+    display_name: SONIC 规划行走
+    type: sonic_planner
+    category: realtime
+    command:
+      limits: {min_vx: -0.3, max_vx: 0.8, max_vy: 0.5, max_wz: 0.8}
+    model_path: policy/sonic/planner_sonic.onnx
+
+rl_policy:
+  onnx_infer:
+    policies:
+      sonic:
+        policy_adapter:
+          type: sonic
+          catalog: sonic_actions
+          planners: [sonic_planner]
+```
+
+规划器加载、预热和离线生成期间机器人保持待命，操作端显示阶段和进度；运行期间显示
+规划耗时和频率，速度指令的范围和档位取该规划器的 `command` 配置。规划器失败时参考
+回到待命并显示原因，RL 继续运行。规划器占用参考期间不能播放目录动作，目录动作播放
+期间不能启动规划器。
+
+类别、登记字段、运行阶段、新增规划器类型和让新的跟踪策略接入规划器的方法见
+[`src/behavior_manager/motion_planner/README.md`](src/behavior_manager/motion_planner/README.md)。
 
 ### 策略链调度（prerequisite chain）
 
@@ -766,7 +841,8 @@ RL 频率均来自 control 端回传，不在 HMI 本地预判。主界面用左
 | `b` | 速度页切换快慢档 |
 | `空格` | 速度清零 |
 | `Esc` / `v` | 退出速度页并清零 |
-| `A` / `G` / `C` | 主页面进入动作列表 / 开始手动参考动作 / 平滑取消动作 |
+| `A` / `G` / `C` | 主页面进入动作列表 / 开始手动参考动作 / 平滑取消动作；规划器准备或运行时 `C` 改为停止规划器并回到待命，失败后清除失败状态 |
+| `N` | 当前策略登记了规划器时打开规划器列表；`↑/↓` 或 `j/k` 移动，Enter 启动，Esc 返回 |
 | `X` | 确认已经恢复的锁存故障 |
 | `Ctrl+C` | 退出客户端并释放控制权，不自动掉电 |
 

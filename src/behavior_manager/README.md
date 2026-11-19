@@ -114,6 +114,7 @@ cd ~/spacemit_robot
 **关键参数：**
 - `rl_policy.onnx_infer.policies.<name>.kp/kd`：各策略的 PD 增益
 - `rl_policy.onnx_infer.policies.<name>.entry_target_transition_duration`（可选）：进入 RL 后的目标位置过渡时间，默认 `0`
+- `rl_policy.onnx_infer.policies.<name>.enabled_in`（可选）：该策略可用的运行环境，取值 `sim`、`real` 的列表，省略表示两者都可用。driver 后端在状态中上报所处环境（MuJoCo 为 `sim`，整机硬件为 `real`）；当前环境未启用的策略不能被选择，已选中时拒绝进入 RL。动作目录的 `actions.<动作>.enabled_in` 以同样方式限制单个动作，`motion_planners.<name>.enabled_in` 限制规划器。经 `return_policy`、`prerequisite` 或 `policy_actions` 自动到达的策略，其 `enabled_in` 须覆盖来源策略或动作的环境，否则配置加载失败。
 - `rl_policy.onnx_infer.policies.<name>.switch_group`（可选）：允许 RL 内交接的兼容组；来源与目标须属于同一非空组
 - `rl_policy.onnx_infer.policies.<name>.policy_switch.transition_duration`（可选）：RL 内交接时，目标位置与 KP/KD 同步过渡的时长，默认 `0`；不改变普通 ZERO→RL 的配置
 - `rl_policy.onnx_infer.policies.<name>.return_policy`（可选）：有限动作完成后的返回策略，须在同一兼容组中；省略时保持当前策略
@@ -128,10 +129,10 @@ cd ~/spacemit_robot
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.catalog`（SONIC / SuperMimic 可选）：为同一全身策略注册多个参考动作；选择动作只切换参考输入，保留模型实例、观测历史和上一帧 action。默认动作作为待命参考。
 - SuperMimic 动作目录的 `actions.<动作>.cancel_transition_duration` 可单独设置取消及模式交接时返回待命的时长；省略时使用目录的 `transition_duration`，不改变该动作的入场时长。播放中的取消保留原参考的推进，逐渐减小其权重并回到待命，关节速度包含原参考速度与过渡曲线导数。播放参考时，目标窗口从下一拍开始取未来 10 拍；静态待命不推进参考。
 - `rl_policy.onnx_infer.policies.<name>.policy_adapter.encoder`（SONIC 可选）：配置独立 encoder 的 `model_path`、`runtime`、`latent_dim` 和 `observation_term`。每拍先编码参考，再将 latent 写入 decoder 的同名自定义观测项；decoder 的第一段放当前 latent，第二段放本体历史，不将 latent 混入历史。encoder 的接口为 `obs_dict` → `encoded_tokens`，decoder 仍由普通 `PolicyExecutor` 执行。未配置 encoder 时兼容合并模型。
-- encoder、planner 的 `runtime` 与策略执行器共用推理配置。CPU ONNX 可用 `worker_sched`、`worker_priority` 显式指定模型工作线程的调度，`affinity` 指定工作线程核心；调用线程仍由 `robot_base.threads` 配置。后台加载模型时，工作线程不会自动继承后来启动的 RL 调用线程的优先级。
-- SONIC planner 时序：按 `check_interval`（默认 0.1 s）检查是否需要规划，期间的指令变化合并为最新值；推理超时跳过错过的检查拍，不补跑积压请求。`lookahead` 默认 0.04 s；指令不变时，行走按 `replan_interval`（默认 1 s）重规划，跑步按 `running_replan_interval`（0.1 s），爬行按 `crawling_replan_interval`（0.2 s），静止不定时重规划。这些间隔不是单次推理耗时。`allowed_pred_num_tokens` 默认开放 9–11 个 token。
-- `rl_policy.onnx_infer.policies.<name>.policy_adapter.planner`（SONIC 可选）：独立线程运行 kinematic planner，将速度命令转换为 tracker 参考；与 `catalog` 互斥，启用后不要求静态 `reference_file`。`model_path`、`runtime`、规划周期 `replan_interval`、提前量 `lookahead` 和输出帧率 `output_fps` 均由 YAML 配置。规划周期包含推理耗时，不在推理结束后再次等待完整周期。新轨迹从其起点（请求时刻加 `lookahead`）和发布时刻中较晚的一个开始，与正在跟踪的参考做 8 帧过渡；剩余时长不足时延长末帧以完成过渡。已过期的结果不发布，沿用旧参考并重新规划，停步交接也等待有效参考完成过渡。每次规划完成在 `control_sonic_planner.csv` 记录请求/完成时间、推理耗时、迟到量、参考停滞量和实际过渡帧数，`expired=1` 表示结果已丢弃；迟到或运动参考已播完（静止规划停在末帧属正常，不计入）时，每 10 秒最多在 `events.log` 警告一次。
-- `robot_base.threads.motion_planner`（启用 planner 时可选）：沿用 `ThreadLoop` 的 `cpu_id/cpu_affinity`、`sched`、`priority`、`lock_memory` 配置，在加载规划模型前应用；CPU 推理线程池随之继承调度与核心范围，`planner.runtime.affinity` 可另把推理 worker 固定到指定 CPU。规划模型在策略准备阶段加载一次，并用站立、行走输入各预热一次，加载失败时该策略准备失败、不能切入；进入 RL 只重置规划状态，不重新加载模型。`events.log` 的 `SONIC planner model ready` 记录加载、预热耗时及 worker 实际落核。tracker 通过尝试加锁读取快照；锁忙时沿用上次快照并跳过状态更新，下一拍重试，不等待 planner 释放锁。planner 可配置为 `sched: idle` 等低于 tracker worker 的调度。未配置时使用普通后台调度和进程启动时的核心范围，不继承 control 的实时优先级或单核绑定。规划轨迹在锁外生成、拼接，以只读快照发布；tracker 只在快照更新时重新整理参考帧。
+- SONIC encoder 和 `sonic_planner` 规划器的 `runtime` 与策略执行器共用推理配置。CPU ONNX 可用 `worker_sched`、`worker_priority` 显式指定模型工作线程的调度，`affinity` 指定工作线程核心；调用线程仍由 `robot_base.threads` 配置。后台加载模型时，工作线程不会自动继承后来启动的 RL 调用线程的优先级。
+- `rl_policy.onnx_infer.policies.<name>.policy_adapter.planners`（SONIC / SuperMimic 可选，需同时配置 `catalog`）：该策略可用的参考动作规划器，名字对应 YAML 根节点 `motion_planners` 下的登记。进入 RL 后由操作端启动、停止；`policy_adapter.auto_planner` 可指定进入 RL 后自动启动的实时规划器。未启动规划器时策略按 `catalog` 的待命参考和目录动作运行。规划器的类别、登记字段、运行阶段和新增规划器类型的方法见 [`motion_planner/README.md`](motion_planner/README.md)。旧的 `policy_adapter.planner` 写法加载时报错并提示迁移方式。
+- `motion_planners.<name>`（`type: sonic_planner`）：SONIC kinematic planner，把速度指令转换为 tracker 参考。`model_path`、`runtime`、规划周期 `replan_interval`、提前量 `lookahead` 和输出帧率 `output_fps` 均由 YAML 配置。按 `check_interval`（默认 0.1 s）检查是否需要规划，期间的指令变化合并为最新值；推理超时跳过错过的检查拍，不补跑积压请求。`lookahead` 默认 0.04 s；指令不变时，行走按 `replan_interval`（默认 1 s）重规划，跑步按 `running_replan_interval`（0.1 s），爬行按 `crawling_replan_interval`（0.2 s），静止不定时重规划。这些间隔包含推理耗时，不是单次推理耗时。`allowed_pred_num_tokens` 默认开放 9–11 个 token。新轨迹从其起点（请求时刻加 `lookahead`）和发布时刻中较晚的一个开始，与正在跟踪的参考做 8 帧过渡；剩余时长不足时延长末帧以完成过渡。已过期的结果不发布，沿用旧参考并重新规划，停止时也等待有效的停步参考完成过渡。每次规划完成在 `control_sonic_planner.csv` 记录请求/完成时间、推理耗时、迟到量、参考停滞量和实际过渡帧数，`expired=1` 表示结果已丢弃；迟到或运动参考已播完（静止规划停在末帧属正常，不计入）时，每 10 秒最多在 `events.log` 警告一次。
+- `robot_base.threads.motion_planner`（可选）：规划器后台线程的 `cpu_id/cpu_affinity`、`sched`、`priority`、`lock_memory` 配置，在加载规划器前应用；CPU 推理线程池随之继承调度与核心范围，`sonic_planner` 的 `runtime.affinity` 可另把推理 worker 固定到指定 CPU。`motion_planners.<name>.thread` 可改用 `robot_base.threads` 下的其他配置名。规划模型默认在操作端首次启动规划器时于后台加载，并用站立、行走输入各预热一次，期间 tracker 保持待命参考；加载失败时规划器进入 FAILED，RL 继续运行。`preload: true` 改为在策略准备阶段加载，此时加载失败使该策略准备失败、不能切入。`events.log` 的 `SONIC planner model ready` 记录加载、预热耗时及 worker 实际落核。tracker 通过尝试加锁读取快照；锁忙时沿用上次快照并跳过状态更新，下一拍重试，不等待 planner 释放锁。planner 可配置为 `sched: idle` 等低于 tracker worker 的调度。未配置时使用普通后台调度和进程启动时的核心范围，不继承 control 的实时优先级或单核绑定。规划轨迹在锁外生成、拼接，以只读快照发布；tracker 只在快照更新时重新整理参考帧。
 - `rl_policy.onnx_infer.policies.<name>.command.limits`（可选）：应用层声明该策略接受的 `min_vx/max_vx/min_vy/max_vy/min_wz/max_wz`；未配置 `min_*` 时默认为对应的 `-max_*`，整个 limits 未配置时 HMI 和 Control 均拒绝速度命令
 - `behavior_manager.damp_kd`：阻尼状态 kd（≈ policy kd / 5）
 - `behavior_manager.home.gain_ramp_duration / move_duration`：HOME 建立增益和移动时长，`move_duration` 默认 3 秒
@@ -244,8 +245,8 @@ motion:
 | 内置 `ref_motion_phase` 的有限动作 | `motion_length` 结束 |
 | `joint_trajectory` | 当前轨迹收回完成 |
 | `mjlab` / `protomotions` 参考动作 | 待播放首帧，或当前动作末帧；循环动作等到本轮末帧 |
-| 带动作目录的 `sonic` | 当前动作收回到待命参考 |
-| 带 `planner` 的 `sonic` | 速度归零后生成的停步参考播放完成 |
+| 带动作目录的 `sonic` / `supermimic` | 当前动作收回到待命参考 |
+| 规划器运行中的 `sonic` / `supermimic` | 规划器收到零速度并回到静止，参考过渡回待命 |
 | `stance_motion` / `history_actor` | 退出交互、返回站立或待命分支 |
 
 有限动作可通过 `return_policy` 自动返回另一策略；返回模型准备失败时保留当前控制，

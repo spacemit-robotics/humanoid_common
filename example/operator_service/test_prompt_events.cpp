@@ -163,5 +163,52 @@ int main() {
     expect({});  // Selection outside RL is not a successful mode entry.
     status.state = "RL";
     expect({"state.RL", "policy.dance"});
-    std::puts("audio events: confirmed status, ownership, actions, preset, fault, gamepad and reconnect passed");
+
+    // A planner is announced when it takes over the reference, not while it loads.
+    operator_service::PromptEvents planner_events;
+    operator_service::Status planner_status;
+    const auto expect_planner = [&](std::vector<std::string> expected) {
+        assert(planner_events.Update(planner_status) == expected);
+    };
+    planner_status.online = true;
+    planner_status.state = "RL";
+    planner_status.policy = "track";
+    expect_planner({});
+    planner_status.planner.name = "walker";
+    planner_status.planner.phase = "LOADING";
+    expect_planner({});
+    planner_status.planner.phase = "WARMING";
+    expect_planner({});
+    planner_status.planner.phase = "RUNNING";
+    expect_planner({"planner.walker"});
+    expect_planner({});
+    planner_status.planner.plan_count = 5;
+    expect_planner({});  // Planning statistics do not announce again.
+    planner_status.planner.phase = "STOPPING";
+    expect_planner({});
+    planner_status.planner.phase = "READY";
+    expect_planner({});
+    planner_status.planner.phase = "RUNNING";
+    expect_planner({"planner.walker"});  // A restart is a new takeover.
+    planner_status.planner.name = "writer";
+    expect_planner({"planner.writer"});  // Another planner took over directly.
+    planner_status.planner.phase = "GENERATING";
+    expect_planner({});
+    planner_status.planner.phase = "FAILED";
+    expect_planner({});
+    planner_status.fault = {true, true, 1, "driver", "timeout", "fault"};
+    planner_status.planner.phase = "RUNNING";
+    expect_planner({"fault"});  // A latched fault is the only cue.
+    planner_status.fault = {};
+    planner_status.planner.phase = "READY";
+    expect_planner({});
+    planner_status.state = "DAMP";
+    planner_status.planner.phase = "RUNNING";
+    expect_planner({"state.DAMP"});  // Planners only run inside RL.
+    planner_status.state = "RL";
+    planner_events.Reset();
+    expect_planner({});  // An observer that connects mid-run does not replay the takeover.
+    expect_planner({});
+    std::puts("audio events: confirmed status, ownership, actions, preset, fault, gamepad, planner and reconnect "
+        "passed");
 }

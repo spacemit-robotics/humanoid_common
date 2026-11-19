@@ -137,6 +137,79 @@ int main() {
     assert(!feedback.Update(status));  // Never replay after a reconnect.
     feedback.Track("action", "wave", status, reply);
     assert(!feedback.Update(status));
+
+    // Planner start: one pulse when the planner takes over the reference.
+    operator_service::Status tracking;
+    tracking.online = true;
+    tracking.state = "RL";
+    tracking.policy = "track";
+    uint64_t sequence = 10;
+    const auto start_planner = [&](const std::string &phase) {
+        reply.request = {++sequence, "planner", "accepted", ""};
+        feedback.Track("planner", "walker", tracking, reply);
+        tracking.request = reply.request;
+        assert(!feedback.Update(tracking));  // Control has not answered yet.
+        tracking.request.phase = phase;
+    };
+    start_planner("completed");
+    tracking.planner.name = "walker";
+    tracking.planner.phase = "LOADING";
+    assert(!feedback.Update(tracking));  // Accepted, still loading.
+    tracking.planner.phase = "WARMING";
+    assert(!feedback.Update(tracking));
+    tracking.planner.phase = "RUNNING";
+    assert(feedback.Update(tracking));
+    assert(!feedback.Update(tracking));  // One pulse per start.
+    reply.request = {++sequence, "planner", "accepted", ""};
+    feedback.Track("planner", "walker", tracking, reply);
+    tracking.request = {sequence, "planner", "completed", ""};
+    assert(!feedback.Update(tracking));  // Restarting the running planner is silent.
+    // A planner that was already loaded runs as soon as control accepts the start.
+    tracking.planner.phase = "READY";
+    start_planner("completed");
+    tracking.planner.phase = "RUNNING";
+    assert(feedback.Update(tracking));
+    // No pulse for a failed load, a rejected start, a stop before RUNNING or another planner.
+    tracking.planner.phase = "READY";
+    start_planner("completed");
+    tracking.planner.phase = "LOADING";
+    assert(!feedback.Update(tracking));
+    tracking.planner.phase = "FAILED";
+    assert(!feedback.Update(tracking));
+    tracking.planner.phase = "RUNNING";
+    assert(!feedback.Update(tracking));  // A later start by another client is not this request.
+    tracking.planner.phase = "READY";
+    for (const auto *phase : {"rejected", "expired", "cancelled"}) {
+        start_planner(phase);
+        assert(!feedback.Update(tracking));
+        tracking.planner.phase = "RUNNING";
+        assert(!feedback.Update(tracking));
+        tracking.planner.phase = "READY";
+    }
+    start_planner("completed");
+    tracking.planner.phase = "LOADING";
+    assert(!feedback.Update(tracking));
+    tracking.planner.phase = "STOPPING";
+    assert(!feedback.Update(tracking));
+    tracking.planner.phase = "READY";
+    assert(!feedback.Update(tracking));
+    tracking.planner.phase = "RUNNING";
+    assert(!feedback.Update(tracking));
+    tracking.planner.phase = "READY";
+    start_planner("completed");
+    tracking.planner.name = "writer";
+    tracking.planner.phase = "RUNNING";
+    assert(!feedback.Update(tracking));
+    tracking.planner.name = "walker";
+    tracking.planner.phase = "READY";
+    start_planner("completed");
+    tracking.planner.phase = "LOADING";
+    assert(!feedback.Update(tracking));
+    tracking.online = false;
+    assert(!feedback.Update(tracking));
+    tracking.online = true;
+    tracking.planner.phase = "RUNNING";
+    assert(!feedback.Update(tracking));  // Never replay after a reconnect.
     const auto report = operator_gamepad::Ds4RumbleReport(90);
     for (size_t i = 0; i < report.size(); ++i) {
         const int expected = i == 0 ? 5 : i == 1 ? 1 : (i == 4 || i == 5) ? 90 : 0;
@@ -162,5 +235,5 @@ int main() {
         return false;
     }, [] {}));
     assert(attempts == 3);  // A disconnected receiver cannot cause an infinite retry loop.
-    std::puts("gamepad feedback: confirmed switches, failures, reconnect and USB report passed");
+    std::puts("gamepad feedback: confirmed switches, planner takeover, failures, reconnect and USB report passed");
 }

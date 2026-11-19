@@ -22,10 +22,12 @@
  *   ./test_transport_executor ../example/config_example.yaml             # 按 type 字段决定
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cmath>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <string>
 #include <thread>
@@ -122,6 +124,149 @@ bool TestStaleShmDataDiscard() {
     return true;
 }
 
+bool TestPlannerPackets(transport::HmiCmdPacket *hmi) {
+    using Request = robot_base::PlannerRequest;
+    using Status = robot_base::PlannerStatus;
+
+    // 请求：START 需要序号和规划器名，STOP 需要序号且不带名称和参数，NONE 不带任何内容。
+    if (!transport::CanEncodePlannerRequest({}) ||
+        !transport::CanEncodePlannerRequest({3, Request::Operation::START, "walker", ""}) ||
+        !transport::CanEncodePlannerRequest({3, Request::Operation::START, "walker", "向前走两步"}) ||
+        !transport::CanEncodePlannerRequest({4, Request::Operation::STOP, "", ""})) {
+        return false;
+    }
+    const std::string long_name(transport::kPlannerNameLength, 'x');
+    const std::string long_argument(robot_base::kPlannerArgumentMaxLength + 1, 'x');
+    const std::string max_argument(robot_base::kPlannerArgumentMaxLength, 'x');
+    if (!transport::CanEncodePlannerRequest({3, Request::Operation::START, "walker", max_argument})) {
+        return false;
+    }
+    for (const Request &request : {
+            Request{0, Request::Operation::START, "walker", ""},
+            Request{3, Request::Operation::START, "", ""},
+            Request{3, Request::Operation::START, long_name, ""},
+            Request{3, Request::Operation::START, "walker", long_argument},
+            Request{3, Request::Operation::START, std::string("wal\0ker", 7), ""},
+            Request{3, Request::Operation::START, "walker", std::string("a\0b", 3)},
+            Request{0, Request::Operation::STOP, "", ""},
+            Request{4, Request::Operation::STOP, "walker", ""},
+            Request{4, Request::Operation::STOP, "", "argument"},
+            Request{0, Request::Operation::NONE, "walker", ""},
+            Request{0, Request::Operation::NONE, "", "argument"},
+            Request{3, static_cast<Request::Operation>(9), "walker", ""}}) {
+        if (transport::CanEncodePlannerRequest(request)) return false;
+    }
+
+    const Request start{12, Request::Operation::START, "walker", max_argument};
+    transport::EncodePlannerRequest(start, hmi);
+    Request decoded_request;
+    transport::DecodePlannerRequest(*hmi, &decoded_request);
+    if (!transport::ValidHmiCmdPacket(*hmi) || decoded_request.sequence != 12 ||
+        decoded_request.operation != Request::Operation::START ||
+        decoded_request.planner != "walker" || decoded_request.argument != max_argument) {
+        return false;
+    }
+    hmi->planner_operation = 127;
+    if (transport::ValidHmiCmdPacket(*hmi)) return false;
+    hmi->planner_operation = static_cast<uint8_t>(Request::Operation::STOP);
+    if (transport::ValidHmiCmdPacket(*hmi)) return false;  // STOP 不带规划器名
+    hmi->planner_operation = static_cast<uint8_t>(Request::Operation::START);
+    hmi->planner_sequence = 0;
+    if (transport::ValidHmiCmdPacket(*hmi)) return false;
+    hmi->planner_sequence = 12;
+    std::fill(std::begin(hmi->planner_name), std::end(hmi->planner_name), 'x');
+    if (transport::ValidHmiCmdPacket(*hmi)) return false;  // 名称缺少结尾符
+    std::fill(std::begin(hmi->planner_name), std::end(hmi->planner_name), '\0');
+    std::fill(std::begin(hmi->planner_argument), std::end(hmi->planner_argument), 'x');
+    hmi->planner_name[0] = 'w';
+    if (transport::ValidHmiCmdPacket(*hmi)) return false;  // 参数缺少结尾符
+    std::fill(std::begin(hmi->planner_argument), std::end(hmi->planner_argument), '\0');
+    hmi->planner_name[0] = '\0';
+    hmi->planner_sequence = 0;
+    hmi->planner_operation = 0;
+    if (!transport::ValidHmiCmdPacket(*hmi)) return false;
+
+    // 状态：阶段、进度和各项耗时须在有效范围内；detail 超长时截断。
+    Status status;
+    status.sequence = 12;
+    status.request_accepted = true;
+    status.phase = Status::Phase::RUNNING;
+    status.planner = "walker";
+    status.progress = 0.25F;
+    status.plan_count = 37;
+    status.plan_rate_hz = 9.5F;
+    status.last_plan_ms = 104.0F;
+    status.reference_remaining_s = 1.5F;
+    status.detail.assign(transport::kFaultDetailLength * 2, 'd');
+    if (!transport::CanEncodePlannerStatus(status) ||
+        !transport::IsValidPlannerStatus(status) ||
+        !transport::IsValidPlannerStatus({})) {
+        return false;
+    }
+    transport::PlannerStatusPacket packet;
+    transport::EncodePlannerStatus(status, &packet);
+    Status decoded_status;
+    transport::DecodePlannerStatus(packet, &decoded_status);
+    if (!transport::ValidPlannerStatusPacket(packet) ||
+        decoded_status.sequence != 12 || !decoded_status.request_accepted ||
+        decoded_status.phase != Status::Phase::RUNNING ||
+        decoded_status.planner != "walker" || decoded_status.progress != 0.25F ||
+        decoded_status.plan_count != 37 || decoded_status.plan_rate_hz != 9.5F ||
+        decoded_status.last_plan_ms != 104.0F ||
+        decoded_status.reference_remaining_s != 1.5F ||
+        decoded_status.detail.size() >= transport::kFaultDetailLength ||
+        decoded_status.detail.find("...[truncated]") == std::string::npos) {
+        return false;
+    }
+    for (uint8_t phase = 0; phase <= static_cast<uint8_t>(Status::Phase::FAILED); ++phase) {
+        packet.phase = phase;
+        if (!transport::ValidPlannerStatusPacket(packet)) return false;
+    }
+    packet.phase = static_cast<uint8_t>(Status::Phase::FAILED) + 1;
+    if (transport::ValidPlannerStatusPacket(packet)) return false;
+    packet.phase = static_cast<uint8_t>(Status::Phase::RUNNING);
+    packet.request_accepted = 2;
+    if (transport::ValidPlannerStatusPacket(packet)) return false;
+    packet.request_accepted = 1;
+    std::fill(std::begin(packet.planner), std::end(packet.planner), 'x');
+    if (transport::ValidPlannerStatusPacket(packet)) return false;
+    transport::EncodePlannerStatus(status, &packet);
+    std::fill(std::begin(packet.detail), std::end(packet.detail), 'x');
+    if (transport::ValidPlannerStatusPacket(packet)) return false;
+
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const auto rejected = [&status](float Status::*field, float value) {
+        Status invalid = status;
+        invalid.*field = value;
+        return !transport::CanEncodePlannerStatus(invalid) &&
+            !transport::IsValidPlannerStatus(invalid);
+    };
+    if (!rejected(&Status::progress, 1.5F) || !rejected(&Status::progress, -0.1F) ||
+        !rejected(&Status::progress, nan) ||
+        !rejected(&Status::plan_rate_hz, -1.0F) || !rejected(&Status::plan_rate_hz, nan) ||
+        !rejected(&Status::last_plan_ms, -1.0F) ||
+        !rejected(&Status::last_plan_ms, std::numeric_limits<float>::infinity()) ||
+        !rejected(&Status::reference_remaining_s, -1.0F) ||
+        !rejected(&Status::reference_remaining_s, nan)) {
+        return false;
+    }
+    Status invalid = status;
+    invalid.planner = long_name;
+    if (transport::CanEncodePlannerStatus(invalid)) return false;
+    invalid = status;
+    invalid.planner = std::string("wal\0ker", 7);
+    if (transport::CanEncodePlannerStatus(invalid)) return false;
+    invalid = status;
+    invalid.detail = std::string("bad\0detail", 10);
+    if (transport::CanEncodePlannerStatus(invalid)) return false;
+    invalid = status;
+    invalid.phase = static_cast<Status::Phase>(8);
+    if (transport::CanEncodePlannerStatus(invalid)) return false;
+
+    std::cout << "[test] planner packet validation: PASS\n";
+    return true;
+}
+
 bool TestPacketValidation() {
     static_assert(static_cast<int>(robot_base::ControlMode::POWER_OFF) == 0);
     static_assert(static_cast<int>(robot_base::ControlMode::DAMP) == 1);
@@ -143,12 +288,19 @@ bool TestPacketValidation() {
     hmi.vx = 0.0F;
     hmi.interaction_operation = 127;
     if (transport::ValidHmiCmdPacket(hmi)) return false;
+    hmi.interaction_operation = 0;
+    if (!TestPlannerPackets(&hmi)) return false;
 
     transport::RobotStatePacket state{};
     state.header.type = static_cast<uint16_t>(transport::MsgType::ROBOT_STATE);
     state.num_dof = 2;
     if (!transport::ValidRobotStatePacket(state)) return false;
     state.joint_pos[1] = std::numeric_limits<double>::infinity();
+    if (transport::ValidRobotStatePacket(state)) return false;
+    state.joint_pos[1] = 0.0;
+    state.environment = static_cast<uint8_t>(robot_base::RuntimeEnvironment::REAL);
+    if (!transport::ValidRobotStatePacket(state)) return false;
+    state.environment = 3;
     if (transport::ValidRobotStatePacket(state)) return false;
 
     transport::ControlCmdPacket control{};
@@ -178,6 +330,10 @@ bool TestPacketValidation() {
     status.hmi_connected = 2;
     if (transport::ValidControlStatusPacket(status)) return false;
     status.hmi_connected = 0;
+    status.environment = 3;
+    if (transport::ValidControlStatusPacket(status)) return false;
+    status.environment = static_cast<uint8_t>(robot_base::RuntimeEnvironment::SIMULATION);
+    if (!transport::ValidControlStatusPacket(status)) return false;
     status.interaction_request_accepted = 2;
     if (transport::ValidControlStatusPacket(status)) return false;
 
@@ -222,6 +378,13 @@ bool TestPacketValidation() {
     status.policy_switch.sequence = 41;
     if (transport::ValidControlStatusPacket(status)) return false;
     status.policy_switch = {};
+    status.planner.phase = 255;
+    if (transport::ValidControlStatusPacket(status)) return false;
+    status.planner = {};
+    status.planner.progress = 2.0F;
+    if (transport::ValidControlStatusPacket(status)) return false;
+    status.planner = {};
+    if (!transport::ValidControlStatusPacket(status)) return false;
     status.header.version = transport::kVersion - 1;
     if (transport::ValidControlStatusPacket(status)) return false;
 
@@ -267,6 +430,7 @@ int main(int argc, char *argv[]) {
 
     robot_base::RobotData state = robot_base::RobotData::FromYaml(yaml_path);
     state.time = 1.234;
+    state.environment = robot_base::RuntimeEnvironment::SIMULATION;
     state.rpy = {0.1, 0.2, 0.3};
     state.gyro = {0.01, 0.02, 0.03};
     state.acceleration = {0.4, 0.5, 9.7};
@@ -305,6 +469,7 @@ int main(int argc, char *argv[]) {
                 (recv_state.joint_torque == state.joint_torque) &&
                 (recv_state.joint_temperature == state.joint_temperature) &&
                 (recv_state.joint_error == state.joint_error) &&
+                recv_state.environment == state.environment &&
                 recv_state_fault.source == state_fault.source &&
                 recv_state_fault.code == state_fault.code &&
                 recv_state_fault.native_code == state_fault.native_code &&
@@ -452,6 +617,10 @@ int main(int argc, char *argv[]) {
     hmi_cmd.interaction.operation =
         robot_base::InteractionRequest::Operation::START;
     hmi_cmd.interaction.action = "wave";
+    hmi_cmd.planner.sequence = 9;
+    hmi_cmd.planner.operation = robot_base::PlannerRequest::Operation::START;
+    hmi_cmd.planner.planner = "walker";
+    hmi_cmd.planner.argument = "向前走两步";
 
     if (!hmi->SendCommandV2(hmi_cmd, 42)) {
         std::cerr << "[test] 合法 HMI 命令发送失败\n";
@@ -472,6 +641,11 @@ int main(int argc, char *argv[]) {
             recv_hmi.interaction.operation ==
                 robot_base::InteractionRequest::Operation::START &&
             recv_hmi.interaction.action == "wave" &&
+            recv_hmi.planner.sequence == 9 &&
+            recv_hmi.planner.operation ==
+                robot_base::PlannerRequest::Operation::START &&
+            recv_hmi.planner.planner == "walker" &&
+            recv_hmi.planner.argument == "向前走两步" &&
             recv_fault_ack_sequence == 42;
         all_ok = all_ok && ok;
         std::cout << "[test] 命令数据验证: " << (ok ? "通过" : "失败") << "\n";
@@ -492,6 +666,23 @@ int main(int argc, char *argv[]) {
         transport::kInteractionNameLength, 'x');
     invalid_hmi_rejected = !hmi->SendCommandV2(invalid_hmi_cmd, 0) &&
         invalid_hmi_rejected;
+    invalid_hmi_cmd = hmi_cmd;
+    invalid_hmi_cmd.planner.planner.assign(transport::kPlannerNameLength, 'x');
+    invalid_hmi_rejected = !hmi->SendCommandV2(invalid_hmi_cmd, 0) &&
+        invalid_hmi_rejected;
+    invalid_hmi_cmd = hmi_cmd;
+    invalid_hmi_cmd.planner.argument.assign(
+        robot_base::kPlannerArgumentMaxLength + 1, 'x');
+    invalid_hmi_rejected = !hmi->SendCommandV2(invalid_hmi_cmd, 0) &&
+        invalid_hmi_rejected;
+    invalid_hmi_cmd = hmi_cmd;
+    invalid_hmi_cmd.planner.sequence = 0;
+    invalid_hmi_rejected = !hmi->SendCommandV2(invalid_hmi_cmd, 0) &&
+        invalid_hmi_rejected;
+    invalid_hmi_cmd = hmi_cmd;
+    invalid_hmi_cmd.planner.operation = robot_base::PlannerRequest::Operation::STOP;
+    invalid_hmi_rejected = !hmi->SendCommandV2(invalid_hmi_cmd, 0) &&
+        invalid_hmi_rejected;
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     robot_base::Command unexpected_hmi_cmd;
     uint64_t unexpected_acknowledgement = 0;
@@ -509,7 +700,25 @@ int main(int argc, char *argv[]) {
     robot_base::Command legacy_command;
     const bool legacy_command_ok = legacy_control.RecvCommand(legacy_command) &&
         legacy_command.key == hmi_cmd.key &&
-        legacy_command.switch_policy == hmi_cmd.switch_policy;
+        legacy_command.switch_policy == hmi_cmd.switch_policy &&
+        legacy_command.planner.sequence == hmi_cmd.planner.sequence &&
+        legacy_command.planner.planner == hmi_cmd.planner.planner;
+
+    // STOP 请求只带序号。
+    hmi_cmd.planner = {10, robot_base::PlannerRequest::Operation::STOP, "", ""};
+    bool planner_stop_ok = hmi->SendCommandV2(hmi_cmd, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    robot_base::Command stop_command;
+    uint64_t stop_acknowledgement = 0;
+    planner_stop_ok = planner_stop_ok &&
+        control->RecvCommandV2(stop_command, stop_acknowledgement) &&
+        stop_command.planner.sequence == 10 &&
+        stop_command.planner.operation ==
+            robot_base::PlannerRequest::Operation::STOP &&
+        stop_command.planner.planner.empty() && stop_command.planner.argument.empty();
+    all_ok = planner_stop_ok && all_ok;
+    std::cout << "[test] 规划器停止请求: "
+        << (planner_stop_ok ? "通过" : "失败") << "\n";
     all_ok = legacy_command_ok && all_ok;
     std::cout << "[test] 旧命令接口兼容: "
         << (legacy_command_ok ? "通过" : "失败") << "\n";
@@ -522,6 +731,7 @@ int main(int argc, char *argv[]) {
     status.mode = robot_base::ControlMode::RL;
     status.zero_ready = false;
     status.hmi_connected = true;
+    status.environment = robot_base::RuntimeEnvironment::REAL;
     status.vx = 0.3f;
     status.vy = -0.1f;
     status.wz = 0.2f;
@@ -535,6 +745,16 @@ int main(int argc, char *argv[]) {
         robot_base::InteractionStatus::Phase::PLAYING;
     status.interaction.progress = 0.4F;
     status.interaction.action = "wave";
+    status.planner.sequence = 9;
+    status.planner.request_accepted = true;
+    status.planner.phase = robot_base::PlannerStatus::Phase::RUNNING;
+    status.planner.planner = "walker";
+    status.planner.progress = 0.5F;
+    status.planner.plan_count = 21;
+    status.planner.plan_rate_hz = 9.75F;
+    status.planner.last_plan_ms = 102.5F;
+    status.planner.reference_remaining_s = 1.25F;
+    status.planner.detail = "planner detail";
     state.time = 2.5;
     state.has_joint_feedback = true;
     state.has_base_imu = true;
@@ -579,6 +799,7 @@ int main(int argc, char *argv[]) {
     const bool status_ok = recv_status.mode == robot_base::ControlMode::RL &&
         feedback_ok &&
         recv_status.hmi_connected &&
+        recv_status.environment == status.environment &&
         std::abs(recv_status.vx - status.vx) < 1e-4f &&
         recv_status.active_policy == status.active_policy &&
         recv_status.policy_switch.sequence == status.policy_switch.sequence &&
@@ -592,6 +813,17 @@ int main(int argc, char *argv[]) {
         std::abs(recv_status.interaction.progress -
             status.interaction.progress) < 1.0e-4F &&
         recv_status.interaction.action == status.interaction.action &&
+        recv_status.planner.sequence == status.planner.sequence &&
+        recv_status.planner.request_accepted &&
+        recv_status.planner.phase == status.planner.phase &&
+        recv_status.planner.planner == status.planner.planner &&
+        recv_status.planner.progress == status.planner.progress &&
+        recv_status.planner.plan_count == status.planner.plan_count &&
+        recv_status.planner.plan_rate_hz == status.planner.plan_rate_hz &&
+        recv_status.planner.last_plan_ms == status.planner.last_plan_ms &&
+        recv_status.planner.reference_remaining_s ==
+            status.planner.reference_remaining_s &&
+        recv_status.planner.detail == status.planner.detail &&
         recv_status_fault.latched &&
         recv_status_fault.source == status_fault.source &&
         recv_status_fault.code == status_fault.code &&
@@ -619,6 +851,12 @@ int main(int argc, char *argv[]) {
         recv_status.mode != robot_base::ControlMode::TRAJECTORY || !recv_status.active_policy.empty() ||
         recv_status.rl_frequency_hz != 0 || recv_status.interaction.action != "wave" || recv_status_fault.latched)
         return 1;
+    if (recv_status.planner.phase != robot_base::PlannerStatus::Phase::IDLE ||
+        recv_status.planner.sequence != 0 || !recv_status.planner.planner.empty() ||
+        !recv_status.planner.detail.empty()) {
+        std::cerr << "[test] 未带规划器状态的回传没有清空规划器字段\n";
+        return 1;
+    }
 
     robot_base::ControlStatus invalid_status = status;
     invalid_status.rl_frequency_hz = std::numeric_limits<float>::infinity();
@@ -629,6 +867,18 @@ int main(int argc, char *argv[]) {
         invalid_status_rejected;
     invalid_status = status;
     invalid_status.interaction.progress = 1.5F;
+    invalid_status_rejected = !control->SendStatusV2(invalid_status, status_fault) &&
+        invalid_status_rejected;
+    invalid_status = status;
+    invalid_status.planner.progress = 1.5F;
+    invalid_status_rejected = !control->SendStatusV2(invalid_status, status_fault) &&
+        invalid_status_rejected;
+    invalid_status = status;
+    invalid_status.planner.last_plan_ms = std::numeric_limits<float>::quiet_NaN();
+    invalid_status_rejected = !control->SendStatusV2(invalid_status, status_fault) &&
+        invalid_status_rejected;
+    invalid_status = status;
+    invalid_status.planner.planner.assign(transport::kPlannerNameLength, 'x');
     invalid_status_rejected = !control->SendStatusV2(invalid_status, status_fault) &&
         invalid_status_rejected;
     std::this_thread::sleep_for(std::chrono::milliseconds(10));

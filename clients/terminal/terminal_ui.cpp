@@ -119,11 +119,6 @@ Layout GetLayout() {
     return layout;
 }
 
-const operator_service::Policy *ActivePolicy(const UiState &state) {
-    const auto it = std::find_if(state.policies.begin(), state.policies.end(),
-        [&](const auto &policy) { return policy.name == state.status.policy; });
-    return it == state.policies.end() ? nullptr : &*it;
-}
 bool IsManualReferencePolicy(const UiState &state) {
     const auto *policy = ActivePolicy(state);
     return policy && policy->manual_reference;
@@ -169,6 +164,64 @@ Color InteractionColor(const std::string &phase) {
     if (phase == "REJECTED") return Color::BRIGHT_RED;
     if (phase == "FINISHED") return Color::BRIGHT_GREEN;
     return Color::BRIGHT_CYAN;
+}
+const std::vector<operator_service::Planner> *ActivePlanners(const UiState &state) {
+    const auto *policy = ActivePolicy(state);
+    return policy && !state.status.trajectory_enabled && !policy->planners.empty() ? &policy->planners : nullptr;
+}
+const char *PlannerPhaseName(const std::string &phase) {
+    if (phase == "LOADING") return "加载中";
+    if (phase == "WARMING") return "预热中";
+    if (phase == "READY") return "已加载";
+    if (phase == "GENERATING") return "生成中";
+    if (phase == "RUNNING") return "运行中";
+    if (phase == "STOPPING") return "停止中";
+    if (phase == "FAILED") return "失败";
+    return "未启动";
+}
+Color PlannerColor(const std::string &phase) {
+    if (phase == "FAILED") return Color::BRIGHT_RED;
+    if (phase == "RUNNING") return Color::BRIGHT_GREEN;
+    if (phase == "IDLE" || phase == "READY") return Color::GRAY;
+    return Color::BRIGHT_YELLOW;
+}
+// A planner holds, takes or returns the reference, or its last start failed.
+bool PlannerShown(const UiState &state) {
+    return state.status.planner.Engaged() || state.status.planner.phase == "FAILED";
+}
+std::string PlannerDisplayName(const UiState &state, const std::string &name) {
+    if (const auto *planners = ActivePlanners(state)) {
+        const auto it =
+            std::find_if(planners->begin(), planners->end(), [&](const auto &p) { return p.name == name; });
+        if (it != planners->end() && !it->display_name.empty()) return it->display_name;
+    }
+    return name;
+}
+bool PlannerPreparing(const operator_service::PlannerState &planner) {
+    return planner.phase == "LOADING" || planner.phase == "WARMING" || planner.phase == "GENERATING";
+}
+// Preparation or playback progress as a text bar; empty while there is no estimate.
+std::string PlannerProgressBar(const operator_service::PlannerState &planner, int width) {
+    const double progress = std::clamp(planner.progress, 0.0, 1.0);
+    if (progress <= 0.0 || (!PlannerPreparing(planner) && planner.phase != "RUNNING")) return "";
+    const int cells = std::clamp(width, 4, 40);
+    const int filled = static_cast<int>(std::round(progress * cells));
+    std::string bar;
+    for (int index = 0; index < cells; ++index) bar += index < filled ? "━" : "─";
+    char percent[16];
+    std::snprintf(percent, sizeof(percent), " %3.0f%%", progress * 100.0);
+    return bar + percent;
+}
+std::string PlannerMetrics(const operator_service::PlannerState &planner, int width) {
+    char text[160] = "";
+    if (planner.phase == "RUNNING" && planner.plan_count > 0) {
+        std::snprintf(text, sizeof(text), "已规划 %u 次 · 单次 %.0f ms · %.1f 次/秒 · 参考余量 %.2f s",
+            planner.plan_count, planner.last_plan_ms, planner.plan_rate_hz, planner.reference_remaining_s);
+        return text;
+    }
+    const std::string bar = PlannerProgressBar(planner, width - 22);
+    if (bar.empty()) return "";
+    return std::string(PlannerPreparing(planner) ? "准备进度 " : "动作进度 ") + bar;
 }
 
 void PrintInteractionProgress(const UiState &state, int width) {
@@ -226,7 +279,10 @@ void PrintHeader(const Layout &layout, const UiState &state, const char *title) 
     MoveTo(2, layout.content_left);
     SetFg(Color::BRIGHT_CYAN);
     SetBold();
-    printf("SpaceMIT Humanoid · %s", title);
+    // 驱动上报的运行环境；策略和动作列表只含该环境可用的条目
+    const char *environment = state.status.environment == "sim" ? " · 仿真"
+        : state.status.environment == "real" ? " · 实机" : "";
+    printf("SpaceMIT Humanoid · %s%s", title, environment);
     ResetAttr();
     MoveTo(2, layout.left + layout.width - 22);
     PrintConnection(state);
@@ -313,6 +369,22 @@ void RenderMainPage(const UiState &state) {
         SetFg(state.status.zero_ready ? Color::BRIGHT_GREEN : Color::BRIGHT_YELLOW);
         printf("回零: %s", !state.status.zero_ready ? "进行中，等待到位"
             : (state.status.trajectory_enabled ? "READY，可按 → 进入动作" : "READY，可按 → 进入 RL"));
+    } else if (state.status.online && state.status.state == "RL" && PlannerShown(state)) {
+        const auto &planner = state.status.planner;
+        SetFg(PlannerColor(planner.phase));
+        SetBold();
+        if (planner.phase == "RUNNING") {
+            printf("规划器运行中    [V] 速度遥控    [C] 停止规划器");
+        } else if (planner.phase == "STOPPING") {
+            printf("规划器停止中，正在回到待命");
+        } else if (planner.phase == "FAILED") {
+            printf("规划器失败: %s  [C] 清除", Fit(planner.detail, layout.width - 30).c_str());
+        } else if (planner.progress > 0) {
+            printf("规划器%s %.0f%%，机器人保持待命    [C] 取消", PlannerPhaseName(planner.phase),
+                std::clamp(planner.progress, 0.0, 1.0) * 100.0);
+        } else {
+            printf("规划器%s，机器人保持待命    [C] 取消", PlannerPhaseName(planner.phase));
+        }
     } else if (state.status.online && state.status.state == "RL" && IsManualReferencePolicy(state)) {
         SetFg(state.reference_start_requested ? Color::BRIGHT_GREEN : Color::BRIGHT_YELLOW);
         printf("%s",
@@ -351,6 +423,26 @@ void RenderMainPage(const UiState &state) {
         SetDim();
         printf("策略");
         ResetAttr();
+        if (ActivePlanners(state)) {
+            const auto &planner = state.status.planner;
+            MoveTo(10, layout.left + 18);
+            SetFg(PlannerColor(planner.phase));
+            const std::string name = PlannerShown(state) || planner.phase == "READY"
+                ? PlannerDisplayName(state, planner.name) + " · " : "";
+            // Planning time and rate while it runs, like the RL rate of the policy.
+            char rate[64] = "";
+            if (planner.phase == "RUNNING" && planner.plan_count > 0) {
+                std::snprintf(rate, sizeof(rate), " · %.0f ms · %.1f 次/秒", planner.last_plan_ms,
+                    planner.plan_rate_hz);
+            } else if (PlannerPreparing(planner) && planner.progress > 0) {
+                std::snprintf(rate, sizeof(rate), " %.0f%%", std::clamp(planner.progress, 0.0, 1.0) * 100.0);
+            }
+            printf("规划器: %s", Fit(name + PlannerPhaseName(planner.phase) + rate, layout.width - 36).c_str());
+            ResetAttr();
+            SetFg(Color::CYAN);
+            printf("  [N] 选择");
+            ResetAttr();
+        }
         MoveTo(11, layout.content_left);
         const std::string policy = PolicyDisplayName(state).empty() ? "(未加载)" : PolicyDisplayName(state);
         SetFg(Color::MAGENTA);
@@ -399,6 +491,7 @@ void RenderMainPage(const UiState &state) {
     MoveTo(20, layout.content_left);
     SetDim();
     printf("%s", state.status.trajectory_enabled ? "[A]动作 [C]取消 [X]确认 [Ctrl+C]退出"
+        : ActivePlanners(state) ? "[A]动作 [N]规划器 [C]取消/停止 [X]确认 [Ctrl+C]退出"
         : "[A]动作 [G]开始 [C]取消 [X]确认 [Ctrl+C]退出");
     ResetAttr();
 
@@ -540,6 +633,74 @@ void RenderInteractionSelectPage(const UiState &state) {
     fflush(stdout);
 }
 
+void RenderPlannerSelectPage(const UiState &state) {
+    const Layout layout = GetLayout();
+    ClearScreen();
+    PrintHeader(layout, state, "动作规划器");
+
+    const auto *planners = ActivePlanners(state);
+    constexpr int kVisibleRows = 9;
+    const int count = planners ? static_cast<int>(planners->size()) : 0;
+    const int cursor = count == 0 ? 0 : std::clamp(state.planner_cursor_idx, 0, count - 1);
+    const int first = std::clamp(cursor - kVisibleRows / 2, 0, std::max(0, count - kVisibleRows));
+    const int shown = std::min(kVisibleRows, std::max(1, count));
+    const auto &planner = state.status.planner;
+    DrawBox(4, layout.left, layout.width, shown + 3);
+    MoveTo(5, layout.content_left);
+    SetDim();
+    printf("策略: %s    规划器 %d/%d", Fit(PolicyDisplayName(state), layout.width - 30).c_str(),
+        count == 0 ? 0 : cursor + 1, count);
+    ResetAttr();
+    if (count == 0) {
+        MoveTo(6, layout.content_left);
+        printf("(当前策略没有登记规划器)");
+    } else {
+        for (int row = 0; row < shown; ++row) {
+            const int index = first + row;
+            MoveTo(6 + row, layout.content_left);
+            if (index == cursor) {
+                SetBg(Color::BLUE);
+                SetFg(Color::WHITE);
+                SetBold();
+            }
+            const auto &entry = (*planners)[index];
+            printf("%s ", PlannerShown(state) && planner.name == entry.name
+                ? (planner.phase == "FAILED" ? "✗" : "▶") : " ");
+            const std::string label = (entry.display_name.empty() ? entry.name : entry.display_name) +
+                (entry.category == "offline" ? "（离线生成）" : "（实时）");
+            printf("%s", Fit(label, layout.width - 8).c_str());
+            ResetAttr();
+        }
+    }
+
+    const int operation_row = 4 + shown + 3;
+    DrawBox(operation_row, layout.left, layout.width, 6);
+    MoveTo(operation_row + 1, layout.content_left);
+    printf("当前: %s", PlannerShown(state) || planner.phase == "READY"
+        ? Fit(PlannerDisplayName(state, planner.name), layout.width - 25).c_str() : "未启动");
+    printf("   ·   ");
+    SetFg(PlannerColor(planner.phase));
+    SetBold();
+    printf("%s", PlannerPhaseName(planner.phase));
+    ResetAttr();
+    MoveTo(operation_row + 2, layout.content_left);
+    SetFg(PlannerColor(planner.phase));
+    const std::string metrics = PlannerMetrics(planner, layout.width - 4);
+    printf("%s", Fit(!planner.detail.empty() ? planner.detail
+        : !metrics.empty() ? metrics
+        : planner.Engaged() ? "规划器占用参考动作期间不能播放交互动作"
+        : "启动后速度指令交给规划器；停止后回到待命", layout.width - 4).c_str());
+    ResetAttr();
+    MoveTo(operation_row + 3, layout.content_left);
+    printf("↑/↓ 或 j/k 移动    Enter 启动    C 停止    Esc/N 返回");
+    MoveTo(operation_row + 4, layout.content_left);
+    SetDim();
+    printf("终端不输入文字；离线规划器的动作描述由网页端或 SDK 提供");
+    ResetAttr();
+    PrintLastAction(layout, operation_row + 6, state.last_action);
+    fflush(stdout);
+}
+
 void PrintKey(int row, int col, const char *key, const char *action, bool highlighted) {
     MoveTo(row, col);
     if (highlighted) {
@@ -569,10 +730,10 @@ void RenderVelocityPage(const UiState &state) {
     SetBold();
     printf("%s", ModeName(state.status.state));
     ResetAttr();
-    const auto active = std::find_if(state.policies.begin(), state.policies.end(),
-        [&](const auto &p) { return p.name == state.status.policy; });
-    const bool speed_modes = active != state.policies.end() && active->HasSpeedModes();
-    printf("    策略: %s    %s    RL: %.1f Hz", Fit(policy, layout.width - 50).c_str(),
+    const bool speed_modes = HasSpeedModes(state);
+    const auto *planner = RunningPlanner(state);
+    const std::string receiver = planner ? PlannerDisplayName(state, planner->name) : policy;
+    printf("    %s: %s    %s    RL: %.1f Hz", planner ? "规划器" : "策略", Fit(receiver, layout.width - 52).c_str(),
         speed_modes ? (state.status.teleop_preset == "fast" ? "快速" : "慢速") : "单档", state.status.rl_hz);
     MoveTo(6, layout.content_left);
     printf("目标  vx=%+.2f   vy=%+.2f   wz=%+.2f", state.target_command.vx, state.target_command.vy,
@@ -621,6 +782,9 @@ void Render(const View &state) {
         break;
     case HmiPage::INTERACTION_SELECT:
         RenderInteractionSelectPage(state);
+        break;
+    case HmiPage::PLANNER_SELECT:
+        RenderPlannerSelectPage(state);
         break;
     case HmiPage::VELOCITY:
         RenderVelocityPage(state);

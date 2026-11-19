@@ -34,33 +34,55 @@ struct FeedbackConfig {
 };
 class SuccessFeedback {
 public:
-    void Clear() { sequence_ = 0; }
+    void Clear() {
+        sequence_ = 0;
+        planner_.clear();
+    }
     void Track(const std::string &operation, const std::string &target,
         const operator_service::Status &before, const operator_service::Reply &reply) {
-        if (operation != "state" && operation != "policy") return;
+        if (operation != "state" && operation != "policy" && operation != "planner") return;
         if (!reply.ok || reply.request.phase != "accepted" || !reply.request.sequence) return;
         Clear();
-        if ((operation == "state" ? before.state : before.policy) == target) return;
+        if (operation == "planner") {
+            if (before.planner.phase == "RUNNING" && before.planner.name == target) return;
+        } else if ((operation == "state" ? before.state : before.policy) == target) {
+            return;
+        }
         sequence_ = reply.request.sequence;
         operation_ = operation;
         target_ = target;
     }
     bool Update(const operator_service::Status &status) {
         if (!status.online) { Clear(); return false; }
-        if (!sequence_ || status.request.sequence < sequence_) return false;
-        if (status.request.sequence != sequence_ || status.request.operation != operation_) {
+        if (planner_.empty()) {
+            if (!sequence_ || status.request.sequence < sequence_) return false;
+            if (status.request.sequence != sequence_ || status.request.operation != operation_) {
+                Clear();
+                return false;
+            }
+            if (status.request.phase == "accepted") return false;
+            const bool completed = status.request.phase == "completed";
+            if (operation_ != "planner") {
+                const bool success = completed && (operation_ == "state" ? status.state : status.policy) == target_;
+                Clear();
+                return success;
+            }
+            // Control accepted the start. The planner takes over the reference
+            // once it has loaded, which is when the sticks begin to drive it.
+            const std::string planner = target_;
             Clear();
-            return false;
+            if (!completed) return false;
+            planner_ = planner;
         }
-        if (status.request.phase == "accepted") return false;
-        const bool success = status.request.phase == "completed" &&
-            (operation_ == "state" ? status.state : status.policy) == target_;
-        Clear();
-        return success;
+        const bool engaged = status.planner.name == planner_ && status.planner.Engaged();
+        const bool running = engaged && status.planner.phase == "RUNNING";
+        if (running || !engaged) Clear();
+        return running;
     }
 private:
     uint64_t sequence_ = 0;
     std::string operation_, target_;
+    std::string planner_;  // Accepted planner start waiting for RUNNING.
 };
 
 inline std::array<unsigned char, 32> Ds4RumbleReport(unsigned char strength) {

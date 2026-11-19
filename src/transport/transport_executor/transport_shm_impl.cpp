@@ -195,6 +195,7 @@ bool TransportShmImpl::SendStateV2(const robot_base::RobotData &state,
             (i < static_cast<int>(state.joint_error.size())) ? state.joint_error[i] : 0U;
     }
     EncodeFault(fault, &p.fault);
+    p.environment = static_cast<uint8_t>(state.environment);
 
     if (!ValidRobotStatePacket(p)) return false;
     if (!state_writer_->Write(&p, sizeof(p))) return false;
@@ -227,6 +228,7 @@ bool TransportShmImpl::RecvStateV2(robot_base::RobotData &state,
     state.num_dof = p.num_dof;
     state.InitJointVectors();
     state.time = p.time;
+    state.environment = static_cast<robot_base::RuntimeEnvironment>(p.environment);
     std::memcpy(state.rpy.data(), p.rpy, sizeof(p.rpy));
     std::memcpy(state.gyro.data(), p.gyro, sizeof(p.gyro));
     std::memcpy(state.acceleration.data(), p.acceleration, sizeof(p.acceleration));
@@ -336,6 +338,7 @@ bool TransportShmImpl::SendCommandV2(const robot_base::Command &cmd,
     p.interaction_operation = static_cast<uint8_t>(cmd.interaction.operation);
     std::strncpy(p.interaction_action, cmd.interaction.action.c_str(),
         sizeof(p.interaction_action) - 1);
+    EncodePlannerRequest(cmd.planner, &p);
 
     if (!ValidHmiCmdPacket(p)) return false;
     if (!hmi_writer_->Write(&p, sizeof(p))) return false;
@@ -372,6 +375,7 @@ bool TransportShmImpl::RecvCommandV2(robot_base::Command &cmd,
         static_cast<robot_base::InteractionRequest::Operation>(
             p.interaction_operation);
     cmd.interaction.action = DecodeText(p.interaction_action);
+    DecodePlannerRequest(p, &cmd.planner);
 
     return true;
 }
@@ -392,6 +396,7 @@ bool TransportShmImpl::SendStatusV2(const robot_base::ControlStatus &status,
     p.control_mode = static_cast<int8_t>(status.mode);
     p.zero_ready = status.zero_ready ? 1 : 0;
     p.hmi_connected = status.hmi_connected ? 1 : 0;
+    p.environment = static_cast<uint8_t>(status.environment);
     p.vx = status.vx;
     p.vy = status.vy;
     p.wz = status.wz;
@@ -407,6 +412,7 @@ bool TransportShmImpl::SendStatusV2(const robot_base::ControlStatus &status,
         sizeof(p.interaction_action) - 1);
     EncodeFault(fault, &p.fault);
     EncodePolicySwitch(status.policy_switch, &p.policy_switch);
+    EncodePlannerStatus(status.planner, &p.planner);
 
     if (!ValidControlStatusPacket(p)) return false;
     if (!status_writer_->Write(&p, sizeof(p))) return false;
@@ -435,6 +441,7 @@ bool TransportShmImpl::RecvStatusV2(robot_base::ControlStatus &status,
     status.mode = static_cast<robot_base::ControlMode>(p.control_mode);
     status.zero_ready = (p.zero_ready != 0);
     status.hmi_connected = (p.hmi_connected != 0);
+    status.environment = static_cast<robot_base::RuntimeEnvironment>(p.environment);
     status.vx = p.vx;
     status.vy = p.vy;
     status.wz = p.wz;
@@ -449,6 +456,7 @@ bool TransportShmImpl::RecvStatusV2(robot_base::ControlStatus &status,
     status.interaction.progress = p.interaction_progress;
     status.interaction.action = DecodeText(p.interaction_action);
     DecodePolicySwitch(p.policy_switch, &status.policy_switch);
+    DecodePlannerStatus(p.planner, &status.planner);
     return DecodeFault(p.fault, &fault);
 }
 

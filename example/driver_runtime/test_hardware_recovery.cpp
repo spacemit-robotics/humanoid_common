@@ -65,6 +65,8 @@ Scenario scenario;
 
 bool Publish(const robot_base::RobotData &state, const robot_base::FaultStatus &fault) {
     assert(state.IsValid());
+    // Feedback and fault-only publications both identify the hardware backend.
+    assert(state.environment == robot_base::RuntimeEnvironment::REAL);
     ++scenario.publications;
     if (fault.active && !scenario.last_fault_active) {
         ++scenario.fault_events;

@@ -48,6 +48,8 @@ public:
     virtual robot_base::InteractionStatus CurrentInteractionStatus() const {
         return {};
     }
+    // 当前 RL 内部参考动作规划器状态（其余状态返回 IDLE）
+    virtual robot_base::PlannerStatus CurrentPlannerStatus() const { return {}; }
 
     StateName name;
 

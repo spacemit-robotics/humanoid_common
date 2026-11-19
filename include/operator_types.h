@@ -22,6 +22,33 @@ struct Action {
     std::string key;
     std::string display_name;
 };
+// True when the slow and fast teleop presets give different speeds within [minimum, maximum].
+inline bool SpeedModesDiffer(const Velocity &minimum, const Velocity &maximum,
+    const std::optional<Velocity> &slow_limits, const std::optional<Velocity> &fast_limits) {
+    if (!slow_limits || !fast_limits) return false;
+    const auto different = [](double low, double high, double slow, double fast) {
+        return std::min(std::max(0.0, -low), slow) != std::min(std::max(0.0, -low), fast) ||
+            std::min(std::max(0.0, high), slow) != std::min(std::max(0.0, high), fast);
+    };
+    return different(minimum.vx, maximum.vx, slow_limits->vx, fast_limits->vx) ||
+        different(minimum.vy, maximum.vy, slow_limits->vy, fast_limits->vy) ||
+        different(minimum.wz, maximum.wz, slow_limits->wz, fast_limits->wz);
+}
+// A reference-motion planner that a tracker policy accepts. While a realtime
+// planner runs, velocity commands go to it and use its range instead of the
+// policy's.
+struct Planner {
+    std::string name;
+    std::string display_name;
+    std::string category = "realtime";  // realtime: runs until stopped; offline: one motion per request.
+    std::string type;
+    Velocity minimum;
+    Velocity maximum;
+    bool client_smoothing = true;  // Same meaning as Policy::client_smoothing.
+    std::optional<Velocity> slow_limits;
+    std::optional<Velocity> fast_limits;
+    bool HasSpeedModes() const { return SpeedModesDiffer(minimum, maximum, slow_limits, fast_limits); }
+};
 struct Policy {
     std::string name;
     bool manual_reference = false;
@@ -33,15 +60,27 @@ struct Policy {
     std::string display_name;
     std::optional<Velocity> slow_limits;
     std::optional<Velocity> fast_limits;
-    bool HasSpeedModes() const {
-        if (!slow_limits || !fast_limits) return false;
-        const auto different = [](double low, double high, double slow, double fast) {
-            return std::min(std::max(0.0, -low), slow) != std::min(std::max(0.0, -low), fast) ||
-                std::min(std::max(0.0, high), slow) != std::min(std::max(0.0, high), fast);
-        };
-        return different(minimum.vx, maximum.vx, slow_limits->vx, fast_limits->vx) ||
-            different(minimum.vy, maximum.vy, slow_limits->vy, fast_limits->vy) ||
-            different(minimum.wz, maximum.wz, slow_limits->wz, fast_limits->wz);
+    std::vector<Planner> planners;  // Enabled in the driver environment, in YAML order.
+    std::string auto_planner;       // Started by control when the policy enters RL; may be empty.
+    bool HasSpeedModes() const { return SpeedModesDiffer(minimum, maximum, slow_limits, fast_limits); }
+};
+// Planner state reported by control. Phases: IDLE, LOADING, WARMING, READY,
+// GENERATING, RUNNING, STOPPING, FAILED.
+struct PlannerState {
+    std::string name;
+    std::string phase = "IDLE";
+    double progress = 0;
+    uint64_t sequence = 0;
+    bool accepted = false;
+    uint32_t plan_count = 0;
+    double plan_rate_hz = 0;
+    double last_plan_ms = 0;
+    double reference_remaining_s = 0;
+    std::string detail;
+    // The tracker follows the planner or is preparing to; actions wait until it stops.
+    bool Engaged() const {
+        return phase == "LOADING" || phase == "WARMING" || phase == "GENERATING" ||
+            phase == "RUNNING" || phase == "STOPPING";
     }
 };
 struct Fault {
@@ -83,6 +122,10 @@ struct Status {
     bool trajectory_enabled = false;
     Velocity target_velocity;
     Velocity command_velocity;
+    // Backend reported by the driver: unknown, sim or real. The catalog lists
+    // only the policies and actions enabled there.
+    std::string environment = "unknown";
+    PlannerState planner;
 };
 struct Reply {
     bool ok = false;

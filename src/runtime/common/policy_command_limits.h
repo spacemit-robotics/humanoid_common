@@ -38,10 +38,13 @@ struct PolicyCommandLimits {
 using PolicyCommandLimitMap =
     std::unordered_map<std::string, PolicyCommandLimits>;
 
-inline PolicyCommandLimits LoadOnePolicyCommandLimits(
-        const robot_base::YamlFile &yaml, const std::string &policy_name) {
-    const std::string base = "rl_policy.onnx_infer.policies." + policy_name
-        + ".command.limits";
+/**
+ * @brief Read <owner_base>.command.limits
+ * @param label Owner named in configuration errors, e.g. "策略 walk"
+ */
+inline PolicyCommandLimits LoadCommandLimits(const robot_base::YamlFile &yaml,
+        const std::string &owner_base, const std::string &label) {
+    const std::string base = owner_base + ".command.limits";
     const auto max_vx = yaml.Read<double>(base + ".max_vx");
     const auto max_vy = yaml.Read<double>(base + ".max_vy");
     const auto max_wz = yaml.Read<double>(base + ".max_wz");
@@ -54,20 +57,20 @@ inline PolicyCommandLimits LoadOnePolicyCommandLimits(
         || min_wz.has_value();
     if (!configured) return {};
     if (!max_vx || !max_vy || !max_wz) {
-        throw std::runtime_error("[runtime] 策略 " + policy_name
+        throw std::runtime_error("[runtime] " + label
             + " 的 command.limits 必须同时配置 max_vx/max_vy/max_wz");
     }
 
     const auto validate_max = [&](double value, const char *name) {
         if (!std::isfinite(value) || value < 0.0) {
-            throw std::runtime_error("[runtime] 策略 " + policy_name
+            throw std::runtime_error("[runtime] " + label
                 + " 的 command.limits." + name + " 必须为非负有限数");
         }
         return static_cast<float>(value);
     };
     const auto validate_min = [&](double value, const char *name) {
         if (!std::isfinite(value) || value > 0.0) {
-            throw std::runtime_error("[runtime] 策略 " + policy_name
+            throw std::runtime_error("[runtime] " + label
                 + " 的 command.limits." + name + " 必须为非正有限数");
         }
         return static_cast<float>(value);
@@ -84,6 +87,12 @@ inline PolicyCommandLimits LoadOnePolicyCommandLimits(
     limits.min_wz = min_wz
         ? validate_min(*min_wz, "min_wz") : -limits.max_wz;
     return limits;
+}
+
+inline PolicyCommandLimits LoadOnePolicyCommandLimits(
+        const robot_base::YamlFile &yaml, const std::string &policy_name) {
+    return LoadCommandLimits(yaml, "rl_policy.onnx_infer.policies." + policy_name,
+        "策略 " + policy_name);
 }
 
 inline PolicyCommandLimitMap LoadPolicyCommandLimits(

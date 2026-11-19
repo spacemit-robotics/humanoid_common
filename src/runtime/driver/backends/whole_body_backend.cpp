@@ -85,6 +85,7 @@ public:
         const auto yaml_file = robot_base::YamlFile::Load(yaml_path);
         const bool fixed_base = yaml_file.Read<bool>("robot_base.fixed_base").value_or(false);
         state_template_ = robot_base::RobotData::FromYaml(yaml_path);
+        state_template_.environment = robot_base::RuntimeEnvironment::REAL;
         const auto hardware_config = yaml_file.Read<std::string>("whole_body.config_file");
         if (hardware_config) {
             runtime_logging::RecordArtifact("hardware_config", "whole_body",
@@ -252,6 +253,8 @@ public:
                     }
                 } else {
                     RecoverFault(FaultContext::kStateAdapter);
+                    // The adapter rebuilds the state when its dimensions change.
+                    state.environment = state_template_.environment;
                     last_valid_state_ = state;
                     if (!PublishState(publish_state, state, current_fault_)) return 1;
                     const bool accepts_command = !recovery_active_ &&

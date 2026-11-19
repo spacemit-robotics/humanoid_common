@@ -162,6 +162,52 @@ void CheckReturnSpeed(const std::string &file) {
     Require(ticks >= 3750 && ticks <= 3752, "unexpected return duration");
 }
 
+// The catalog is owned by the state: a request for an action disabled in the
+// current environment must be rejected before it reaches the player.
+void CheckEnvironment(const std::string &path) {
+    namespace bm = behavior_manager;
+    using Phase = robot_base::InteractionStatus::Phase;
+    using Operation = robot_base::InteractionRequest::Operation;
+    bm::BehaviorManagerClass manager(path);
+    manager.Init();
+    auto sensor = robot_base::RobotData::FromYaml(path);
+    sensor.time = 1.0;
+    sensor.environment = robot_base::RuntimeEnvironment::REAL;
+    robot_base::Command command;
+    const auto step = [&]() {
+        sensor.time += 0.002;
+        manager.SetSensorData(sensor);
+        manager.SetCommand(command);
+        manager.Step(0.002F, 0.02F);
+        if (manager.GetOutput().enable) sensor.joint_pos = manager.GetOutput().target_pos;
+    };
+    for (int i = 0; i < 10000 && manager.CurrentState() != bm::StateName::TRAJECTORY; ++i) step();
+    Require(manager.CurrentState() == bm::StateName::TRAJECTORY, "trajectory unavailable");
+    for (int i = 0; i < 100; ++i) step();
+    const auto ready = manager.GetOutput().target_pos;
+    command.interaction = {1, Operation::START, "test"};
+    for (int i = 0; i < 100; ++i) step();
+    auto status = manager.CurrentInteractionStatus();
+    Require(status.sequence == 1 && !status.request_accepted && status.phase == Phase::REJECTED &&
+        status.action == "test" && manager.GetOutput().target_pos == ready,
+        "action disabled on the robot was played");
+    sensor.environment = robot_base::RuntimeEnvironment::SIMULATION;
+    command.interaction = {2, Operation::START, "test"};
+    step();
+    status = manager.CurrentInteractionStatus();
+    Require(status.sequence == 2 && status.request_accepted, "action enabled in simulation was rejected");
+    // A request rejected while another action runs keeps that action's phase.
+    sensor.environment = robot_base::RuntimeEnvironment::REAL;
+    command.interaction = {3, Operation::START, "test"};
+    step();
+    status = manager.CurrentInteractionStatus();
+    Require(status.sequence == 3 && !status.request_accepted && status.phase != Phase::REJECTED &&
+        status.phase != Phase::IDLE, "rejection hid the running action");
+    command = {};
+    command.key = -1;
+    step();
+}
+
 void CheckAutomaticStop(const std::string &path, bool inject_fault) {
     namespace bm = behavior_manager;
     bm::BehaviorManagerClass manager(path);
@@ -228,6 +274,15 @@ int main(int argc, char **argv) {
             CheckProfile((temporary / "config.yaml").string());
             CheckAutomaticStop((temporary / "config.yaml").string(), false);
             CheckAutomaticStop((temporary / "config.yaml").string(), true);
+            std::ofstream(temporary / "environment.yaml")
+                << "robot_base:\n  name: test\n  num_dof: 2\n  fixed_base: true\n"
+                "  robot_dir: .\n  joint_names: [a, b]\n  default_joint_pos: [0, 0]\n"
+                "  kp: [10, 10]\n  kd: [1, 1]\n"
+                "behavior_manager:\n  damp_kd: [1, 1]\n  zero_pos: [0, 0]\n"
+                "  trajectory:\n    enabled: true\n    prepare_on_start: true\n    action_names: [test]\n"
+                "    actions:\n      test:\n        file: action.npz\n        joint_indices: [0, 1]\n"
+                "        enabled_in: [sim]\n";
+            CheckEnvironment((temporary / "environment.yaml").string());
             std::filesystem::remove_all(temporary);
         }
         return 0;

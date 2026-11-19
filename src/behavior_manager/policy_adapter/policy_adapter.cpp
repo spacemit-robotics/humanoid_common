@@ -8,11 +8,11 @@
 
 #include "policy_adapter.h"
 #include "hiking_policy_adapter.h"
-#include "sonic_planner.h"
 
 #include "joint_trajectory_policy_adapter.h"
 #include "stance_motion_policy_adapter.h"
 #include "history_actor_policy_adapter.h"
+#include "motion_planner/planner_binding.h"
 #include "runtime_logger.h"
 
 #include <cnpy.h>
@@ -237,7 +237,7 @@ YAML::Node AtPath(YAML::Node node, const std::string &path) {
     return node;
 }
 
-class SupermimicPolicyAdapter final : public PolicyAdapter {
+class SupermimicPolicyAdapter final : public PolicyAdapter, private motion_planner::ReferenceSink {
 public:
     SupermimicPolicyAdapter(const Config &config,
         const rl_policy::PolicyExecutorConfig &policy)
@@ -312,10 +312,42 @@ public:
             reference.loop_pause = config_.loop_pause;
             reference_ = LoadReference(reference);
         }
+        if (config_.planners.Enabled()) {
+            Require(interactive_, "planners need a catalog that provides the standby reference");
+            Require(config_.planners.planners.front().context.num_dof == static_cast<int>(joints_),
+                "planner trajectories use the robot joint order, which must be the policy joint order");
+            // Holds explicit planner trajectories; not selectable as a catalog action.
+            planner_clip_ = clips_.size();
+            clips_.emplace_back();
+            // The conversion to the private base is only accessible inside the class.
+            config_.planners.prepare_trajectory =
+                [target = &clips_[planner_clip_].frames](const motion_planner::ReferenceTrajectory &trajectory) {
+                    std::vector<ReferenceFrame> frames;
+                    ConvertTrajectory(trajectory, &frames);
+                    return [target, frames = std::move(frames)]() mutable { target->swap(frames); };
+                };
+            motion_planner::ReferenceSink &sink = *this;
+            planner_ = std::make_unique<motion_planner::PlannerBinding>(config_.planners, sink);
+        }
     }
 
     const char *Type() const override { return "supermimic"; }
+
+    rl_policy::PolicyExecutor &SelectExecutor(const std::array<double, 3> &command,
+        rl_policy::PolicyExecutor &primary) override {
+        latest_command_.vx = static_cast<float>(command[0]);
+        latest_command_.vy = static_cast<float>(command[1]);
+        latest_command_.wz = static_cast<float>(command[2]);
+        return primary;
+    }
+
+    void OnInferenceStopped() override {
+        if (planner_) planner_->Suspend();
+    }
+
     bool ReadyForPolicySwitch() const override {
+        // A planner hands its reference back to standby before the policy leaves.
+        if (PlannerEngaged()) return false;
         if (interactive_) {
             return !transition_active_ && (!playback_active_ || status_.phase == Phase::FINISHED);
         }
@@ -326,10 +358,14 @@ public:
     }
 
     void PreparePolicySwitch(bool requested, double elapsed_s) override {
+        switch_requested_ = requested;
+        if (planner_ && requested) planner_->RequestRelease();
         if (interactive_) {
-            // Return to the default reference before another policy takes over.
+            // Return to the default reference before another policy takes over. A planner
+            // returns its own reference; that crossfade is left to finish.
             UpdateInteractionStatus(elapsed_s);
-            if (requested && !canceling_ && (playback_active_ || transition_active_)) {
+            if (requested && !canceling_ && !PlannerEngaged() &&
+                (playback_active_ || transition_active_)) {
                 BeginTransition(default_clip_, elapsed_s, false, true);
             }
         } else if (!reference_.empty()) {
@@ -362,6 +398,12 @@ public:
         transition_duration_ = 0.0;
         last_request_sequence_ = 0;
         status_ = {};
+        latest_command_ = {};
+        switch_requested_ = false;
+        planner_owned_ = false;
+        planner_continuous_ = false;
+        planner_transition_ = false;
+        if (planner_) planner_->Reset();
     }
 
     void PrepareInputs(const robot_base::RobotData &robot, double elapsed_s,
@@ -389,6 +431,10 @@ public:
         std::copy(previous_action_.begin(), previous_action_.end(),
             sample_.begin() + 2 * joints_ + 6);
 
+        if (planner_) {
+            UpdateInteractionStatus(elapsed_s);
+            planner_->Step(robot, latest_command_, elapsed_s, switch_requested_ || ActionBusy());
+        }
         PrepareGoal(elapsed_s);
         // Model bindings validate the goal size before history is mutated.
         policy.SetModelInput("supermimic_goal", goal_.data(), static_cast<int>(goal_.size()));
@@ -421,9 +467,20 @@ public:
             request.sequence <= last_request_sequence_) return;
         last_request_sequence_ = request.sequence;
         UpdateInteractionStatus(elapsed_s);
-        const bool busy = status_.phase == Phase::BLEND_IN || status_.phase == Phase::PLAYING ||
-            status_.phase == Phase::HOLDING || status_.phase == Phase::BLEND_OUT;
         status_.sequence = request.sequence;
+        if (PlannerEngaged()) {
+            // The planner owns the reference until it is stopped.
+            status_.request_accepted = false;
+            status_.phase = Phase::REJECTED;
+            status_.progress = 0.0F;
+            if (request.operation != Operation::CANCEL) {
+                status_.action = request.action;
+            } else if (status_.action.empty()) {
+                status_.action = "cancel";
+            }
+            return;
+        }
+        const bool busy = ActionBusy();
         if (request.operation == Operation::CANCEL) {
             status_.request_accepted = busy;
             if (!busy) {
@@ -448,6 +505,14 @@ public:
     }
 
     robot_base::InteractionStatus GetInteractionStatus() const override { return status_; }
+
+    void HandlePlannerRequest(const robot_base::PlannerRequest &request) override {
+        if (planner_) planner_->SetRequest(request);
+    }
+
+    const robot_base::PlannerStatus *PlannerStatus() const override {
+        return planner_ ? &planner_->Status() : nullptr;
+    }
 
 private:
     using Phase = robot_base::InteractionStatus::Phase;
@@ -476,6 +541,119 @@ private:
         ReferenceMotionConfig config;
         std::vector<ReferenceFrame> frames;
     };
+
+    bool ActionBusy() const {
+        return status_.phase == Phase::BLEND_IN || status_.phase == Phase::PLAYING ||
+            status_.phase == Phase::HOLDING || status_.phase == Phase::BLEND_OUT;
+    }
+
+    bool PlannerEngaged() const { return planner_ && planner_->Engaged(); }
+
+    // ==================== motion_planner::ReferenceSink ====================
+
+    std::string FollowAction(const std::string &action, double elapsed_s) override {
+        const auto clip = clips_by_name_.find(action);
+        if (clip == clips_by_name_.end()) return "action " + action + " is not in the catalog";
+        TakePlannerReference();
+        planner_continuous_ = false;
+        SwitchReference(clip->second, elapsed_s, true, false);
+        planner_transition_ = true;
+        return {};
+    }
+
+    std::string FollowTrajectory(const motion_planner::ReferenceTrajectory &trajectory,
+        const motion_planner::InstallReference &install,
+        bool finite,
+        bool replace,
+        double elapsed_s) override {
+        if (!replace) {
+            TakePlannerReference();
+            // Freezes the current goal as the crossfade source; the planner clip may then change.
+            SwitchReference(planner_clip_, elapsed_s, true, false);
+            planner_transition_ = true;
+        }
+        Clip &clip = clips_[planner_clip_];
+        install();
+        clip.config.motion_fps = trajectory.fps;
+        clip.config.playback_speed = 1.0;
+        clip.config.loop = false;
+        clip.config.loop_pause = 0.0;
+        planner_continuous_ = !finite;
+        // A continuous trajectory is sampled on the RL time axis it was planned on.
+        if (!finite) playback_start_elapsed_ = trajectory.start_time_s;
+        return {};
+    }
+
+    void FollowStandby(double elapsed_s) override {
+        planner_owned_ = false;
+        // The planner reference keeps playing underneath the fade, like a cancelled action.
+        SwitchReference(default_clip_, elapsed_s, false, true);
+        planner_continuous_ = false;
+        planner_transition_ = true;
+    }
+
+    // Progress of the action or finite trajectory the planner selected.
+    motion_planner::PlaybackState Playback(double elapsed_s) const override {
+        motion_planner::PlaybackState state;
+        const Clip &clip = clips_[active_clip_];
+        const double active = clip.frames.size() /
+            (clip.config.motion_fps * clip.config.playback_speed);
+        double elapsed = playback_active_ ? std::max(0.0, elapsed_s - playback_start_elapsed_) : 0.0;
+        if (clip.config.loop) {
+            elapsed = std::fmod(elapsed, active + clip.config.loop_pause);
+        } else {
+            state.finished = elapsed >= active;
+        }
+        state.progress = active <= 0.0
+            ? 1.0F : static_cast<float>(std::clamp(elapsed / active, 0.0, 1.0));
+        return state;
+    }
+
+    // The interaction status describes catalog actions started by the operator;
+    // it is cleared when the planner first takes the reference.
+    void TakePlannerReference() {
+        if (planner_owned_) return;
+        planner_owned_ = true;
+        status_.phase = Phase::IDLE;
+        status_.progress = 0.0F;
+        status_.action.clear();
+    }
+
+    static void ConvertTrajectory(const motion_planner::ReferenceTrajectory &trajectory,
+            std::vector<ReferenceFrame> *converted) {
+        const std::size_t frames = trajectory.FrameCount();
+        const float fps = static_cast<float>(trajectory.fps);
+        const auto position = [&](std::size_t frame) {
+            return Eigen::Map<const Eigen::Vector3f>(&trajectory.root_pos[frame * 3]);
+        };
+        const auto orientation = [&](std::size_t frame) {
+            const float *quat = &trajectory.root_quat[frame * 4];
+            return Eigen::Quaternionf(quat[0], quat[1], quat[2], quat[3]).normalized();
+        };
+        converted->resize(frames);
+        bool finite = std::isfinite(fps);
+        for (std::size_t frame = 0; frame < frames; ++frame) {
+            ReferenceFrame &out = (*converted)[frame];
+            const auto count = static_cast<std::ptrdiff_t>(trajectory.num_dof);
+            const auto joint = static_cast<std::ptrdiff_t>(frame) * count;
+            out.joint_pos.assign(trajectory.joint_pos.begin() + joint,
+                trajectory.joint_pos.begin() + joint + count);
+            out.joint_vel.assign(trajectory.joint_vel.begin() + joint,
+                trajectory.joint_vel.begin() + joint + count);
+            out.orientation = orientation(frame);
+            out.height = trajectory.root_pos[frame * 3 + 2];
+            // Forward difference; the last frame repeats the previous interval.
+            const std::size_t from = frame + 1 < frames ? frame : frame - 1;
+            out.linear_velocity = (position(from + 1) - position(from)) * fps;
+            Eigen::Quaternionf delta = orientation(from + 1) * orientation(from).conjugate();
+            if (delta.w() < 0.0F) delta.coeffs() = -delta.coeffs();
+            const Eigen::AngleAxisf rotation(delta);
+            out.angular_velocity = rotation.axis() * (rotation.angle() * fps);
+            finite = finite && out.linear_velocity.allFinite() && out.angular_velocity.allFinite() &&
+                out.orientation.coeffs().allFinite();
+        }
+        if (!finite) throw std::runtime_error("root velocities derived from the trajectory are not finite");
+    }
 
     std::vector<ReferenceFrame> LoadReference(const ReferenceMotionConfig &reference) const {
         Require(std::isfinite(reference.motion_fps) && reference.motion_fps > 0.0 &&
@@ -620,7 +798,15 @@ private:
                 PlaybackFrame(clips_[cancel_source_clip_], time - cancel_playback_start_elapsed_,
                     origin - cancel_playback_start_elapsed_, cancel_frame_);
             }
-            Interpolate(clip.frames, 0.0, playback_active_ ? clip.config.playback_speed : 0.0, target_);
+            if (planner_continuous_ && active_clip_ == planner_clip_) {
+                // A continuous planner trajectory keeps its own time axis while it is blended in.
+                const double origin = horizon_origin < 0.0 ? time : horizon_origin;
+                PlaybackFrame(clip, time - playback_start_elapsed_,
+                    origin - playback_start_elapsed_, target_);
+            } else {
+                Interpolate(clip.frames, 0.0,
+                    playback_active_ ? clip.config.playback_speed : 0.0, target_);
+            }
             Blend(target_, (time - transition_start_elapsed_) / duration, out);
         } else if (!playback_active_) {
             Interpolate(clip.frames, 0.0, 0.0, out);
@@ -631,7 +817,10 @@ private:
         }
     }
 
-    void BeginTransition(std::size_t clip, double elapsed_s, bool start_playback, bool canceling) {
+    // Crossfades from the current goal to the first frame of a clip; when canceling, the
+    // reference that was playing continues underneath the fade. Leaves the interaction
+    // status alone; BeginTransition adds it for catalog actions.
+    void SwitchReference(std::size_t clip, double elapsed_s, bool start_playback, bool canceling) {
         CatalogFrame(elapsed_s, frame_);
         transition_source_ = frame_;
         cancel_follows_playback_ = canceling && playback_active_ && !transition_active_;
@@ -647,11 +836,18 @@ private:
         transition_active_ = duration > 0.0;
         playback_active_ = start_playback;
         canceling_ = canceling;
-        status_.phase = canceling ? Phase::BLEND_OUT :
-            (transition_active_ ? Phase::BLEND_IN : Phase::PLAYING);
+        planner_transition_ = false;
         if (!transition_active_ && canceling_) {
             playback_active_ = false;
             canceling_ = false;
+        }
+    }
+
+    void BeginTransition(std::size_t clip, double elapsed_s, bool start_playback, bool canceling) {
+        SwitchReference(clip, elapsed_s, start_playback, canceling);
+        status_.phase = canceling ? Phase::BLEND_OUT :
+            (transition_active_ ? Phase::BLEND_IN : Phase::PLAYING);
+        if (!transition_active_ && canceling) {
             status_.phase = Phase::FINISHED;
             status_.progress = 1.0F;
         }
@@ -659,19 +855,22 @@ private:
 
     void UpdateInteractionStatus(double elapsed_s) {
         if (transition_active_) {
-            status_.progress = 0.0F;
+            // Transitions started by a planner do not belong to an operator action.
+            if (!planner_transition_) status_.progress = 0.0F;
             if (elapsed_s < transition_start_elapsed_ + transition_duration_) return;
             transition_active_ = false;
             if (canceling_) {
                 canceling_ = false;
                 playback_active_ = false;
+                if (planner_transition_) return;
                 status_.phase = Phase::FINISHED;
                 status_.progress = 1.0F;
                 return;
             }
-            status_.phase = Phase::PLAYING;
+            if (!planner_transition_) status_.phase = Phase::PLAYING;
         }
-        if (!playback_active_) return;
+        // Planner references report their progress through the planner status.
+        if (!playback_active_ || planner_owned_) return;
         const auto &clip = clips_[active_clip_];
         const double active = clip.frames.size() /
             (clip.config.motion_fps * clip.config.playback_speed);
@@ -755,6 +954,13 @@ private:
     GoalFrame target_;
     GoalFrame transition_source_;
     GoalFrame cancel_frame_;
+    motion_planner::MotionCommand latest_command_;
+    bool switch_requested_ = false;
+    std::unique_ptr<motion_planner::PlannerBinding> planner_;
+    std::size_t planner_clip_ = 0;                // Extra clip filled from planner trajectories.
+    bool planner_owned_ = false;       // The active clip was selected by the planner.
+    bool planner_continuous_ = false;  // Following a realtime trajectory on the RL time axis.
+    bool planner_transition_ = false;  // The active transition was started by the planner.
 };
 
 Config::SupermimicConfig LoadSupermimicConfig(
@@ -1410,8 +1616,11 @@ struct SonicClip {
  * 未来窗口和模型关节数由机型 YAML/策略配置提供；本类只实现 SONIC
  * reference encoder 的字段排列和 masking。机器人关节映射和 PD 参数仍全部
  * 由机型 YAML 提供。
+ *
+ * 配置 planners 后，参考在三个来源之间切换并做 transition_duration 过渡：
+ * 目录的待命参考、目录中的交互动作、规划器的发布（显式轨迹或目录动作名）。
  */
-class SonicPolicyAdapter final : public PolicyAdapter {
+class SonicPolicyAdapter final : public PolicyAdapter, private motion_planner::ReferenceSink {
 public:
     SonicPolicyAdapter(const Config &config,
         const rl_policy::PolicyExecutorConfig &policy_config)
@@ -1459,16 +1668,8 @@ public:
                 "SONIC encoder ready: provider=" + runtime.initialized_provider +
                 ", workers=" + runtime.worker_threads, false);
         }
-        if (config_.sonic_planner.Enabled()) {
-            if (config_.reference_motion_catalog.Enabled())
-                throw std::runtime_error("[policy_adapter] planner and motion catalog are exclusive");
-            planner_ = std::make_unique<SonicPlanner>(config_.sonic_planner, policy_config);
-            SonicClip clip;
-            clip.config.motion_fps = config_.sonic_planner.output_fps;
-            clips_.push_back(std::move(clip));
-        } else {
-            LoadReferences();
-        }
+        LoadReferences();
+        if (config_.planners.Enabled()) SetupPlanners(policy_config);
     }
 
     const char *Type() const override { return "sonic"; }
@@ -1483,27 +1684,30 @@ public:
 
     void RequestInferenceTermination() override {
         if (encoder_) encoder_->RequestInferenceTermination();
-        if (planner_) planner_->RequestStop();
+    }
+
+    void OnInferenceStopped() override {
+        if (planner_) planner_->Suspend();
     }
 
     bool ReadyForPolicySwitch() const override {
-        if (planner_) return planner_->Idle();
+        // A planner hands its reference back to standby before the policy leaves.
+        if (PlannerEngaged()) return false;
         return interactive_ ? !transition_active_ &&
             (!playback_active_ || status_.phase == robot_base::InteractionStatus::Phase::FINISHED)
             : handoff_.Ready();
     }
     bool PlaybackFinished() const override {
-        if (planner_) return false;
         return interactive_ ? status_.phase == robot_base::InteractionStatus::Phase::FINISHED &&
             playback_active_ : handoff_.Finished();
     }
     void PreparePolicySwitch(bool requested, double elapsed_s) override {
-        if (planner_) {
-            planner_switch_requested_ = requested;
-            return;
-        }
+        switch_requested_ = requested;
+        if (planner_ && requested) planner_->RequestRelease();
         if (interactive_) {
-            if (requested && !canceling_ && (playback_active_ || transition_active_))
+            // The crossfade that returns a planner reference to standby is left to finish.
+            if (requested && !canceling_ && !PlannerEngaged() &&
+                (playback_active_ || (transition_active_ && interaction_transition_)))
                 BeginTransition(default_clip_index_, elapsed_s, false, true);
         } else {
             const auto &clip = ActiveClip();
@@ -1521,19 +1725,15 @@ public:
         last_request_sequence_ = 0;
         transition_active_ = false;
         canceling_ = false;
+        interaction_transition_ = false;
         playback_active_ = !interactive_;
         status_ = {};
         last_robot_quat_ = RobotQuaternion(robot);
-        if (planner_) {
-            latest_command_ = {};
-            planner_switch_requested_ = false;
-            planner_motion_.reset();
-            playback_active_ = true;
-            heading_offset_ = Eigen::Quaternionf::Identity();
-            planner_->Reset(robot);
-            UpdatePlannerMotion(0.0, robot);
-            return;
-        }
+        latest_command_ = {};
+        switch_requested_ = false;
+        planner_owned_ = false;
+        planner_continuous_ = false;
+        if (planner_) planner_->Reset();
         UpdateHeadingOffset();
     }
 
@@ -1545,9 +1745,15 @@ public:
                 "[policy_adapter] SONIC elapsed_s 非法");
         }
         last_robot_quat_ = RobotQuaternion(robot);
-        if (planner_) UpdatePlannerMotion(elapsed_s, robot);
+        if (planner_) {
+            motion_planner::MotionCommand command;
+            command.vx = latest_command_.vx;
+            command.vy = latest_command_.vy;
+            command.wz = latest_command_.wz;
+            planner_->Step(robot, command, elapsed_s, switch_requested_ || ActionBusy());
+        }
         UpdateInteractionStatus(elapsed_s);
-        if (!interactive_ && !planner_) handoff_.Sample(PlaybackElapsed(elapsed_s),
+        if (!interactive_) handoff_.Sample(PlaybackElapsed(elapsed_s),
             static_cast<int>(ActiveClip().frames.size()), config_);
 
         const PlaybackSample sample = ActiveSample(elapsed_s);
@@ -1609,10 +1815,20 @@ public:
 
         using Operation = robot_base::InteractionRequest::Operation;
         using Phase = robot_base::InteractionStatus::Phase;
-        const bool busy = status_.phase == Phase::BLEND_IN ||
-            status_.phase == Phase::PLAYING ||
-            status_.phase == Phase::HOLDING ||
-            status_.phase == Phase::BLEND_OUT;
+        if (PlannerEngaged()) {
+            // The planner owns the reference until it is stopped.
+            status_.sequence = request.sequence;
+            status_.request_accepted = false;
+            status_.phase = Phase::REJECTED;
+            status_.progress = 0.0F;
+            if (request.operation != Operation::CANCEL) {
+                status_.action = request.action;
+            } else if (status_.action.empty()) {
+                status_.action = "cancel";
+            }
+            return;
+        }
+        const bool busy = ActionBusy();
         if (request.operation == Operation::CANCEL) {
             status_.sequence = request.sequence;
             if (!busy) {
@@ -1653,6 +1869,14 @@ public:
         return status_;
     }
 
+    void HandlePlannerRequest(const robot_base::PlannerRequest &request) override {
+        if (planner_) planner_->SetRequest(request);
+    }
+
+    const robot_base::PlannerStatus *PlannerStatus() const override {
+        return planner_ ? &planner_->Status() : nullptr;
+    }
+
 private:
     static constexpr int kEncoderModeDim = 4;
     static constexpr int kPositionDim = 3;
@@ -1663,21 +1887,131 @@ private:
     static constexpr int kSmplJointCount = 24;
     static constexpr int kWristPositionDim = 6;
 
-    void UpdatePlannerMotion(double elapsed_s, const robot_base::RobotData &robot) {
-        planner_->Update(robot, planner_switch_requested_
-            ? robot_base::Command{} : latest_command_, elapsed_s);
-        const auto motion = planner_->Motion();
-        if (motion == planner_motion_) return;
-        auto &frames = clips_.front().frames;
-        frames.resize(motion->frames.size());
-        for (std::size_t i = 0; i < frames.size(); ++i) {
-            frames[i].dof_pos = motion->frames[i].dof_pos;
-            frames[i].dof_vel = motion->frames[i].dof_vel;
-            const auto &q = motion->frames[i].root_quat;
-            frames[i].root_quat = Eigen::Quaternionf(q[0], q[1], q[2], q[3]).normalized();
+    void SetupPlanners(const rl_policy::PolicyExecutorConfig &policy_config) {
+        if (!interactive_) {
+            throw std::runtime_error(
+                "[policy_adapter] SONIC planners 需要 catalog 提供待命参考");
         }
-        playback_start_elapsed_ = motion->start_time_s;
-        planner_motion_ = motion;
+        const int robot_dof = config_.planners.planners.front().context.num_dof;
+        model_to_robot_.resize(model_dof_count_);
+        for (int joint = 0; joint < model_dof_count_; ++joint) {
+            const int robot_joint = policy_config.action_joint_index.empty()
+                ? joint : policy_config.action_joint_index[joint];
+            if (robot_joint < 0 || robot_joint >= robot_dof) {
+                throw std::runtime_error(
+                    "[policy_adapter] SONIC 模型关节映射超出机器人关节范围");
+            }
+            model_to_robot_[joint] = robot_joint;
+        }
+        // Holds explicit planner trajectories; not selectable as a catalog action.
+        planner_clip_index_ = clips_.size();
+        clips_.emplace_back();
+        clips_.back().config.loop = false;
+        clips_.back().config.loop_pause = 0.0;
+        config_.planners.prepare_trajectory =
+            [target = &clips_[planner_clip_index_].frames, mapping = model_to_robot_](
+                const motion_planner::ReferenceTrajectory &trajectory) {
+                auto frames = ConvertTrajectory(trajectory, mapping);
+                return [target, frames = std::move(frames)]() mutable { target->swap(frames); };
+            };
+        motion_planner::ReferenceSink &sink = *this;
+        planner_ = std::make_unique<motion_planner::PlannerBinding>(config_.planners, sink);
+    }
+
+    bool ActionBusy() const {
+        using Phase = robot_base::InteractionStatus::Phase;
+        return status_.phase == Phase::BLEND_IN || status_.phase == Phase::PLAYING ||
+            status_.phase == Phase::HOLDING || status_.phase == Phase::BLEND_OUT;
+    }
+
+    bool PlannerEngaged() const { return planner_ && planner_->Engaged(); }
+
+    // ==================== motion_planner::ReferenceSink ====================
+
+    std::string FollowAction(const std::string &action, double elapsed_s) override {
+        const auto clip = clips_by_name_.find(action);
+        if (clip == clips_by_name_.end()) return "action " + action + " is not in the catalog";
+        TakePlannerReference();
+        planner_continuous_ = false;
+        SwitchReference(CurrentReference(elapsed_s), clip->second, elapsed_s, true);
+        return {};
+    }
+
+    std::string FollowTrajectory(const motion_planner::ReferenceTrajectory &trajectory,
+        const motion_planner::InstallReference &install,
+        bool finite,
+        bool replace,
+        double elapsed_s) override {
+        auto &clip = clips_[planner_clip_index_];
+        clip.config.motion_fps = trajectory.fps;
+        if (replace) {
+            install();
+            playback_start_elapsed_ = trajectory.start_time_s;
+            return {};
+        }
+        // Sample the crossfade source before the planner clip is overwritten.
+        const SonicFrame source = CurrentReference(elapsed_s);
+        install();
+        TakePlannerReference();
+        planner_continuous_ = !finite;
+        SwitchReference(source, planner_clip_index_, elapsed_s, true);
+        if (trajectory.frame == motion_planner::ReferenceTrajectory::Frame::WORLD) {
+            heading_offset_ = Eigen::Quaternionf::Identity();
+        }
+        if (!finite) playback_start_elapsed_ = trajectory.start_time_s;
+        return {};
+    }
+
+    void FollowStandby(double elapsed_s) override {
+        planner_owned_ = false;
+        planner_continuous_ = false;
+        SwitchReference(CurrentReference(elapsed_s), default_clip_index_, elapsed_s, false);
+    }
+
+    // Progress of the action or finite trajectory the planner selected.
+    motion_planner::PlaybackState Playback(double elapsed_s) const override {
+        motion_planner::PlaybackState state;
+        const auto &clip = ActiveClip();
+        const double duration = clip.frames.size() /
+            (clip.config.motion_fps * clip.config.playback_speed);
+        double elapsed = PlaybackElapsed(elapsed_s);
+        if (clip.config.loop) {
+            elapsed = std::fmod(elapsed, duration + clip.config.loop_pause);
+        } else {
+            state.finished = elapsed >= duration;
+        }
+        state.progress = duration <= 0.0
+            ? 1.0F : static_cast<float>(std::clamp(elapsed / duration, 0.0, 1.0));
+        return state;
+    }
+
+    static std::vector<SonicFrame> ConvertTrajectory(const motion_planner::ReferenceTrajectory &trajectory,
+            const std::vector<int> &mapping) {
+        const std::size_t dof = static_cast<std::size_t>(trajectory.num_dof);
+        std::vector<SonicFrame> frames(trajectory.FrameCount());
+        for (std::size_t index = 0; index < frames.size(); ++index) {
+            auto &frame = frames[index];
+            frame.dof_pos.resize(mapping.size());
+            frame.dof_vel.resize(mapping.size());
+            for (std::size_t joint = 0; joint < mapping.size(); ++joint) {
+                const std::size_t source = index * dof + mapping[joint];
+                frame.dof_pos[joint] = trajectory.joint_pos[source];
+                frame.dof_vel[joint] = trajectory.joint_vel[source];
+            }
+            const float *quat = &trajectory.root_quat[index * 4];
+            frame.root_quat = Eigen::Quaternionf(quat[0], quat[1], quat[2], quat[3]).normalized();
+        }
+        return frames;
+    }
+
+    // The interaction status describes catalog actions started by the operator;
+    // it is cleared when the planner first takes the reference.
+    void TakePlannerReference() {
+        if (planner_owned_) return;
+        planner_owned_ = true;
+        status_.phase = robot_base::InteractionStatus::Phase::IDLE;
+        status_.progress = 0.0F;
+        status_.action.clear();
     }
 
     void ValidateConfig() const {
@@ -1881,7 +2215,7 @@ private:
 
     PlaybackSample ActiveSample(double elapsed_s) const {
         const auto &clip = ActiveClip();
-        if (!interactive_ && !planner_ && handoff_.Ready()) {
+        if (!interactive_ && handoff_.Ready()) {
             return SamplePlayback(static_cast<double>(clip.frames.size()) /
                 (clip.config.motion_fps * clip.config.playback_speed),
                 static_cast<int>(clip.frames.size()), clip.config.motion_fps,
@@ -1950,11 +2284,13 @@ private:
         heading_offset_.normalize();
     }
 
-    void BeginTransition(std::size_t clip_index,
+    // Crossfades from `source` to the first frame of a clip. Leaves the
+    // interaction status alone; BeginTransition adds it for catalog actions.
+    void SwitchReference(const SonicFrame &source,
+        std::size_t clip_index,
         double elapsed_s,
-        bool start_playback,
-        bool canceling) {
-        transition_source_ = CurrentReference(elapsed_s);
+        bool start_playback) {
+        transition_source_ = source;
         active_clip_index_ = clip_index;
         UpdateHeadingOffset();
         transition_start_elapsed_ = elapsed_s;
@@ -1963,7 +2299,17 @@ private:
         transition_active_ =
             config_.reference_motion_catalog.transition_duration > 0.0;
         playback_active_ = start_playback;
+        canceling_ = false;
+        interaction_transition_ = false;
+    }
+
+    void BeginTransition(std::size_t clip_index,
+        double elapsed_s,
+        bool start_playback,
+        bool canceling) {
+        SwitchReference(CurrentReference(elapsed_s), clip_index, elapsed_s, start_playback);
         canceling_ = canceling;
+        interaction_transition_ = true;
         status_.phase = canceling
             ? robot_base::InteractionStatus::Phase::BLEND_OUT
             : (transition_active_
@@ -1981,19 +2327,22 @@ private:
         if (!interactive_) return;
         using Phase = robot_base::InteractionStatus::Phase;
         if (transition_active_) {
-            status_.progress = 0.0F;
+            if (interaction_transition_) status_.progress = 0.0F;
             if (TransitionAlpha(elapsed_s) < 1.0) return;
             transition_active_ = false;
-            if (canceling_) {
-                canceling_ = false;
-                playback_active_ = false;
-                status_.phase = Phase::FINISHED;
-                status_.progress = 1.0F;
-                return;
+            if (interaction_transition_) {
+                if (canceling_) {
+                    canceling_ = false;
+                    playback_active_ = false;
+                    status_.phase = Phase::FINISHED;
+                    status_.progress = 1.0F;
+                    return;
+                }
+                status_.phase = Phase::PLAYING;
             }
-            status_.phase = Phase::PLAYING;
         }
-        if (!playback_active_) return;
+        // Planner references report their progress through the planner status.
+        if (!playback_active_ || planner_owned_) return;
 
         const auto &clip = ActiveClip();
         const double active_duration = clip.frames.size() /
@@ -2109,10 +2458,14 @@ private:
     uint64_t last_request_sequence_ = 0;
     robot_base::InteractionStatus status_;
     SonicFrame transition_source_;
-    std::unique_ptr<SonicPlanner> planner_;
-    std::shared_ptr<const SonicPlannerMotion> planner_motion_;
+    bool interaction_transition_ = false;  // Active transition belongs to a catalog action.
     robot_base::Command latest_command_;
-    bool planner_switch_requested_ = false;
+    bool switch_requested_ = false;
+    std::unique_ptr<motion_planner::PlannerBinding> planner_;
+    std::vector<int> model_to_robot_;     // Model joint -> robot joint, for planner trajectories.
+    std::size_t planner_clip_index_ = 0;  // Extra clip filled from planner trajectories.
+    bool planner_owned_ = false;          // The active clip was selected by the planner.
+    bool planner_continuous_ = false;     // Following a realtime trajectory on the RL timeline.
     Eigen::Quaternionf last_robot_quat_ = Eigen::Quaternionf::Identity();
     Eigen::Quaternionf heading_offset_ = Eigen::Quaternionf::Identity();
 };
@@ -2147,6 +2500,12 @@ Config LoadConfig(const std::string &yaml_path,
     }
     if (type) {
         config.type = *type;
+        if (config.type != "sonic" && config.type != "supermimic" &&
+            (yaml.Read<std::vector<std::string>>(adapter_base + ".planners") ||
+                yaml.Read<std::string>(adapter_base + ".auto_planner"))) {
+            throw std::runtime_error("[policy_adapter] " + adapter_base +
+                ".planners 只用于跟踪类 adapter（sonic、supermimic）");
+        }
         if (config.type == "hiking") {
             const double rl_dt = yaml.Read<double>("rl_policy.rl_dt").value_or(.02);
             const int decimation = yaml.Read<int>(policy_base + ".infer_decimation").value_or(1);
@@ -2277,83 +2636,20 @@ Config LoadConfig(const std::string &yaml_path,
             encoder.runtime.ep_options = yaml.Read<std::map<std::string, std::string>>(
                 encoder_base + ".runtime.ep_options").value_or(std::map<std::string, std::string>{});
         }
-        const std::string planner_base = adapter_base + ".planner";
-        const auto planner_model =
-            yaml.Read<std::string>(planner_base + ".model_path");
-        config.sonic_planner.enabled = yaml.Read<bool>(
-            planner_base + ".enabled").value_or(
-                planner_model && !planner_model->empty());
-        if (config.sonic_planner.enabled) {
-            if (config.type != "sonic") {
-                throw std::runtime_error(
-                    "[policy_adapter] planner 仅适用于 SONIC adapter");
-            }
-            if (!planner_model || planner_model->empty()) {
-                throw std::runtime_error(
-                    "[policy_adapter] SONIC planner 缺少 model_path");
-            }
-            config.sonic_planner.model_path =
-                ResolvePath(robot_dir, *planner_model).string();
-            config.sonic_planner.thread =
-                robot_base::ThreadLoop::FromYaml(yaml, "motion_planner");
-            if (config.sonic_planner.thread.cpu_id < 0 &&
-                config.sonic_planner.thread.cpu_affinity.empty()) {
-                config.sonic_planner.thread.cpu_affinity =
-                    robot_base::ThreadLoop::Background("motion_planner").cpu_affinity;
-            }
-            config.sonic_planner.runtime.provider = yaml.Read<std::string>(
-                planner_base + ".runtime.provider").value_or("cpu");
-            config.sonic_planner.runtime.threads = yaml.Read<int>(
-                planner_base + ".runtime.threads").value_or(2);
-            config.sonic_planner.runtime.affinity = yaml.Read<std::string>(
-                planner_base + ".runtime.affinity").value_or("");
-            config.sonic_planner.runtime.worker_sched = yaml.Read<std::string>(
-                planner_base + ".runtime.worker_sched").value_or("");
-            config.sonic_planner.runtime.worker_priority = yaml.Read<int>(
-                planner_base + ".runtime.worker_priority").value_or(0);
-            config.sonic_planner.runtime.ort_spinning = yaml.Read<bool>(
-                planner_base + ".runtime.ort_spinning").value_or(false);
-            config.sonic_planner.runtime.ep_dump_subgraphs = yaml.Read<bool>(
-                planner_base + ".runtime.ep_dump_subgraphs").value_or(false);
-            config.sonic_planner.runtime.ep_profile_prefix =
-                yaml.Read<std::string>(
-                    planner_base + ".runtime.ep_profile_prefix").value_or("");
-            config.sonic_planner.runtime.ep_options = yaml.Read<std::map<std::string, std::string>>(
-                planner_base + ".runtime.ep_options").value_or(std::map<std::string, std::string>{});
-            config.sonic_planner.output_fps = yaml.Read<double>(
-                planner_base + ".output_fps").value_or(config.motion_fps);
-            config.sonic_planner.check_interval = yaml.Read<double>(
-                planner_base + ".check_interval").value_or(0.1);
-            config.sonic_planner.replan_interval = yaml.Read<double>(
-                planner_base + ".replan_interval").value_or(1.0);
-            config.sonic_planner.running_replan_interval = yaml.Read<double>(
-                planner_base + ".running_replan_interval").value_or(0.1);
-            config.sonic_planner.crawling_replan_interval = yaml.Read<double>(
-                planner_base + ".crawling_replan_interval").value_or(0.2);
-            config.sonic_planner.lookahead = yaml.Read<double>(
-                planner_base + ".lookahead").value_or(0.04);
-            config.sonic_planner.default_height = yaml.Read<double>(
-                planner_base + ".default_height").value_or(0.788740);
-            config.sonic_planner.facing_horizon = yaml.Read<double>(
-                planner_base + ".facing_horizon").value_or(1.0);
-            config.sonic_planner.command_epsilon = yaml.Read<double>(
-                planner_base + ".command_epsilon").value_or(1.0e-3);
-            config.sonic_planner.slow_walk_max_speed = yaml.Read<double>(
-                planner_base + ".slow_walk_max_speed").value_or(0.8);
-            config.sonic_planner.walk_max_speed = yaml.Read<double>(
-                planner_base + ".walk_max_speed").value_or(2.5);
-            config.sonic_planner.mode = yaml.Read<int>(
-                planner_base + ".mode").value_or(-1);
-            config.sonic_planner.random_seed = yaml.Read<int>(
-                planner_base + ".random_seed").value_or(1234);
-            config.sonic_planner.allowed_pred_num_tokens =
-                yaml.Read<std::vector<int>>(
-                    planner_base + ".allowed_pred_num_tokens")
-                    .value_or(std::vector<int>{
-                        0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0});
+        if (yaml.Read<std::string>(adapter_base + ".planner.model_path") ||
+            yaml.Read<bool>(adapter_base + ".planner.enabled")) {
+            throw std::runtime_error("[policy_adapter] " + adapter_base +
+                ".planner 已不再支持：请在顶层 motion_planners 下登记规划器，并在 " +
+                adapter_base + ".planners 中引用");
         }
+        config.planners = motion_planner::LoadHostConfig(
+            yaml_path, policy_name, robot_dir, config.motion_fps);
         const auto catalog = yaml.Read<std::string>(
             adapter_base + ".catalog");
+        if (config.planners.Enabled() && (!catalog || catalog->empty())) {
+            throw std::runtime_error("[policy_adapter] " + adapter_base +
+                ".planners 需要同时配置 catalog 提供待命参考");
+        }
         if ((config.type == "sonic" || config.type == "supermimic") &&
             catalog && !catalog->empty()) {
             const std::string catalog_base = *catalog;
@@ -2385,6 +2681,11 @@ Config LoadConfig(const std::string &yaml_path,
                     yaml.Read<std::string>(
                         catalog_base + ".default_action")
                             .value_or(action_names.front()));
+            const auto standby_path = catalog_base + ".actions." + motion_catalog.default_action + ".enabled_in";
+            if (!robot_base::EnvironmentSet::FromYaml(yaml, standby_path).Covers(
+                    robot_base::EnvironmentSet::FromYaml(yaml, policy_base + ".enabled_in"))) {
+                throw std::runtime_error(standby_path + " must cover every environment of " + policy_name);
+            }
             for (const auto &name : action_names) {
                 const std::string action_base =
                     catalog_base + ".actions." + name;
@@ -2418,8 +2719,8 @@ Config LoadConfig(const std::string &yaml_path,
                     "[policy_adapter] default_action 不在动作目录中: " +
                     motion_catalog.default_action);
             }
-        } else if (!config.sonic_planner.Enabled() &&
-            (config.type != "supermimic" || yaml.Read<std::string>(adapter_base + ".reference_file"))) {
+        } else if (config.type != "supermimic" ||
+            yaml.Read<std::string>(adapter_base + ".reference_file")) {
             config.reference_file =
                 ReadReferenceField(yaml, adapter_base, robot_dir);
         }

@@ -46,6 +46,12 @@ struct Config {
     std::vector<Policy> policies;
     bool trajectory_enabled = false;
     std::vector<Action> actions;
+    // enabled_in of policies and of their actions, keyed by policy name; the
+    // standalone trajectory catalog uses the empty key. Clients only receive
+    // the entries enabled in the environment reported by the driver.
+    std::map<std::string, robot_base::EnvironmentSet> policy_environments;
+    std::map<std::string, std::map<std::string, robot_base::EnvironmentSet>> action_environments;
+    std::map<std::string, robot_base::EnvironmentSet> planner_environments;  // Keyed by planner name.
     std::vector<std::string> joint_names;
     std::string feedback_frame_id;
 };
@@ -68,6 +74,8 @@ public:
     RobotFeedback FeedbackSnapshot() const;
     bool FeedbackSubscribed(uint64_t session) const;
     Json Catalog() const;
+    /** @brief Changes whenever Catalog() would return different entries. */
+    uint64_t CatalogRevision() const { return catalog_revision_; }
     robot_base::Command Command() const;
     void MarkCommandSent() { command_sent_ = true; }
     uint64_t AcknowledgeSequence() const { return acknowledge_sequence_; }
@@ -86,6 +94,7 @@ private:
     Json ReplyTo(uint64_t id, bool ok, const std::string &code, const std::string &message,
         const Json &data = Json::object()) const;
     bool Online() const;
+    void CancelPendingPlannerStart();
     void ClearInput(const std::string &reason, bool immediate = false);
     void ClearVelocity(bool immediate);
     void AdvanceVelocity(double now);
@@ -93,7 +102,16 @@ private:
     bool SelectPreset(uint64_t session, const std::string &preset);
     void Finish(const std::string &phase, const std::string &message);
     const Policy *ActivePolicy() const;
+    // Velocity range, presets and smoothing in effect: the running planner's, else the policy's.
+    const Policy *CommandPolicy() const;
+    const Planner *ActivePlanner(const std::string &name) const;
+    bool PlannerEnabled(const std::string &planner) const;
+    bool PolicyEnabled(const std::string &policy) const;
+    bool ActionEnabled(const std::string &policy, const std::string &action) const;
+    std::string EnvironmentMessage(const std::string &item) const;
     Config config_;
+    std::map<std::string, Policy> planner_profiles_;  // Planner velocity settings, as a Policy.
+    uint64_t catalog_revision_ = 0;
     std::map<uint64_t, Session> sessions_;
     uint64_t next_session_ = 0;
     uint64_t owner_ = 0;

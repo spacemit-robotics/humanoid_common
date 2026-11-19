@@ -15,9 +15,14 @@
  * 用法: ./test_robot_base [yaml配置文件路径]
  */
 
+#include <unistd.h>
+
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 #include "robot_base.h"
@@ -111,6 +116,42 @@ int main(int argc, char *argv[]) {
             std::cout << "\n提示: 提供 YAML 文件路径可运行 YamlFile 和 RobotData::FromYaml 测试"
                 << std::endl;
             std::cout << "用法: " << argv[0] << " <yaml配置文件路径>" << std::endl;
+        }
+
+        // ========== EnvironmentSet（enabled_in）==========
+        std::cout << "\n--- EnvironmentSet ---" << std::endl;
+        {
+            using robot_base::EnvironmentSet;
+            using robot_base::RuntimeEnvironment;
+            const std::string path = "/tmp/robot_base_environment_" + std::to_string(::getpid()) + ".yaml";
+            std::ofstream(path) << "sim_only: {enabled_in: [sim]}\nboth: {enabled_in: [real, sim]}\n"
+                "unrestricted: {}\nscalar: {enabled_in: sim}\nempty: {enabled_in: []}\n"
+                "unknown: {enabled_in: [hardware]}\nmap: {enabled_in: {sim: true}}\n"
+                "mixed: {enabled_in: [sim, [real]]}\nnull_value: {enabled_in: null}\n";
+            const YamlFile environments = YamlFile::Load(path);
+            std::remove(path.c_str());
+            const auto sim_only = EnvironmentSet::FromYaml(environments, "sim_only.enabled_in");
+            const auto both = EnvironmentSet::FromYaml(environments, "both.enabled_in");
+            const auto unrestricted = EnvironmentSet::FromYaml(environments, "unrestricted.enabled_in");
+            bool ok = sim_only.Allows(RuntimeEnvironment::SIMULATION) &&
+                !sim_only.Allows(RuntimeEnvironment::REAL) && !sim_only.Allows(RuntimeEnvironment::UNKNOWN) &&
+                both.Allows(RuntimeEnvironment::REAL) && both.Allows(RuntimeEnvironment::UNKNOWN) &&
+                unrestricted.Allows(RuntimeEnvironment::REAL) && unrestricted.Covers(sim_only) &&
+                !sim_only.Covers(unrestricted) && sim_only.Covers(sim_only);
+            for (const char *invalid : {"scalar", "empty", "unknown", "map", "mixed", "null_value"}) {
+                try {
+                    (void)EnvironmentSet::FromYaml(environments, std::string(invalid) + ".enabled_in");
+                    ok = false;
+                } catch (const std::runtime_error &) {
+                }
+            }
+            ok = ok && std::string(robot_base::RuntimeEnvironmentName(RuntimeEnvironment::SIMULATION)) == "sim" &&
+                std::string(robot_base::RuntimeEnvironmentName(RuntimeEnvironment::REAL)) == "real";
+            if (!ok) {
+                std::cerr << "[错误] enabled_in 解析或环境判断不符合预期\n";
+                return 1;
+            }
+            std::cout << "EnvironmentSet ✓" << std::endl;
         }
 
         // ========== RobotData::Create ==========

@@ -89,6 +89,7 @@ public:
      * @brief 获取当前 RL 内部交互动作状态
      */
     robot_base::InteractionStatus CurrentInteractionStatus() const;
+    robot_base::PlannerStatus CurrentPlannerStatus() const;
 
     /**
      * @brief 设置共享数据指针（所有状态共享）

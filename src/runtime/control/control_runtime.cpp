@@ -37,6 +37,7 @@
 
 #include "transport_executor.h"
 #include "behavior_manager.h"
+#include "planner_catalog.h"
 #include "policy_command_limits.h"
 #include "robot_base.h"
 #include "runtime_logger.h"
@@ -306,13 +307,17 @@ int main(int argc, char *argv[]) {
     robot_base::YamlFile yaml_file;
     bool trajectory_enabled = false;
     runtime_config::PolicyCommandLimitMap policy_command_limits;
+    runtime_config::PolicyCommandLimitMap planner_command_limits;
     std::unique_ptr<runtime_logging::Session> logging_session;
     int startup_ready_fd = -1;
     try {
         startup_ready_fd = StartupReadyFd();
         yaml_file = robot_base::YamlFile::Load(yaml_path);
         trajectory_enabled = yaml_file.Read<bool>("behavior_manager.trajectory.enabled").value_or(false);
-        if (!trajectory_enabled) policy_command_limits = runtime_config::LoadPolicyCommandLimits(yaml_file);
+        if (!trajectory_enabled) {
+            policy_command_limits = runtime_config::LoadPolicyCommandLimits(yaml_file);
+            planner_command_limits = runtime_config::LoadPlannerCommandLimits(yaml_file);
+        }
         logging_session = std::make_unique<runtime_logging::Session>(
             yaml_file, yaml_path, "control", false);
     } catch (const std::exception &e) {
@@ -390,6 +395,9 @@ int main(int argc, char *argv[]) {
     bool status_send_failed = false;
     bool interaction_report_invalid = false;
     control_runtime::InteractionReportCache interaction_report;
+    bool planner_report_invalid = false;
+    // 运行中的规划器的速度范围；随状态回传更新，规划器未运行时为空
+    const runtime_config::PolicyCommandLimits *planner_limits = nullptr;
     const auto joint_names =
         yaml_file.Read<std::vector<std::string>>("robot_base.joint_names").value_or(
             std::vector<std::string>{});
@@ -547,6 +555,13 @@ int main(int argc, char *argv[]) {
             cmd.switch_policy.clear();
             cmd.policy_request_sequence = 0;
             if (hmi_just_disconnected) {
+                const auto planner = bm.CurrentPlannerStatus();
+                using Phase = robot_base::PlannerStatus::Phase;
+                if (cmd.planner.operation == robot_base::PlannerRequest::Operation::START ||
+                    (planner.phase != Phase::IDLE && planner.phase != Phase::READY &&
+                        planner.phase != Phase::FAILED && planner.phase != Phase::STOPPING)) {
+                    cmd.planner.StopAfter(planner.sequence);
+                }
                 ++cmd.interaction.sequence;
                 if (cmd.interaction.sequence == 0) {
                     ++cmd.interaction.sequence;
@@ -558,8 +573,10 @@ int main(int argc, char *argv[]) {
             fault_ack_sequence = 0;
         }
         if (bm.CurrentState() == behavior_manager::StateName::RL) {
-            const auto *limits = runtime_config::FindPolicyCommandLimits(
-                policy_command_limits, bm.CurrentPolicyName());
+            // 规划器运行期间速度指令交给规划器，范围取规划器的 command.limits。
+            const auto *limits = planner_limits ? planner_limits
+                : runtime_config::FindPolicyCommandLimits(
+                    policy_command_limits, bm.CurrentPolicyName());
             runtime_config::ApplyPolicyCommandLimits(limits, &cmd);
         } else {
             // 禁止在非 RL 状态预置速度，避免进入 RL 时突然起步。
@@ -725,6 +742,23 @@ int main(int argc, char *argv[]) {
             status.active_policy = bm.CurrentPolicySelectionName();
             status.policy_switch = bm.CurrentPolicySwitchStatus();
             status.interaction = bm.CurrentInteractionStatus();
+            status.environment = latest_state.environment;
+            status.planner = bm.CurrentPlannerStatus();
+            const bool planner_valid = transport::IsValidPlannerStatus(status.planner);
+            if (!planner_valid) {
+                if (!planner_report_invalid) {
+                    runtime_logging::Log(runtime_logging::Level::kWarning,
+                        "invalid planner status; reporting an idle planner, "
+                        "core control status continues", false);
+                }
+                status.planner = {};
+            }
+            planner_report_invalid = !planner_valid;
+            planner_limits =
+                status.planner.phase == robot_base::PlannerStatus::Phase::RUNNING
+                ? runtime_config::FindPolicyCommandLimits(
+                    planner_command_limits, status.planner.planner)
+                : nullptr;
             const bool interaction_valid = interaction_report.Update(&status);
             if (!interaction_valid && !interaction_report_invalid) {
                 runtime_logging::Log(runtime_logging::Level::kWarning,

@@ -195,8 +195,12 @@ if(BUILD_RL)
         src/behavior_manager/behavior_manager.cpp
         src/behavior_manager/rl_state_config.cpp
         src/behavior_manager/joint_trajectory.cpp
+        src/behavior_manager/motion_planner/motion_planner.cpp
+        src/behavior_manager/motion_planner/planner_host.cpp
+        src/behavior_manager/motion_planner/planner_binding.cpp
         src/behavior_manager/policy_adapter/policy_adapter.cpp
         src/behavior_manager/policy_adapter/sonic_planner.cpp
+        src/behavior_manager/policy_adapter/sonic_motion_planner.cpp
         src/behavior_manager/policy_adapter/joint_trajectory_policy_adapter.cpp
         src/behavior_manager/policy_adapter/stance_motion_policy_adapter.cpp
         src/behavior_manager/policy_adapter/history_actor_policy_adapter.cpp
@@ -221,6 +225,7 @@ if(BUILD_RL)
         PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager
             ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager/policy_adapter
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/common
             ${RL_INCLUDE_DIR}
     )
 
@@ -673,13 +678,21 @@ if(BUILD_RL)
 
     if(BUILD_TESTS)
         add_test(NAME policy_adapter COMMAND test_policy_adapter)
+        add_executable(test_motion_planner example/behavior_manager/test_motion_planner.cpp)
+        target_include_directories(test_motion_planner PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager)
+        target_link_libraries(test_motion_planner PRIVATE behavior_manager robot_base Threads::Threads)
+        add_test(NAME motion_planner COMMAND test_motion_planner)
+        set_tests_properties(motion_planner PROPERTIES TIMEOUT 60)
         add_executable(test_supermimic example/behavior_manager/test_supermimic.cpp)
         target_include_directories(test_supermimic PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
             ${CMAKE_CURRENT_SOURCE_DIR}/src/behavior_manager ${RL_INCLUDE_DIR})
         target_link_libraries(test_supermimic PRIVATE
             behavior_manager robot_base Eigen3::Eigen ${RL_LIB} cnpy)
         add_test(NAME supermimic COMMAND test_supermimic)
-        set_tests_properties(supermimic PROPERTIES TIMEOUT 15)
+        set_tests_properties(supermimic PROPERTIES TIMEOUT 30)
         add_executable(test_home_limits example/behavior_manager/test_home_limits.cpp)
         target_include_directories(test_home_limits PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/include

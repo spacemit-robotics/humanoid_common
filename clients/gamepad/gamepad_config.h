@@ -58,10 +58,19 @@ inline Config ReadConfig(const YAML::Node &root) {
     for (const auto &[code, name] : c.input.buttons)
         if (!names.insert(name).second) throw std::runtime_error("duplicated gamepad button name");
     const std::set<std::string> operations{
-        "control", "state", "policy", "preset", "action", "cancel", "ack", "reference"};
+        "control", "state", "policy", "preset", "action", "cancel", "ack", "reference", "planner"};
     const auto policies = root["rl_policy"]["onnx_infer"]["policy_names"].as<std::vector<std::string>>();
     const auto known_policy = [&](const std::string &name) {
         return std::find(policies.begin(), policies.end(), name) != policies.end();
+    };
+    // A planner is started inside a tracker policy that lists it under policy_adapter.planners.
+    const auto lists_planner = [&](const std::string &policy, const std::string &planner) {
+        const auto entries = root["rl_policy"]["onnx_infer"]["policies"];
+        if (!entries || !entries[policy] || !entries[policy]["policy_adapter"]) return false;
+        const auto list = entries[policy]["policy_adapter"]["planners"];
+        if (!list || !list.IsSequence()) return false;
+        const auto names = list.as<std::vector<std::string>>();
+        return std::find(names.begin(), names.end(), planner) != names.end();
     };
     for (const auto &node : pad["bindings"]) {
         const auto buttons = node["buttons"].as<std::vector<std::string>>();
@@ -87,6 +96,11 @@ inline Config ReadConfig(const YAML::Node &root) {
             throw std::runtime_error("gamepad policy is not in selectable catalog");
         if (b.operation == "preset" && b.value != "slow" && b.value != "fast" && b.value != "toggle")
             throw std::runtime_error("unknown speed preset");
+        if (b.operation == "planner" && !(b.policy.empty()
+                ? std::any_of(policies.begin(), policies.end(),
+                    [&](const std::string &policy) { return lists_planner(policy, b.value); })
+                : lists_planner(b.policy, b.value)))
+            throw std::runtime_error("gamepad planner is not listed by the bound policy");
         c.bindings.push_back(std::move(b));
     }
     if (c.bindings.empty()) throw std::runtime_error("empty gamepad bindings");

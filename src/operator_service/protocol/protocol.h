@@ -11,6 +11,7 @@
 namespace operator_service {
 using Json = nlohmann::json;
 Json Encode(const Velocity &v);
+Json Encode(const Planner &v);
 Json Encode(const Policy &v);
 Json Encode(const RequestResult &v);
 Json Encode(const Status &v);

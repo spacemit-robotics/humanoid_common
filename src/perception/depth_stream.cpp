@@ -11,14 +11,39 @@ namespace perception {
 namespace {
 int Reflect(int i, int n) { return i < 0 ? -i : (i >= n ? 2 * n - 2 - i : i); }
 } // namespace
-std::vector<float> Preprocess(const std::vector<float> &raw) {
+std::vector<float> FillDepthHoles(const std::vector<float> &raw) {
     if (raw.size() != kPixels)
         throw std::runtime_error("depth size must be 64x36");
+    auto filled = raw;
+    for (int y = 0; y < kHeight; ++y)
+        for (int x = 0; x < kWidth; ++x) {
+            const int index = y * kWidth + x;
+            if (std::isfinite(raw[index]) && raw[index] > 0) continue;
+            float value = 2.5f;
+            int best = 5;
+            // A radius of two pixels fills small 3x3 holes without flooding
+            // large missing regions. Ties use ascending row then column.
+            for (int dy = -2; dy <= 2; ++dy)
+                for (int dx = -2; dx <= 2; ++dx) {
+                    const int distance = dx * dx + dy * dy;
+                    const int yy = y + dy, xx = x + dx;
+                    if (distance >= best || yy < 0 || yy >= kHeight || xx < 0 || xx >= kWidth) continue;
+                    const float donor = raw[yy * kWidth + xx];
+                    if (std::isfinite(donor) && donor > 0) {
+                        best = distance;
+                        value = donor;
+                    }
+                }
+            filled[index] = value;
+        }
+    return filled;
+}
+std::vector<float> Preprocess(const std::vector<float> &raw) {
+    const auto filled = FillDepthHoles(raw);
     std::vector<float> crop(kFrame), result(kFrame);
     for (int y = 0; y < 18; ++y)
         for (int x = 0; x < 32; ++x) {
-            const float d = raw[(y + 18) * 64 + x + 16];
-            crop[y * 32 + x] = !std::isfinite(d) || d <= 0 ? 2.5f : d;
+            crop[y * 32 + x] = filled[(y + 18) * 64 + x + 16];
         }
     const float e = std::exp(-.5f), sum = 1 + 2 * e;
     const float kernel[3] = {e / sum, 1 / sum, e / sum};

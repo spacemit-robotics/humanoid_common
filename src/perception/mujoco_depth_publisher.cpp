@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "mujoco_depth_publisher.h"
 #include "depth_stream.h"
+#include "robot_base.h"
 #include "runtime_logger.h"
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
+#include <algorithm>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <mujoco/mujoco.h>
 #include <sstream>
 #include <stdexcept>
@@ -17,15 +20,22 @@ namespace perception {
 class MujocoDepthPublisher::Impl {
     public:
     std::string endpoint;
+    SimDepthConfig config;
+    SimDepthRate rate;
+    SimDepthDegrader degrader;
     std::mutex mutex;
     std::condition_variable condition;
     bool stop = false, pending = false, subscribed = false;
     mjModel *model = nullptr;
     mjData *snapshot = nullptr;
-    double last = -1;
+    double observed = -1, last_report = -1;
     uint64_t epoch = 0;
+    uint64_t applied_epoch = 0;
+    std::deque<Frame> delayed;
     std::thread worker;
-    explicit Impl(std::string address) : endpoint(std::move(address)), worker([this] { Loop(); }) {}
+    Impl(std::string address, const SimDepthConfig &settings)
+        : endpoint(std::move(address)), config(settings), rate(config.fps), degrader(config),
+            worker([this] { Loop(); }) {}
     ~Impl() {
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -40,14 +50,17 @@ class MujocoDepthPublisher::Impl {
     }
     void Observe(double time, const void *m, const void *d) {
         std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
-        if (!lock || !subscribed || pending)
-            return;
-        if (time < last) {
+        if (!lock) return;
+        if (time < observed) {
             ++epoch;
-            last = -1;
+            rate.Reset();
+            delayed.clear();
+            last_report = -1;
         }
-        if (last >= 0 && time - last < .02 - 1e-9)
-            return;
+        observed = time;
+        if (!delayed.empty() && time + 1e-9 >= delayed.front().time + config.latency_s)
+            condition.notify_one();
+        if (!subscribed || pending || !rate.Due(time)) return;
         if (!model) {
             model = mj_copyModel(nullptr, static_cast<const mjModel *>(m));
             if (model) {
@@ -69,6 +82,11 @@ class MujocoDepthPublisher::Impl {
                 runtime_logging::Log(runtime_logging::Level::kInfo,
                     "[depth publisher] SDK camera XML FOV=" + std::to_string(xml_fovy) +
                     " deg; offscreen FOV=58.29 deg; SDK physics unchanged", false);
+                runtime_logging::Log(runtime_logging::Level::kInfo,
+                    "[depth publisher] FPS=" + std::to_string(config.fps) +
+                    "; simulated latency_s=" + std::to_string(config.latency_s) +
+                    "; synthetic defects=" + (config.enabled ? "enabled" : "disabled") +
+                    "; seed=" + std::to_string(config.seed), false);
             }
         }
         if (!model)
@@ -78,7 +96,6 @@ class MujocoDepthPublisher::Impl {
         if (!snapshot)
             throw std::runtime_error("depth snapshot allocation failed");
         mj_copyData(snapshot, model, static_cast<const mjData *>(d));
-        last = time;
         pending = true;
         condition.notify_one();
     }
@@ -92,6 +109,7 @@ class MujocoDepthPublisher::Impl {
         mjrContext render;
         mjr_defaultContext(&render);
         try {
+            robot_base::ThreadLoop::Background("sim_depth").Apply();
             ctx = zmq_ctx_new();
             if (!ctx)
                 throw std::runtime_error("depth ZMQ context failed");
@@ -117,10 +135,20 @@ class MujocoDepthPublisher::Impl {
                 while ((size = zmq_recv(socket, &event, 1, ZMQ_DONTWAIT)) >= 0)
                     if (size == 1)
                         subscribed = event != 0;
-                if (!subscribed)
+                if (!subscribed) {
                     pending = false;
+                    delayed.clear();
+                }
+                while (!delayed.empty() && observed + 1e-9 >= delayed.front().time + config.latency_s) {
+                    const auto packet = Encode(delayed.front());
+                    zmq_send(socket, packet.data(), packet.size(), ZMQ_DONTWAIT);
+                    delayed.pop_front();
+                }
                 if (!pending) {
-                    condition.wait_for(lock, std::chrono::milliseconds(20), [this] { return stop || pending; });
+                    condition.wait_for(lock, std::chrono::milliseconds(20), [this] {
+                        return stop || pending || (!delayed.empty() &&
+                            observed + 1e-9 >= delayed.front().time + config.latency_s);
+                    });
                     continue;
                 }
                 const int camera = mj_name2id(model, mjOBJ_CAMERA, "rgbd_camera");
@@ -142,6 +170,7 @@ class MujocoDepthPublisher::Impl {
                 const int torso = mj_name2id(model, mjOBJ_BODY, "torso_link");
                 if (torso < 0 || model->cam_bodyid[camera] != torso)
                     throw std::runtime_error("scene camera must attach to torso_link");
+                const bool warming_up = !ready;
                 if (!ready) {
                     auto platform = reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(
                         eglGetProcAddress("eglGetPlatformDisplayEXT"));
@@ -193,6 +222,14 @@ class MujocoDepthPublisher::Impl {
                 mjr_render(viewport, &scene, &render);
                 float zbuffer[kPixels];
                 mjr_readPixels(nullptr, zbuffer, viewport, &render);
+                if (warming_up) {
+                    // EGL setup and the first draw may compile shaders for
+                    // hundreds of ms. Never publish this stale first snapshot.
+                    // Restart deadlines with a fresh physics snapshot instead.
+                    pending = false;
+                    rate.Reset();
+                    continue;
+                }
                 const double near = model->vis.map.znear * model->stat.extent;
                 const double far = model->vis.map.zfar * model->stat.extent;
                 Frame frame;
@@ -209,8 +246,22 @@ class MujocoDepthPublisher::Impl {
                         frame.pixels[y * 64 + x] =
                             (!std::isfinite(distance) || distance >= .99 * far) ? 0 : distance;
                     }
-                const auto packet = Encode(frame);
-                zmq_send(socket, packet.data(), packet.size(), ZMQ_DONTWAIT);
+                if (applied_epoch != epoch) {
+                    degrader.Reset();
+                    applied_epoch = epoch;
+                }
+                degrader.Apply(frame.pixels);
+                if (last_report < 0 || frame.time - last_report >= 1) {
+                    const auto holes = std::count(frame.pixels.begin(), frame.pixels.end(), 0.f);
+                    runtime_logging::Log(runtime_logging::Level::kInfo,
+                        "[depth publisher] raw invalid=" + std::to_string(100.0 * holes / kPixels) +
+                        "%; capture_time=" + std::to_string(frame.time), false);
+                    last_report = frame.time;
+                }
+                // Simulation-time delivery preserves acquisition timestamps and
+                // never sleeps on the physics thread. <=120 FPS / 1 s is bounded.
+                if (delayed.size() >= 128) delayed.pop_front();
+                delayed.push_back(std::move(frame));
                 pending = false;
             }
         } catch (const std::exception &e) {
@@ -233,8 +284,8 @@ class MujocoDepthPublisher::Impl {
         }
     }
 };
-MujocoDepthPublisher::MujocoDepthPublisher(std::string e)
-    : impl_(std::make_unique<Impl>(std::move(e))) {}
+MujocoDepthPublisher::MujocoDepthPublisher(std::string e, const SimDepthConfig &config)
+    : impl_(std::make_unique<Impl>(std::move(e), config)) {}
 MujocoDepthPublisher::~MujocoDepthPublisher() = default;
 void MujocoDepthPublisher::Observe(double t, const void *m, const void *d) {
     impl_->Observe(t, m, d);

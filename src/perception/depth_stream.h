@@ -25,6 +25,9 @@ struct Frame {
     std::string clock;
     std::vector<float> pixels;
 };
+// Fill holes from the nearest original valid pixel within a two-pixel radius.
+// Donors never propagate; unsupported holes fall back to 2.5 m.
+std::vector<float> FillDepthHoles(const std::vector<float> &raw);
 std::vector<float> Preprocess(const std::vector<float> &raw);
 std::vector<unsigned char> Encode(const Frame &frame);
 Frame Decode(const void *data, size_t size);

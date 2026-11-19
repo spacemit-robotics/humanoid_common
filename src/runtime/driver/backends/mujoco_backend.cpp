@@ -49,9 +49,29 @@ public:
             scene_path, default_joint_pos, kp, kd, true);
         if (yaml_file.Read<bool>("perception.depth.publish_sim").value_or(false)) {
 #ifdef HAS_HIKING_SIM_DEPTH
+            perception::SimDepthConfig config;
+            const std::string base = "simulation.mujoco.depth.";
+            config.fps = yaml_file.Read<double>(base + "fps").value_or(config.fps);
+            config.latency_s = yaml_file.Read<double>(base + "latency_s").value_or(config.latency_s);
+            const std::string defects = base + "degradation.";
+            config.enabled = yaml_file.Read<bool>(defects + "enabled").value_or(config.enabled);
+            const int seed = yaml_file.Read<int>(defects + "seed").value_or(42);
+            if (seed < 0) throw std::runtime_error("simulation depth seed must be nonnegative");
+            config.seed = static_cast<uint32_t>(seed);
+            config.random_hole_probability = yaml_file.Read<double>(defects + "random_hole_probability")
+                .value_or(config.random_hole_probability);
+            config.patch_count = yaml_file.Read<int>(defects + "patch_count").value_or(config.patch_count);
+            config.patch_radius_px = yaml_file.Read<int>(defects + "patch_radius_px").value_or(config.patch_radius_px);
+            config.edge_threshold_m = yaml_file.Read<double>(defects + "edge_threshold_m").value_or(config.edge_threshold_m);
+            config.edge_hole_probability = yaml_file.Read<double>(defects + "edge_hole_probability")
+                .value_or(config.edge_hole_probability);
+            config.edge_width_px = yaml_file.Read<int>(defects + "edge_width_px").value_or(config.edge_width_px);
+            config.hold_frames = yaml_file.Read<int>(defects + "hold_frames").value_or(config.hold_frames);
+            config.noise_std_m = yaml_file.Read<double>(defects + "noise_std_m").value_or(config.noise_std_m);
+            config.Validate();
             depth_ = std::make_unique<perception::MujocoDepthPublisher>(
                 yaml_file.Read<std::string>("simulation.mujoco.depth_endpoint").value_or(
-                    yaml_file.Read<std::string>("perception.depth.endpoint").value_or("tcp://127.0.0.1:5560")));
+                    yaml_file.Read<std::string>("perception.depth.endpoint").value_or("tcp://127.0.0.1:5560")), config);
             simulator_->SetObserveCallback([this](const auto &state, const auto &frame) {
                 depth_->Observe(state.time, frame.model, frame.data);
             });

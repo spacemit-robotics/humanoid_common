@@ -1,5 +1,9 @@
-// Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
-// SPDX-License-Identifier: Apache-2.0
+/**
+ * Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
+ * SPDX-License-Identifier: Apache-2.0
+ * @file depth_stream.h
+ * @brief Hiking depth stream and encoder input interface.
+ */
 
 #ifndef DEPTH_STREAM_H
 #define DEPTH_STREAM_H
@@ -25,9 +29,7 @@ struct Frame {
     std::string clock;
     std::vector<float> pixels;
 };
-// Fill holes from the nearest original valid pixel within a two-pixel radius.
-// Donors never propagate; unsupported holes fall back to 2.5 m.
-std::vector<float> FillDepthHoles(const std::vector<float> &raw);
+// Hiking encoder input: bottom-center crop, inpaint, blur, normalize to [0, 1].
 std::vector<float> Preprocess(const std::vector<float> &raw);
 std::vector<unsigned char> Encode(const Frame &frame);
 Frame Decode(const void *data, size_t size);

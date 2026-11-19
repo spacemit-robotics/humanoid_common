@@ -56,7 +56,8 @@ public:
                 depth_->Observe(state.time, frame.model, frame.data);
             });
 #else
-            throw std::runtime_error("this build has no simulation depth publisher");
+            runtime_logging::Log(runtime_logging::Level::kWarning,
+                "Simulation depth output unavailable in this build; continuing without depth", false);
 #endif
         }
     }

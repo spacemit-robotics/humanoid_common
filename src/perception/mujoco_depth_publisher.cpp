@@ -19,7 +19,7 @@ class MujocoDepthPublisher::Impl {
     std::string endpoint;
     std::mutex mutex;
     std::condition_variable condition;
-    bool stop = false, pending = false;
+    bool stop = false, pending = false, subscribed = false;
     mjModel *model = nullptr;
     mjData *snapshot = nullptr;
     double last = -1;
@@ -40,7 +40,7 @@ class MujocoDepthPublisher::Impl {
     }
     void Observe(double time, const void *m, const void *d) {
         std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
-        if (!lock || pending)
+        if (!lock || !subscribed || pending)
             return;
         if (time < last) {
             ++epoch;
@@ -92,38 +92,10 @@ class MujocoDepthPublisher::Impl {
         mjrContext render;
         mjr_defaultContext(&render);
         try {
-            auto platform = reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(
-                eglGetProcAddress("eglGetPlatformDisplayEXT"));
-            display = platform ? platform(0x31DD, EGL_DEFAULT_DISPLAY, nullptr)
-                : eglGetDisplay(EGL_DEFAULT_DISPLAY);
-            if (!eglInitialize(display, nullptr, nullptr) || !eglBindAPI(EGL_OPENGL_API))
-                throw std::runtime_error("EGL OpenGL initialization failed");
-            const EGLint attribs[] = {EGL_SURFACE_TYPE,
-                EGL_PBUFFER_BIT,
-                EGL_RENDERABLE_TYPE,
-                EGL_OPENGL_BIT,
-                EGL_RED_SIZE,
-                8,
-                EGL_GREEN_SIZE,
-                8,
-                EGL_BLUE_SIZE,
-                8,
-                EGL_DEPTH_SIZE,
-                24,
-                EGL_NONE};
-            EGLConfig config;
-            EGLint n = 0;
-            if (!eglChooseConfig(display, attribs, &config, 1, &n) || !n)
-                throw std::runtime_error("EGL config missing");
-            const EGLint pbuffer[] = {EGL_WIDTH, 64, EGL_HEIGHT, 36, EGL_NONE};
-            surface = eglCreatePbufferSurface(display, config, pbuffer);
-            gl = eglCreateContext(display, config, EGL_NO_CONTEXT, nullptr);
-            if (!eglMakeCurrent(display, surface, surface, gl))
-                throw std::runtime_error("EGL context failed");
             ctx = zmq_ctx_new();
             if (!ctx)
                 throw std::runtime_error("depth ZMQ context failed");
-            socket = zmq_socket(ctx, ZMQ_PUB);
+            socket = zmq_socket(ctx, ZMQ_XPUB);
             if (!socket)
                 throw std::runtime_error("depth ZMQ socket failed");
             int linger = 0, hwm = 2;
@@ -137,9 +109,20 @@ class MujocoDepthPublisher::Impl {
             bool ready = false;
             while (true) {
                 std::unique_lock<std::mutex> lock(mutex);
-                condition.wait(lock, [this] { return stop || pending; });
                 if (stop)
                     break;
+                // XPUB reports the first empty-topic subscription and the last unsubscribe.
+                unsigned char event;
+                int size;
+                while ((size = zmq_recv(socket, &event, 1, ZMQ_DONTWAIT)) >= 0)
+                    if (size == 1)
+                        subscribed = event != 0;
+                if (!subscribed)
+                    pending = false;
+                if (!pending) {
+                    condition.wait_for(lock, std::chrono::milliseconds(20), [this] { return stop || pending; });
+                    continue;
+                }
                 const int camera = mj_name2id(model, mjOBJ_CAMERA, "rgbd_camera");
                 if (camera < 0)
                     throw std::runtime_error("scene lacks SDK rgbd_camera");
@@ -160,6 +143,34 @@ class MujocoDepthPublisher::Impl {
                 if (torso < 0 || model->cam_bodyid[camera] != torso)
                     throw std::runtime_error("scene camera must attach to torso_link");
                 if (!ready) {
+                    auto platform = reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(
+                        eglGetProcAddress("eglGetPlatformDisplayEXT"));
+                    display = platform ? platform(0x31DD, EGL_DEFAULT_DISPLAY, nullptr)
+                        : eglGetDisplay(EGL_DEFAULT_DISPLAY);
+                    if (!eglInitialize(display, nullptr, nullptr) || !eglBindAPI(EGL_OPENGL_API))
+                        throw std::runtime_error("EGL OpenGL initialization failed");
+                    const EGLint attribs[] = {EGL_SURFACE_TYPE,
+                        EGL_PBUFFER_BIT,
+                        EGL_RENDERABLE_TYPE,
+                        EGL_OPENGL_BIT,
+                        EGL_RED_SIZE,
+                        8,
+                        EGL_GREEN_SIZE,
+                        8,
+                        EGL_BLUE_SIZE,
+                        8,
+                        EGL_DEPTH_SIZE,
+                        24,
+                        EGL_NONE};
+                    EGLConfig config;
+                    EGLint n = 0;
+                    if (!eglChooseConfig(display, attribs, &config, 1, &n) || !n)
+                        throw std::runtime_error("EGL config missing");
+                    const EGLint pbuffer[] = {EGL_WIDTH, 64, EGL_HEIGHT, 36, EGL_NONE};
+                    surface = eglCreatePbufferSurface(display, config, pbuffer);
+                    gl = eglCreateContext(display, config, EGL_NO_CONTEXT, nullptr);
+                    if (!eglMakeCurrent(display, surface, surface, gl))
+                        throw std::runtime_error("EGL context failed");
                     mjv_makeScene(model, &scene, 2000);
                     mjr_makeContext(model, &render, mjFONTSCALE_100);
                     mjr_setBuffer(mjFB_OFFSCREEN, &render);

@@ -28,6 +28,9 @@
 #include "runtime_timing.h"
 #include "snapshot_worker.h"
 #include "whole_body.h"
+#ifdef HAS_ROBOT_CLOCK
+#include "clock_anchor_server.h"
+#endif
 
 namespace driver_runtime {
 namespace {
@@ -104,9 +107,30 @@ public:
             device_ = nullptr;
             throw std::runtime_error("whole_body returned an invalid cycle period");
         }
+        if (yaml_file.Read<bool>("perception.clock.publish").value_or(false)) {
+            try {
+#ifdef HAS_ROBOT_CLOCK
+                if (!imu_configured_) throw std::runtime_error("robot clock service requires a measured IMU");
+                clock_ = std::make_unique<perception::ClockAnchorServer>(
+                    yaml_file.Read<std::string>("perception.clock.endpoint").value_or("tcp://127.0.0.1:5561"),
+                    yaml_file.Read<double>("perception.clock.receive_delay_bound_s").value_or(.01));
+#else
+                throw std::runtime_error("this build has no robot clock service");
+#endif
+            } catch (...) {
+                whole_body_destroy(device_);
+                device_ = nullptr;
+                throw;
+            }
+        }
     }
 
-    ~WholeBodyBackend() override { whole_body_destroy(device_); }
+    ~WholeBodyBackend() override {
+#ifdef HAS_ROBOT_CLOCK
+        clock_.reset();
+#endif
+        whole_body_destroy(device_);
+    }
 
     int Run(const PublishStateCallback &publish_state,
             const ReceiveCommandCallback &receive_command,
@@ -190,6 +214,18 @@ public:
             whole_body_state hardware_state{};
             const int read_result = whole_body_read(device_, &hardware_state);
             const auto read_finished = std::chrono::steady_clock::now();
+#ifdef HAS_ROBOT_CLOCK
+            if (clock_) {
+                if (read_result != WHOLE_BODY_OK && read_result != WHOLE_BODY_RETRY) clock_->Invalidate();
+                else if (std::chrono::duration<double>(read_finished - last_clock_anchor_).count() >= .05) {
+                    whole_body_diagnostics_v2 diagnostics{};
+                    const bool valid = whole_body_get_diagnostics_v2(device_, &diagnostics) == WHOLE_BODY_OK &&
+                        diagnostics.imu.feedback_received && diagnostics.imu.feedback_fresh;
+                    clock_->Observe(diagnostics.imu.sample_timestamp_s, diagnostics.imu.receive_timestamp_s, valid);
+                    last_clock_anchor_ = read_finished;
+                }
+            }
+#endif
             bool feedback_fault_active = false;
             if (read_result == WHOLE_BODY_OK || read_result == WHOLE_BODY_RETRY) {
                 RecoverFault(FaultContext::kRead);
@@ -380,6 +416,10 @@ public:
     }
 
 private:
+#ifdef HAS_ROBOT_CLOCK
+    std::unique_ptr<perception::ClockAnchorServer> clock_;
+    std::chrono::steady_clock::time_point last_clock_anchor_{};
+#endif
 
     robot_base::FaultSource ClassifyFaultSource(
         FaultContext context, const whole_body_diagnostics_v2 *diagnostics) const {

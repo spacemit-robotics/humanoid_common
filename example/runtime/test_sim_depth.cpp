@@ -60,9 +60,9 @@ void CheckMasks() {
     const auto bytes = perception::Encode(packet);
     const auto decoded = perception::Decode(bytes.data(), bytes.size());
     assert(decoded.time == 1 && decoded.clock == "sim" && decoded.pixels == frame);
-    // Injection keeps holes zero; only the original control preprocessing fills them.
+    // An entirely missing image has no measured surface to inpaint from.
     const auto processed = perception::Preprocess(frame);
-    for (float d : processed) assert(std::abs(d - 1.f) < 1e-6);
+    for (float d : processed) assert(d == 0.f);
 
     config.random_hole_probability = .1;
     config.hold_frames = 3;

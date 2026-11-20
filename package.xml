@@ -9,6 +9,7 @@
   <depend>whole_body</depend>
   <system_depend arch="x86_64" check="pkg-config --exists egl">libegl1-mesa-dev</system_depend>
   <system_depend check="pkg-config --exists libzmq">libzmq3-dev</system_depend>
+  <system_depend check="pkg-config --exists opencv4">libopencv-dev</system_depend>
   <system_depend check="pkg-config --exists eigen3">libeigen3-dev</system_depend>
   <system_depend check="pkg-config --exists yaml-cpp">libyaml-cpp-dev</system_depend>
   <system_depend check="test -f /usr/include/boost/beast.hpp">libboost-dev</system_depend>

@@ -6,7 +6,9 @@
  * @brief 把 SONIC kinematic planner 注册为实时规划器类型 sonic_planner
  */
 
+#include <charconv>
 #include <memory>
+#include <string_view>
 #include <stdexcept>
 #include <string>
 
@@ -38,10 +40,34 @@ public:
     }
 
     void Update(const motion_planner::PlannerInput &input) override {
+        if (input.argument_sequence != sequence_) {
+            sequence_ = input.argument_sequence;
+            mode_ = -1;
+            height_ = -1;
+            if (!input.argument.empty()) {
+                const std::string_view value(input.argument);
+                const auto split = value.find(':');
+                const auto parse = [](std::string_view s) {
+                    int n;
+                    const auto end = s.data() + s.size();
+                    const auto result = std::from_chars(s.data(), end, n);
+                    if (result.ec != std::errc{} || result.ptr != end)
+                        throw std::invalid_argument("invalid SONIC planner preset");
+                    return n;
+                };
+                mode_ = parse(value.substr(0, split));
+                if (mode_ < -1 || mode_ > 26) throw std::invalid_argument("invalid SONIC locomotion mode");
+                if (split != value.npos) {
+                    const int cm = parse(value.substr(split + 1));
+                    if (cm < 20 || cm > 80) throw std::invalid_argument("invalid SONIC target height");
+                    height_ = cm * 0.01;
+                }
+            }
+        }
         command_.vx = input.command.vx;
         command_.vy = input.command.vy;
         command_.wz = input.command.wz;
-        planner_.Update(input.robot, command_, input.time_s);
+        planner_.Update(input.robot, command_, input.time_s, input.stopping ? 0 : mode_, input.stopping ? -1 : height_);
     }
 
     std::shared_ptr<const motion_planner::PlannerOutput> Output() override {
@@ -55,6 +81,9 @@ public:
     motion_planner::PlannerStats Stats() const override { return planner_.Stats(); }
 
 private:
+    uint64_t sequence_ = 0;
+    int mode_ = -1;
+    double height_ = -1;
     SonicPlanner planner_;
     robot_base::Command command_;
 };

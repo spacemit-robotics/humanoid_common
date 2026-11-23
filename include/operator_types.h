@@ -34,6 +34,19 @@ inline bool SpeedModesDiffer(const Velocity &minimum, const Velocity &maximum,
         different(minimum.vy, maximum.vy, slow_limits->vy, fast_limits->vy) ||
         different(minimum.wz, maximum.wz, slow_limits->wz, fast_limits->wz);
 }
+struct PlannerPreset {
+    std::string key, display_name;
+    std::vector<int> heights_cm;  // Optional; the first height is the default.
+    std::string Argument(int cm) const {
+        return heights_cm.empty() ? key : key + ":" + std::to_string(cm);
+    }
+    std::string DefaultArgument() const { return Argument(heights_cm.empty() ? 0 : heights_cm.front()); }
+    bool Accepts(const std::string &argument) const {
+        if (heights_cm.empty()) return argument == key;
+        return std::any_of(heights_cm.begin(), heights_cm.end(),
+            [&](int cm) { return Argument(cm) == argument; });
+    }
+};
 // A reference-motion planner that a tracker policy accepts. While a realtime
 // planner runs, velocity commands go to it and use its range instead of the
 // policy's.
@@ -47,6 +60,7 @@ struct Planner {
     bool client_smoothing = true;  // Same meaning as Policy::client_smoothing.
     std::optional<Velocity> slow_limits;
     std::optional<Velocity> fast_limits;
+    std::vector<PlannerPreset> presets;
     bool HasSpeedModes() const { return SpeedModesDiffer(minimum, maximum, slow_limits, fast_limits); }
 };
 struct Policy {
@@ -69,6 +83,7 @@ struct Policy {
 struct PlannerState {
     std::string name;
     std::string phase = "IDLE";
+    std::string preset_argument;
     double progress = 0;
     uint64_t sequence = 0;
     bool accepted = false;

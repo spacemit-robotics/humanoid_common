@@ -79,6 +79,10 @@
               <button id="start-planner" class="primary"><i data-lucide="play"></i>启动</button>
               <button id="stop-planner" class="icon" title="停止规划器并回到待命" aria-label="停止规划器并回到待命"><i data-lucide="square"></i></button></div>
             <input id="planner-argument" type="text" maxlength="255" placeholder="动作描述" aria-label="动作描述" hidden>
+            <div id="planner-controls" class="select-row" hidden>
+              <label>走法 <select id="planner-preset"></select></label>
+              <label id="planner-height-label" hidden>身体高度 <select id="planner-height"></select></label>
+            </div>
             <div id="planner-progress-row" class="progress-row" hidden><progress id="planner-progress" max="1" value="0" aria-label="规划器进度"></progress><span id="planner-progress-label"></span></div>
             <p id="planner-detail" class="planner-detail"></p>
           </div>

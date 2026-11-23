@@ -313,6 +313,28 @@ function render() {
   $("planner").disabled = engaged;
   $("planner-argument").hidden = selectedPlanner?.category !== 'offline';
   $("planner-argument").disabled = engaged;
+  const presets = selectedPlanner?.presets || [];
+  const livePresets = presets.length > 0 && plannerPhase === 'RUNNING';
+  $("planner-controls").hidden = !livePresets;
+  if (livePresets) {
+    const [key, height] = (status.planner.preset_argument || presets[0].key).split(':');
+    const selected = presets.find(item => item.key === key) || presets[0];
+    const select = $("planner-preset"), heights = $("planner-height");
+    const signature = JSON.stringify(presets);
+    if (select.dataset.signature !== signature) {
+      select.replaceChildren(...presets.map(item => new Option(item.display_name, item.key)));
+      select.dataset.signature = signature;
+    }
+    select.value = selected.key;
+    const levels = selected.heights_cm || [];
+    $("planner-height-label").hidden = !levels.length;
+    if (heights.dataset.levels !== levels.join(',')) {
+      heights.replaceChildren(...[...levels].sort((a,b) => a-b).map(cm => new Option(cm + ' cm', String(cm))));
+      heights.dataset.levels = levels.join(',');
+    }
+    heights.value = height || String(levels[0] || '');
+    heights.disabled = select.disabled = !rl || busy;
+  }
   $("planner-state").textContent = plannerPhases[plannerPhase] || plannerPhase;
   $("planner-state").dataset.phase = plannerPhase;
   // 加载、预热、生成阶段显示准备进度，没有估计值（0）时显示为进行中；有限长度的参考显示播放进度
@@ -525,6 +547,17 @@ $("acquire").onclick = () => request('acquire');
 $("release").onclick = () => releaseControl();
 $("policy").onchange = () => render();
 $("planner").onchange = () => render();
+function applyPlannerPreset(useDefaultHeight) {
+  const name = status?.planner?.name;
+  const planner = activePolicy()?.planners?.find(item => item.name === name);
+  const preset = planner?.presets?.find(item => item.key === $("planner-preset").value);
+  if (!preset || status.planner.phase !== 'RUNNING') return;
+  const cm = useDefaultHeight ? preset.heights_cm[0] : $("planner-height").value;
+  const argument = preset.heights_cm.length ? preset.key + ':' + cm : preset.key;
+  request('planner', {name, argument});
+}
+$("planner-preset").onchange = () => applyPlannerPreset(true);
+$("planner-height").onchange = () => applyPlannerPreset(false);
 $("start-planner").onclick = () => {
   endMotion();
   const offline = activePolicy()?.planners?.find(planner => planner.name === $("planner").value)?.category === 'offline';

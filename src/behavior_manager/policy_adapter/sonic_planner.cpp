@@ -76,13 +76,24 @@ float QuaternionYaw(const Eigen::Quaternionf &quat) {
         1.0F - 2.0F * (quat.y() * quat.y() + quat.z() * quat.z()));
 }
 
-bool CommandChanged(const robot_base::Command &lhs,
-    const robot_base::Command &rhs,
+struct PlanCommand {
+    double vx = 0, vy = 0, wz = 0;
+    double yaw = 0;
+    int mode = -1;
+    double height = -1;
+};
+
+bool CommandChanged(const PlanCommand &lhs,
+    const PlanCommand &rhs,
     double epsilon) {
     return std::abs(lhs.vx - rhs.vx) > epsilon ||
         std::abs(lhs.vy - rhs.vy) > epsilon ||
-        std::abs(lhs.wz - rhs.wz) > epsilon;
+        std::abs(lhs.wz - rhs.wz) > epsilon || lhs.mode != rhs.mode || lhs.height != rhs.height ||
+        std::abs(std::remainder(lhs.yaw - rhs.yaw, 2.0 * M_PI)) > epsilon;
 }
+
+// The model's styled walks keep their mode at rest and receive speed zero.
+bool IsStyledWalk(int mode) { return mode >= 18 && mode <= 26; }
 
 bool IsStaticMode(int mode) {
     return mode == 0 || mode == 4 || mode == 5 || mode == 6 ||
@@ -201,7 +212,6 @@ SonicPlannerConfig LoadSonicPlannerConfig(const robot_base::YamlFile &yaml,
         yaml.Read<double>(base + ".crawling_replan_interval").value_or(0.2);
     config.lookahead = yaml.Read<double>(base + ".lookahead").value_or(0.04);
     config.default_height = yaml.Read<double>(base + ".default_height").value_or(0.788740);
-    config.facing_horizon = yaml.Read<double>(base + ".facing_horizon").value_or(1.0);
     config.command_epsilon = yaml.Read<double>(base + ".command_epsilon").value_or(1.0e-3);
     config.slow_walk_max_speed = yaml.Read<double>(base + ".slow_walk_max_speed").value_or(0.8);
     config.walk_max_speed = yaml.Read<double>(base + ".walk_max_speed").value_or(2.5);
@@ -361,8 +371,9 @@ public:
             tracker_motion_ = motion_;
             reference_ = std::move(reference);
             tracker_reference_ = reference_;
-            latest_robot_ = robot;
             latest_command_ = {};
+            latest_command_.yaw = QuaternionYaw(RobotQuaternion(robot));
+            notified_command_ = latest_command_;
             latest_elapsed_s_ = start_time_s;
             has_snapshot_ = true;
             request_generation_ = 1;
@@ -381,19 +392,18 @@ public:
 
     // Tracker side: never waits for the planner thread, which may run at a
     // lower priority. A skipped update is retried on the next tracker step.
-    void Update(const robot_base::RobotData &robot,
-        const robot_base::Command &command,
-        double elapsed_s) {
+    void Update(const robot_base::Command &command, double elapsed_s, int mode, double height) {
         {
             std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
             if (!lock.owns_lock()) return;
-            const bool command_changed = CommandChanged(
-                latest_command_, command, config_.command_epsilon);
-            latest_robot_ = robot;
-            latest_command_ = command;
-            latest_elapsed_s_ = std::max(0.0, elapsed_s);
+            const double dt = std::max(0.0, elapsed_s - latest_elapsed_s_);
+            const double yaw = std::remainder(latest_command_.yaw + command.wz * dt, 2.0 * M_PI);
+            latest_command_ = {command.vx, command.vy, command.wz, yaw, mode, height};
+            const bool command_changed = CommandChanged(notified_command_, latest_command_, config_.command_epsilon);
+            latest_elapsed_s_ = elapsed_s;
             has_snapshot_ = true;
             if (command_changed) {
+                notified_command_ = latest_command_;
                 ++request_generation_;
             }
         }
@@ -502,13 +512,13 @@ private:
         auto robot = robot_base::RobotData::Create(kPlannerDofCount);
         robot.base_quat = {1.0, 0.0, 0.0, 0.0};
         const SonicPlannerMotion seed = BuildSeedMotion(robot);
-        robot_base::Command walk;
+        PlanCommand walk;
         walk.vx = static_cast<float>(0.5 * config_.slow_walk_max_speed);
         std::array<double, 2> elapsed_ms = {};
-        const std::array<robot_base::Command, 2> commands = {robot_base::Command{}, walk};
+        const std::array<PlanCommand, 2> commands = {PlanCommand{}, walk};
         for (std::size_t i = 0; i < commands.size(); ++i) {
             const auto start = std::chrono::steady_clock::now();
-            static_cast<void>(Generate(robot, commands[i], 0.0, seed));
+            static_cast<void>(Generate(commands[i], 0.0, seed));
             elapsed_ms[i] = 1000.0 * std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - start).count();
         }
@@ -628,15 +638,18 @@ private:
         return SampleSonicPlannerMotion(motion, absolute_time_s, config_.output_fps);
     }
 
-    int SelectMode(const robot_base::Command &command) const {
-        if (config_.mode >= 0) {
+    int SelectMode(const PlanCommand &command) const {
+        if (command.mode >= 0 && (IsStaticMode(command.mode) || IsStyledWalk(command.mode))) return command.mode;
+        if (command.mode < 0 && config_.mode >= 0) {
             return config_.mode;
         }
         const double speed = std::hypot(command.vx, command.vy);
+        // In auto gait, turning in place changes facing_direction, not the locomotion mode.
         if (speed <= config_.command_epsilon &&
-            std::abs(command.wz) <= config_.command_epsilon) {
+            (command.mode < 0 || std::abs(command.wz) <= config_.command_epsilon)) {
             return 0;
         }
+        if (command.mode >= 0) return command.mode;
         if (speed < config_.slow_walk_max_speed) {
             return 1;
         }
@@ -646,7 +659,7 @@ private:
         return 3;
     }
 
-    bool NeedsPeriodicReplan(const robot_base::Command &command) const {
+    bool NeedsPeriodicReplan(const PlanCommand &command) const {
         const double speed = std::hypot(command.vx, command.vy);
         return !IsStaticMode(SelectMode(command)) &&
             (speed > config_.command_epsilon ||
@@ -678,16 +691,15 @@ private:
         return context;
     }
 
-    void SetPlannerInputs(const robot_base::RobotData &robot,
-        const robot_base::Command &command) {
-        const float speed = static_cast<float>(
-            std::hypot(command.vx, command.vy));
+    void SetPlannerInputs(const PlanCommand &command) {
+        const bool posture = command.mode >= 0 && IsStaticMode(command.mode);
+        const float speed = posture ? 0.0F : static_cast<float>(std::hypot(command.vx, command.vy));
         const std::array<float, 1> target_vel = {
-            speed > config_.command_epsilon ? speed : -1.0F};
+            speed > config_.command_epsilon ? speed : posture || IsStyledWalk(command.mode) ? 0.0F : -1.0F};
         const std::array<std::int64_t, 1> mode = {
             static_cast<std::int64_t>(SelectMode(command))};
 
-        const float yaw = QuaternionYaw(RobotQuaternion(robot));
+        const float yaw = static_cast<float>(command.yaw);
         std::array<float, 3> movement_direction = {};
         if (speed > config_.command_epsilon) {
             const float local_x = command.vx / speed;
@@ -697,10 +709,7 @@ private:
             movement_direction[1] =
                 std::sin(yaw) * local_x + std::cos(yaw) * local_y;
         }
-        const float target_yaw = yaw + static_cast<float>(
-            command.wz * config_.facing_horizon);
-        const std::array<float, 3> facing_direction = {
-            std::cos(target_yaw), std::sin(target_yaw), 0.0F};
+        const std::array<float, 3> facing_direction = {std::cos(yaw), std::sin(yaw), 0.0F};
         const std::array<std::int64_t, 1> random_seed = {
             static_cast<std::int64_t>(config_.random_seed)};
         const std::array<std::int64_t, 1> has_specific_target = {0};
@@ -710,7 +719,7 @@ private:
         for (int index = 0; index < kPlannerAllowedTokenCount; ++index) {
             allowed[index] = config_.allowed_pred_num_tokens[index];
         }
-        const std::array<float, 1> height = {-1.0F};
+        const std::array<float, 1> height = {static_cast<float>(command.height)};
 
         planner_policy_.SetModelInput(
             "target_vel", rl_policy::MakeTensorView(target_vel.data(), 1));
@@ -814,13 +823,12 @@ private:
         return output;
     }
 
-    SonicPlannerMotion Generate(const robot_base::RobotData &robot,
-        const robot_base::Command &command,
+    SonicPlannerMotion Generate(const PlanCommand &command,
         double elapsed_s,
         const SonicPlannerMotion &source) {
         const double context_start_s = elapsed_s + config_.lookahead;
         Eigen::VectorXf context = BuildContext(source, context_start_s);
-        SetPlannerInputs(robot, command);
+        SetPlannerInputs(command);
 
         std::vector<double> qpos;
         planner_policy_.Infer(context, qpos);
@@ -845,10 +853,8 @@ private:
             std::chrono::duration<double>(config_.check_interval));
         auto next_check = std::chrono::steady_clock::now();
         auto next_periodic = next_check;
-        // Reused across plans so copying the snapshot under the lock does not allocate.
-        robot_base::RobotData robot;
         while (true) {
-            robot_base::Command command;
+            PlanCommand command;
             double elapsed_s = 0.0;
             bool source_idle = false;
             std::chrono::steady_clock::time_point check_time;
@@ -873,7 +879,6 @@ private:
                 if (!Running()) {
                     return;
                 }
-                robot = latest_robot_;
                 command = latest_command_;
                 elapsed_s = latest_elapsed_s_;
                 source = motion_;
@@ -885,7 +890,7 @@ private:
             const auto infer_start = std::chrono::steady_clock::now();
             try {
                 SonicPlannerMotion generated =
-                    Generate(robot, command, elapsed_s, *source);
+                    Generate(command, elapsed_s, *source);
                 const double infer_ms = 1000.0 * std::chrono::duration<double>(
                     std::chrono::steady_clock::now() - infer_start).count();
                 double publish_time_s = 0.0;
@@ -907,7 +912,7 @@ private:
                     if (!Running()) return;
                     motion_ = std::move(next_motion);
                     reference_ = std::move(next_reference);
-                    idle_ = SelectMode(command) == 0;
+                    idle_ = SelectMode(command) == 0 && std::abs(command.wz) <= config_.command_epsilon;
                     idle_ready_at_s_ = MotionEndTime(*motion_, config_.output_fps);
                     published_generation_ = handled_generation;
                 }
@@ -941,6 +946,7 @@ private:
     // the low-priority planner never holds the logger's locks.
     struct PlanRecord {
         double wall_s = 0.0, request_s = 0.0, publish_s = 0.0, start_s = 0.0, end_s = 0.0;
+        double yaw = 0.0, height = -1.0;
         double vx = 0.0, vy = 0.0, wz = 0.0, infer_ms = 0.0, late_s = 0.0, stale_s = 0.0;
         std::uint64_t plan = 0;
         int mode = 0, frames = 0, blend_frames = 0;
@@ -948,7 +954,7 @@ private:
     };
 
     // Planner worker only.
-    void RecordPlan(const robot_base::Command &command, double request_time_s,
+    void RecordPlan(const PlanCommand &command, double request_time_s,
         double publish_time_s, double infer_ms, const SonicPlannerMotion &generated,
         const SonicPlannerBlend &blend, bool source_idle) {
         PlanRecord record;
@@ -959,6 +965,8 @@ private:
         record.vx = command.vx;
         record.vy = command.vy;
         record.wz = command.wz;
+        record.yaw = command.yaw;
+        record.height = command.height;
         record.request_s = request_time_s;
         record.publish_s = publish_time_s;
         record.start_s = generated.start_time_s;
@@ -983,11 +991,11 @@ private:
             << record.publish_s << ',' << record.start_s << ',' << record.end_s << ','
             << record.infer_ms << ',' << record.frames << ',' << record.late_s << ','
             << record.stale_s << ',' << record.blend_frames << ',' << (record.expired ? 1 : 0)
-            << ',' << (record.source_static ? 1 : 0);
+            << ',' << (record.source_static ? 1 : 0) << ',' << record.yaw << ',' << record.height;
         runtime_logging::RecordCsv("control_sonic_planner",
             "wall_time_s,plan,mode,vx,vy,wz,request_time_s,publish_time_s,"
             "plan_start_s,plan_end_s,infer_ms,frames,late_s,stale_s,blend_frames,expired,"
-            "source_static",
+            "source_static,target_yaw_rad,target_height_m",
             row.str());
         if (record.plan == 1) {
             late_plans_ = 0;
@@ -1030,8 +1038,7 @@ private:
     bool running_ = false;
     std::atomic<bool> stop_requested_{false};
     bool has_snapshot_ = false;
-    robot_base::RobotData latest_robot_;
-    robot_base::Command latest_command_;
+    PlanCommand latest_command_, notified_command_;
     double latest_elapsed_s_ = 0.0;
     std::uint64_t request_generation_ = 0;
     std::uint64_t plan_count_ = 0;
@@ -1066,10 +1073,9 @@ void SonicPlanner::Reset(const robot_base::RobotData &robot, double start_time_s
     impl_->Reset(robot, start_time_s);
 }
 
-void SonicPlanner::Update(const robot_base::RobotData &robot,
-    const robot_base::Command &command,
-    double elapsed_s) {
-    impl_->Update(robot, command, elapsed_s);
+void SonicPlanner::Update(const robot_base::RobotData &, const robot_base::Command &command,
+    double elapsed_s, int mode, double height) {
+    impl_->Update(command, elapsed_s, mode, height);
 }
 
 std::shared_ptr<const SonicPlannerMotion> SonicPlanner::Motion() const {

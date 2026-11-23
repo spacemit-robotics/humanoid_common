@@ -26,6 +26,27 @@ void Report(const std::string &label, const operator_service::Reply &reply) {
     std::printf("[gamepad] %s: %s %s\n", label.c_str(), reply.ok ? "accepted" : reply.code.c_str(),
         reply.message.c_str());
 }
+// Use the service's confirmed selection, including changes made by a previous owner.
+std::string AdjustPlanner(const operator_service::Planner &planner, const std::string &current,
+    const std::string &step) {
+    const auto &presets = planner.presets;
+    if (presets.empty()) return {};
+    size_t i = 0;
+    while (i < presets.size() && !presets[i].Accepts(current)) ++i;
+    if (i == presets.size()) i = 0;
+    if (step == "previous" || step == "next")
+        return presets[(i + (step == "next" ? 1 : presets.size() - 1)) % presets.size()].DefaultArgument();
+    const auto &preset = presets[i];
+    if (preset.heights_cm.empty()) return {};
+    int height = preset.heights_cm.front();
+    for (int cm : preset.heights_cm) if (preset.Argument(cm) == current) height = cm;
+    int next = height;
+    for (int cm : preset.heights_cm) {
+        if (step == "higher" && cm > height && (next == height || cm < next)) next = cm;
+        if (step == "lower" && cm < height && (next == height || cm > next)) next = cm;
+    }
+    return next == height ? "" : preset.Argument(next);
+}
 void Run(const Config &config, const std::string &connection_path, bool dry_run,
     const std::string &dry_policy) {
     Client client;
@@ -160,6 +181,18 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
             }
             if (!owned) {
                 std::printf("[gamepad] acquire control with the configured binding first\n");
+                continue;
+            }
+            if (command.operation == "planner_preset") {
+                if (status.planner.phase != "RUNNING" || status.request.phase == "accepted") continue;
+                for (const auto &policy : client.Policies()) {
+                    if (policy.name != status.policy) continue;
+                    for (const auto &planner : policy.planners) {
+                        if (planner.name != status.planner.name) continue;
+                        const auto arg = AdjustPlanner(planner, status.planner.preset_argument, command.value);
+                        if (!arg.empty()) Report(label, client.StartPlanner(planner.name, arg));
+                    }
+                }
                 continue;
             }
             if (command.operation == "preset") {

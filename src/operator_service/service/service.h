@@ -137,6 +137,7 @@ private:
     uint64_t teleop_preset_sequence_ = 0;
     RequestResult result_;
     std::string pending_target_;
+    std::string planner_preset_argument_;
     robot_base::ControlMode source_mode_ = robot_base::ControlMode::POWER_OFF;
     std::future<bool> login_result_;
     uint64_t login_session_ = 0;

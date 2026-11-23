@@ -58,7 +58,7 @@ inline Config ReadConfig(const YAML::Node &root) {
     for (const auto &[code, name] : c.input.buttons)
         if (!names.insert(name).second) throw std::runtime_error("duplicated gamepad button name");
     const std::set<std::string> operations{
-        "control", "state", "policy", "preset", "action", "cancel", "ack", "reference", "planner"};
+        "control", "state", "policy", "preset", "action", "cancel", "ack", "reference", "planner", "planner_preset"};
     const auto policies = root["rl_policy"]["onnx_infer"]["policy_names"].as<std::vector<std::string>>();
     const auto known_policy = [&](const std::string &name) {
         return std::find(policies.begin(), policies.end(), name) != policies.end();
@@ -96,6 +96,9 @@ inline Config ReadConfig(const YAML::Node &root) {
             throw std::runtime_error("gamepad policy is not in selectable catalog");
         if (b.operation == "preset" && b.value != "slow" && b.value != "fast" && b.value != "toggle")
             throw std::runtime_error("unknown speed preset");
+        if (b.operation == "planner_preset" &&
+            !std::set<std::string>{"previous", "next", "higher", "lower"}.count(b.value))
+            throw std::runtime_error("unknown planner preset adjustment");
         if (b.operation == "planner" && !(b.policy.empty()
                 ? std::any_of(policies.begin(), policies.end(),
                     [&](const std::string &policy) { return lists_planner(policy, b.value); })

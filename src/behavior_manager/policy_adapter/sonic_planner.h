@@ -40,7 +40,6 @@ struct SonicPlannerConfig {
     double crawling_replan_interval = 0.2;
     double lookahead = 0.04;
     double default_height = 0.788740;
-    double facing_horizon = 1.0;
     double command_epsilon = 1.0e-3;
     double slow_walk_max_speed = 0.8;
     double walk_max_speed = 2.5;
@@ -126,7 +125,7 @@ public:
     /** @brief 更新最新机器人状态、速度命令和 RL 时间 */
     void Update(const robot_base::RobotData &robot,
         const robot_base::Command &command,
-        double elapsed_s);
+        double elapsed_s, int mode = -1, double height = -1);
 
     /** @brief 单一 tracker 线程读取只读快照，发布繁忙时沿用上次快照；Reset 不得并发 */
     std::shared_ptr<const SonicPlannerMotion> Motion() const;

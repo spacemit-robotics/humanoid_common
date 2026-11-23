@@ -495,7 +495,7 @@ private:
                 runtime_config::ClampVelocity(command.vy, lo.vy, hi.vy),
                 runtime_config::ClampVelocity(command.wz, lo.wz, hi.wz)};
             const PlannerInput input{robot, releasing_ ? MotionCommand{} : limited, time_s_,
-                playback, argument_, argument_sequence_};
+                playback, argument_, argument_sequence_, releasing_};
             planner->Update(input);
             auto output = planner->Output();
             if (output && output != seen_output_ && job_kind_ == JobKind::NONE) {

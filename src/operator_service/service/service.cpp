@@ -291,6 +291,19 @@ Config LoadConfig(const std::string &path) {
             planner.display_name = entry.display_name;
             planner.category = entry.category;
             planner.type = entry.type;
+            const auto presets = entry.base + ".command.presets";
+            for (size_t i = 0; yaml.Contains(presets + "[" + std::to_string(i) + "]"); ++i) {
+                const auto path = presets + "[" + std::to_string(i) + "]";
+                PlannerPreset preset;
+                preset.key = yaml.Read<std::string>(path + ".key").value_or("");
+                if (preset.key.empty() || preset.key.find(':') != std::string::npos ||
+                    std::any_of(planner.presets.begin(), planner.presets.end(),
+                        [&](const PlannerPreset &p) { return p.key == preset.key; }))
+                    throw std::runtime_error("invalid planner preset key: " + path);
+                preset.display_name = yaml.Read<std::string>(path + ".display_name").value_or(preset.key);
+                preset.heights_cm = yaml.Read<std::vector<int>>(path + ".heights_cm").value_or(std::vector<int>{});
+                planner.presets.push_back(std::move(preset));
+            }
             planner.minimum = {entry.limits.min_vx, entry.limits.min_vy, entry.limits.min_wz};
             planner.maximum = {entry.limits.max_vx, entry.limits.max_vy, entry.limits.max_wz};
             planner.client_smoothing = yaml.Read<bool>(entry.base + ".command.smoothing").value_or(true);
@@ -533,6 +546,15 @@ void Service::UpdateStatus(const robot_base::ControlStatus &status, const robot_
     const bool changed = status.mode != status_.mode || status.active_policy != status_.active_policy ||
         planner_runs != (status_.planner.phase == PlannerPhase::RUNNING) ||
         (planner_runs && status.planner.planner != status_.planner.planner);
+    if (status.mode != robot_base::ControlMode::RL || !Engaged(status.planner.phase) ||
+        status.active_policy != status_.active_policy || status.planner.planner != status_.planner.planner)
+        planner_preset_argument_.clear();
+    if (status.planner.request_accepted && command_.planner.sequence == status.planner.sequence &&
+        command_.planner.operation == robot_base::PlannerRequest::Operation::START &&
+        status.planner.planner == command_.planner.planner) {
+        const auto *planner = ActivePlanner(command_.planner.planner);
+        if (planner && !planner->presets.empty()) planner_preset_argument_ = command_.planner.argument;
+    }
     if (status.environment != status_.environment) ++catalog_revision_;
     status_ = status;
     fault_ = fault;
@@ -684,6 +706,7 @@ Status Service::Snapshot(uint64_t session) const {
     s.planner.last_plan_ms = status_.planner.last_plan_ms;
     s.planner.reference_remaining_s = status_.planner.reference_remaining_s;
     s.planner.detail = status_.planner.detail;
+    s.planner.preset_argument = planner_preset_argument_;
     s.request = result_;
     return s;
 }
@@ -961,11 +984,17 @@ Json Service::Handle(uint64_t session, const Json &request) {
                 return fail("not_ready", "motion planners run inside the RL state");
             const bool start = op == "planner";
             const auto name = start ? args.at("name").get<std::string>() : std::string();
-            const auto argument = start ? args.value("argument", "") : std::string();
+            auto argument = start ? args.value("argument", "") : std::string();
             if (start) {
                 const auto *planner = ActivePlanner(name);
                 if (!planner) return fail("bad_request", "unknown planner for the active policy");
                 if (!PlannerEnabled(name)) return fail("unavailable", EnvironmentMessage("planner " + name));
+                if (!planner->presets.empty()) {
+                    if (argument.empty()) argument = planner->presets.front().DefaultArgument();
+                    if (std::none_of(planner->presets.begin(), planner->presets.end(),
+                            [&](const PlannerPreset &p) { return p.Accepts(argument); }))
+                        return fail("bad_request", "unknown planner preset or height");
+                }
                 if (argument.size() > robot_base::kPlannerArgumentMaxLength ||
                     std::any_of(argument.begin(), argument.end(),
                         [](unsigned char c) { return c < 32 || c == 127; }))
@@ -980,7 +1009,7 @@ Json Service::Handle(uint64_t session, const Json &request) {
                 status_.planner.phase != robot_base::PlannerStatus::Phase::FAILED) {
                 return ReplyTo(id, true, "ok", "no motion planner is active");
             }
-            ClearVelocity(false);
+            if (!start || status_.planner.phase != robot_base::PlannerStatus::Phase::RUNNING) ClearVelocity(false);
             command_.planner.sequence = std::max(command_.planner.sequence, status_.planner.sequence) + 1;
             if (command_.planner.sequence == 0) ++command_.planner.sequence;
             command_.planner.operation = start ? Operation::START : Operation::STOP;

@@ -109,6 +109,7 @@ struct PlannerInput {
     PlaybackState playback;
     const std::string &argument;     ///< 最近一次 START 请求附带的文本，可为空
     uint64_t argument_sequence = 0;  ///< argument 每更新一次加一
+    bool stopping = false;  ///< 退出规划器时从当前姿态回到待命
 };
 
 /** @brief 检查一次发布的维度和数值；不合法时返回原因，合法时返回空串。 */

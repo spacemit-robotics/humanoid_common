@@ -23,6 +23,9 @@ Json Encode(const Planner &p) {
     Json result = {{"name", p.name}, {"display_name", p.display_name.empty() ? p.name : p.display_name},
         {"category", p.category}, {"type", p.type}, {"minimum", Encode(p.minimum)},
         {"maximum", Encode(p.maximum)}, {"service_smoothing", p.client_smoothing}};
+    for (const auto &preset : p.presets)
+        result["presets"].push_back({{"key", preset.key}, {"display_name", preset.display_name},
+            {"heights_cm", preset.heights_cm}});
     if (p.slow_limits) result["teleop"]["slow_limits"] = Encode(*p.slow_limits);
     if (p.fast_limits) result["teleop"]["fast_limits"] = Encode(*p.fast_limits);
     return result;
@@ -58,7 +61,7 @@ Json Encode(const Status &s) {
         {"teleop_preset", {{"name", s.teleop_preset}, {"sequence", s.teleop_preset_sequence}}},
         {"planner",
             {{"name", s.planner.name}, {"phase", s.planner.phase}, {"progress", s.planner.progress},
-                {"sequence", s.planner.sequence}, {"accepted", s.planner.accepted},
+                {"sequence", s.planner.sequence}, {"accepted", s.planner.accepted}, {"preset_argument", s.planner.preset_argument},
                 {"plan_count", s.planner.plan_count}, {"plan_rate_hz", s.planner.plan_rate_hz},
                 {"last_plan_ms", s.planner.last_plan_ms},
                 {"reference_remaining_s", s.planner.reference_remaining_s}, {"detail", s.planner.detail}}},
@@ -142,6 +145,7 @@ Status DecodeStatus(const Json &v) {
     s.teleop_preset_sequence = preset.value("sequence", uint64_t{0});
     const auto planner = v.value("planner", Json::object());
     s.planner.name = planner.value("name", "");
+    s.planner.preset_argument = planner.value("preset_argument", "");
     s.planner.phase = planner.value("phase", "IDLE");
     s.planner.progress = planner.value("progress", 0.0);
     s.planner.sequence = planner.value("sequence", uint64_t{0});
@@ -180,6 +184,9 @@ Policy DecodePolicy(const Json &v) {
         const auto limits = entry.value("teleop", Json::object());
         if (limits.contains("slow_limits")) planner.slow_limits = ReadVelocity(limits.at("slow_limits"));
         if (limits.contains("fast_limits")) planner.fast_limits = ReadVelocity(limits.at("fast_limits"));
+        for (const auto &preset : entry.value("presets", Json::array()))
+            planner.presets.push_back({preset.at("key"), preset.at("display_name"),
+                preset.value("heights_cm", std::vector<int>{})});
         p.planners.push_back(std::move(planner));
     }
     p.auto_planner = v.value("auto_planner", "");

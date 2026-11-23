@@ -76,9 +76,81 @@ rl_policy:
 | `prepare_time` | `0` | 加载并完成首次启动的预计耗时 (s)，只用于估计准备进度；`0` 表示未知 |
 | `thread` | `motion_planner` | `robot_base.threads` 下的线程配置名，加载规划器前应用到后台线程，规划器在加载时创建的线程继承其核心范围和调度 |
 
-规划器名不超过 63 字节。`policy_adapter.planners` 只用于 `sonic` 和 `supermimic`
-adapter，并要求该策略配置了 `catalog`。`auto_planner` 须是 `planners` 中列出的实时
+规划器名不超过 63 字节。当前 `sonic` 和 `supermimic` 跟踪 adapter 支持
+`policy_adapter.planners`，且必须配置 `catalog`；这里的限制针对负责目录动作播放的
+跟踪策略，不限制规划器类型是否依赖模型。`auto_planner` 须是 `planners` 中列出的实时
 规划器。旧的 `policy_adapter.planner` 写法不再支持，加载时报错并提示迁移方式。
+
+## 代码驱动动作选择器
+
+Common 内置 `code_driven_action_planner` 是 `realtime` / `behavior_tree` 规划器：它按
+限幅后的 `PlannerInput.command` 选择机型动作目录 ID，并通过 `PlannerOutput.action`
+请求跟踪 adapter 播放。Common 不加载 CSV、不包含某机型的关节顺序或动作 ID，也不运行
+ONNX；动作资源、动作目录 `catalog` 和下列 YAML 配置属于机型包。它可以与任何实现了
+目录动作 `ReferenceSink` 的跟踪策略配合；当前 `sonic` 和 `supermimic` adapter 提供此能力。
+
+```yaml
+motion_planners:
+  action_selector:
+    type: code_driven_action_planner
+    category: realtime
+    command:
+      limits:
+        min_vx: -1
+        max_vx: 1
+        min_vy: -1
+        max_vy: 1
+        min_wz: -1
+        max_wz: 1
+      teleop:
+        slow_limits: [1, 1, 1]
+        fast_limits: [1, 1, 1]
+      smoothing: false
+    joystick_threshold: 0.5
+    action_period_s: 1.5
+    max_pending_actions: 32
+    initial_mode: walk
+    mode_ids: [walk]
+    modes:
+      walk:
+        neutral: stand_finite
+        forward: walk_forward
+        backward: walk_backward
+        left: walk_left
+        right: walk_right
+        turn_left: ""       # 空字符串表示当前机型未提供该动作
+        turn_right: ""
+    once_actions: [dance_full]
+
+operator_service:
+  teleop:
+    deadzone: 0
+
+rl_policy:
+  onnx_infer:
+    policies:
+      sonic:
+        policy_adapter:
+          catalog: sonic_actions
+          planners: [action_selector]
+```
+
+`command.limits` 必须对三个轴显式给出 `[-1, 1]`，slow/fast `teleop` 倍率必须是
+`[1, 1, 1]`，并关闭平滑和 operator deadzone；这是为了让选择阈值对应原始归一化输入，
+不能把此专用输入配置套用到模型速度规划器。`mode_ids`、`initial_mode` 和每个模式的
+`neutral`、六个方向字段均必填；方向值可为空以禁用该方向，但 neutral 必须是 catalog
+中的有限动作。`once_actions` 是可通过参数请求的单次动作白名单。可选参数为：
+
+| 参数 | 默认值 | 作用 |
+| --- | --- | --- |
+| `joystick_threshold` | `0.5` | 主轴幅值严格大于该阈值才计时 |
+| `action_period_s` | `1.5` | 同一方向持续每满该周期入队一个完整动作 |
+| `max_pending_actions` | `32` | 待播 FIFO 容量，范围 `[1, 4096]`，满时拒绝新动作 |
+
+参数 `mode:<id>`、`mode:next`、`mode:previous` 切换后续动作套；`action:<id>` 请求白名单
+中的一次性动作，`action:<id>#<数字>` 可区分相同文本的重复请求。Common 只保留最新参数
+值，不是可靠的事件队列；快速连续请求仍可能被覆盖。原生规划器 STOP 仍按有限队列收尾，
+不提供立即清队列或紧急制动保证。游戏手柄协议未扩展为传递这些参数。
 
 ## 运行过程
 

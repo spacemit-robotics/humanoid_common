@@ -206,6 +206,8 @@ if(BUILD_RL)
         src/behavior_manager/policy_adapter/policy_adapter.cpp
         src/behavior_manager/policy_adapter/sonic_planner.cpp
         src/behavior_manager/policy_adapter/sonic_motion_planner.cpp
+        src/behavior_manager/policy_adapter/BT_action_planner.cpp
+        src/behavior_manager/policy_adapter/BT_motion_planner.cpp
         src/behavior_manager/policy_adapter/joint_trajectory_policy_adapter.cpp
         src/behavior_manager/policy_adapter/stance_motion_policy_adapter.cpp
         src/behavior_manager/policy_adapter/history_actor_policy_adapter.cpp

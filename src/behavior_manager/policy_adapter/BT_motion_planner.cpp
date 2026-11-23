@@ -105,7 +105,7 @@ private:
     double last_plan_ms_ = 0;
 };
 
-const motion_planner::PlannerTypeRegistration kCodeDrivenActionPlannerType(
+const motion_planner::PlannerTypeRegistration kCodeDrivenActionPlannerTypeRegistration(
     "code_driven_action_planner", {
         motion_planner::Category::REALTIME,
         motion_planner::Kind::BEHAVIOR_TREE,

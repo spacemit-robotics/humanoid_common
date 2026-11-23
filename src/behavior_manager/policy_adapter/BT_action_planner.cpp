@@ -132,14 +132,19 @@ void CodeDrivenActionPlanner::Accumulate(const motion_planner::PlannerInput &inp
     if (selected < 0 || selected != held_direction_) {
         held_direction_ = selected;
         next_due_s_ = input.time_s + config_.period_s;
+        if (next_due_s_ <= input.time_s)
+            next_due_s_ = std::nextafter(input.time_s, std::numeric_limits<double>::infinity());
         return;
     }
     if (input.time_s < next_due_s_) return;
     const double elapsed = input.time_s - next_due_s_;
     const double periods = std::floor(elapsed / config_.period_s) + 1.0;
     Enqueue(config_.modes[mode_].directions[static_cast<std::size_t>(selected)], periods);
-    // Bounded insertion work even after a very large missed time interval.
-    next_due_s_ = input.time_s + config_.period_s - std::fmod(elapsed, config_.period_s);
+    // Advance from the previous deadline, not from a potentially late tick.
+    next_due_s_ += periods * config_.period_s;
+    // A period below the clock's precision must not retrigger at the same time.
+    if (next_due_s_ <= input.time_s)
+        next_due_s_ = std::nextafter(input.time_s, std::numeric_limits<double>::infinity());
 }
 
 void CodeDrivenActionPlanner::Publish(const std::string &action, bool neutral) {

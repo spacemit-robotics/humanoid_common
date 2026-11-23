@@ -2,8 +2,8 @@
  * SPDX-License-Identifier: Apache-2.0
  * Robot-independent finite-action selector; no inference or reference loading.
  */
-#ifndef CODE_DRIVEN_ACTION_PLANNER_H
-#define CODE_DRIVEN_ACTION_PLANNER_H
+#ifndef BT_ACTION_PLANNER_H
+#define BT_ACTION_PLANNER_H
 
 #include <array>
 #include <cstddef>
@@ -71,4 +71,4 @@ private:
 
 }  // namespace policy_adapter
 }  // namespace behavior_manager
-#endif  // CODE_DRIVEN_ACTION_PLANNER_H
+#endif  // BT_ACTION_PLANNER_H

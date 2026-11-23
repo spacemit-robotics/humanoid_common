@@ -139,13 +139,15 @@ rl_policy:
 `[1, 1, 1]`，并关闭平滑和 operator deadzone；这是为了让选择阈值对应原始归一化输入，
 不能把此专用输入配置套用到模型速度规划器。`mode_ids`、`initial_mode` 和每个模式的
 `neutral`、六个方向字段均必填；方向值可为空以禁用该方向，但 neutral 必须是 catalog
-中的有限动作。`once_actions` 是可通过参数请求的单次动作白名单。可选参数为：
+中的有限动作。所有非空方向映射和 `once_actions` 也必须指向 catalog 中的有限（非循环）
+动作；规划器依赖播放反馈的 `finished` 推进 FIFO，不会主动打断循环动作。`once_actions`
+是可通过参数请求的单次动作白名单。可选参数为：
 
 | 参数 | 默认值 | 作用 |
 | --- | --- | --- |
 | `joystick_threshold` | `0.5` | 主轴幅值严格大于该阈值才计时 |
 | `action_period_s` | `1.5` | 同一方向持续每满该周期入队一个完整动作 |
-| `max_pending_actions` | `32` | 待播 FIFO 容量，范围 `[1, 4096]`，满时拒绝新动作 |
+| `max_pending_actions` | `32` | 待播 FIFO 容量，范围 `[1, 4096]`；满时静默拒绝新请求（丢弃新项、保留已排队项），不提供操作者可见的溢出告警 |
 
 参数 `mode:<id>`、`mode:next`、`mode:previous` 切换后续动作套；`action:<id>` 请求白名单
 中的一次性动作，`action:<id>#<数字>` 可区分相同文本的重复请求。Common 只保留最新参数

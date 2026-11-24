@@ -12,6 +12,7 @@ try {
 let lastActionCatalog = "", lastPolicyCatalog = "", lastPlannerCatalog = "";
 let lastVelocityCatalog = "";
 let requestedPreset = "";
+let previewTicket = "";
 const motion = new window.OperatorTeleop.Motion();
 const keys = new Set();
 const pointers = new Map();
@@ -52,6 +53,7 @@ window.addEventListener('hashchange', () => {
 function tell(text) { $("message").textContent = text; }
 function closeConnection() {
   const previous = socket;
+  previewTicket = "";
   socket = null;
   clearTimeout(connectTimer); connectTimer = null;
   authenticated = false; activeRequest = 0; requestedPreset = ''; endMotion(false);
@@ -105,6 +107,7 @@ function connect() {
       if (socket !== current) return;
       clearTimeout(connectTimer); connectTimer = null; reconnectDelay = 500;
       authenticated = true; catalog = r.data.catalog; status = r.data.status;
+      previewTicket = r.data.preview_ticket || "";
       lastStatusAt = performance.now();
       $("robot").textContent = catalog.robot;
       if ($("voice-robot")) $("voice-robot").textContent = catalog.robot;
@@ -192,6 +195,42 @@ function controlOwnerLabel(owner, owns) {
   const client = owner.replace(/#\d+$/, "");
   return Object.prototype.hasOwnProperty.call(names, client) ? `${names[client]}已接管控制权` : owner;
 }
+// A separate HTTP request carries each frame; delayed images cannot queue on the control socket.
+let previewSession = null;
+function updatePreview(active) {
+  if (!!previewSession === !!active) return;
+  const panel = $("camera-preview"), img = $("camera-frame"), note = $("camera-note");
+  panel.hidden = !active;
+  const clearFrame = () => {
+    if (img.hasAttribute('src')) URL.revokeObjectURL(img.src);
+    img.removeAttribute('src'); img.hidden = true;
+  };
+  if (!active) {
+    previewSession.abort(); previewSession = null; clearFrame();
+    return;
+  }
+  const session = new AbortController();
+  previewSession = session; note.textContent = "等待相机画面";
+  const poll = async () => {
+    if (session.signal.aborted) return;
+    let delay = 200;
+    try {
+      const r = await fetch('/api/v1/camera.jpg', {headers:{Authorization:'Bearer ' + previewTicket},
+        cache:'no-store', signal:session.signal});
+      if (!r.ok) throw new Error();
+      const frame = await r.blob();
+      if (session.signal.aborted) return;
+      const previous = img.getAttribute('src');
+      img.src = URL.createObjectURL(frame); img.hidden = false; note.textContent = '';
+      if (previous) URL.revokeObjectURL(previous);
+    } catch (_) {
+      if (session.signal.aborted) return;
+      clearFrame(); note.textContent = "相机画面暂不可用"; delay = 1000;
+    }
+    setTimeout(poll, delay);
+  };
+  poll();
+}
 function render() {
   const trajectory = status?.trajectory_enabled ?? catalog?.trajectory_enabled ?? false;
   document.body.dataset.trajectory = String(trajectory);
@@ -208,6 +247,9 @@ function render() {
   const online = authenticated && status?.online && fresh;
   const admin = authenticated && (status?.admin || !catalog?.admin_required);
   const owns = online && admin && status.owns_control;
+  updatePreview(online && admin && previewTicket && !suspended && !document.hidden &&
+    document.body.dataset.mode === 'control' && status.environment === 'real' && status.state === 'RL' &&
+    !status.fault?.latched && catalog?.preview_policy && status.policy === catalog.preview_policy);
   const fault = status?.fault;
   const busy = status?.request.phase === "accepted";
   const environment = {sim:"仿真", real:"实机"}[status?.environment];
@@ -605,6 +647,7 @@ window.operatorReconnect = () => {
   if (token) connect();
 };
 function suspend(reason) {
+  updatePreview(false);
   clientEvent(reason);
   suspended = true; clearTimeout(reconnectTimer); reconnectTimer = null;
   endMotion(false);
@@ -675,6 +718,7 @@ function setMode(mode) {
   if (mode === 'control' && (!authenticated || (catalog?.admin_required && !status?.admin))) return;
   const voice = mode === "voice";
   document.body.dataset.mode = voice ? "voice" : "control";
+  if (voice) updatePreview(false);
   const hasPublicPage = Boolean(catalog?.admin_required || voicePort > 0);
   $("admin-entry").hidden = !voice || !hasPublicPage;
   $("admin-exit").hidden = voice || !hasPublicPage;

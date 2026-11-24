@@ -169,6 +169,8 @@ public:
 private:
     void ReadHttp();
     void DownloadApk();
+    void Preview();
+    void ReplyPreview(http::status code, std::string jpeg = {});
     void ReadWs();
     void Write();
     Server &server_;
@@ -276,6 +278,7 @@ public:
     std::unique_ptr<transport::TransportBaseV2> transport;
     std::vector<std::weak_ptr<Session>> sessions;
     int connections = 0;
+    int pending_previews = 0;
     bool send_failed = false;
     std::chrono::steady_clock::time_point last_publish{};
     uint64_t catalog_revision = 0;
@@ -308,6 +311,10 @@ void Session::ReadHttp() {
         }
         self->request_ = self->parser_.release();
         const std::string target(self->request_.target());
+        if (target == "/api/v1/camera.jpg" && self->request_.method() == http::verb::get) {
+            self->Preview();
+            return;
+        }
         if (!self->server_.service.Configuration().terminal_only &&
             target == "/downloads/SpacemiT-Operator.apk" &&
             (self->request_.method() == http::verb::get || self->request_.method() == http::verb::head)) {
@@ -322,7 +329,8 @@ void Session::ReadHttp() {
                 self->Stop();
                 return;
             }
-            self->id_ = self->server_.service.Open();
+            self->id_ = self->server_.service.Open(
+                self->server_.service.Configuration().preview_policy.empty() ? "" : Secret());
             if (!self->id_) {
                 self->Stop();
                 return;
@@ -348,7 +356,7 @@ void Session::ReadHttp() {
         response->set("Referrer-Policy", "no-referrer");
         response->set("Content-Security-Policy",
             "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'");
+            "connect-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'");
         std::string filename;
         if (target == "/") filename = "index.html";
         if (target == "/app.js") {
@@ -410,6 +418,58 @@ void Session::ReadHttp() {
         response->prepare_payload();
         http::async_write(
             self->stream_, *response, [self, response](boost::system::error_code, size_t) { self->Stop(); });
+    });
+}
+void Session::ReplyPreview(http::status code, std::string jpeg) {
+    auto reply = std::make_shared<http::response<http::string_body>>(code, 11);
+    reply->set(http::field::cache_control, "no-store");
+    reply->set(http::field::content_type, jpeg.empty() ? "text/plain" : "image/jpeg");
+    reply->set("X-Content-Type-Options", "nosniff");
+    reply->body() = std::move(jpeg);
+    reply->prepare_payload();
+    stream_.expires_after(std::chrono::seconds(1));
+    http::async_write(stream_, *reply, [self = shared_from_this(), reply](boost::system::error_code, size_t) {
+        self->Stop();
+    });
+}
+void Session::Preview() {
+    const std::string auth(request_[http::field::authorization]);
+    if (auth.rfind("Bearer ", 0) != 0 || !server_.service.PreviewAuthorized(auth.substr(7)))
+        return ReplyPreview(http::status::forbidden);
+    if (!server_.service.PreviewActive()) return ReplyPreview(http::status::not_found);
+    if (server_.pending_previews >= 3) return ReplyPreview(http::status::service_unavailable);
+    const auto &config = server_.service.Configuration();
+    boost::system::error_code error;
+    const auto address = net::ip::make_address(config.preview_address, error);
+    if (error) return ReplyPreview(http::status::bad_gateway);
+    // Only the configured peer is reachable; never forward the operator credential.
+    struct Fetch {
+        explicit Fetch(net::io_context &io) : upstream(io) { response.body_limit(192 * 1024); }
+        beast::tcp_stream upstream;
+        beast::flat_buffer buffer;
+        http::request<http::empty_body> get{http::verb::get, "/frame.jpg", 11};
+        http::response_parser<http::string_body> response;
+    };
+    auto fetch = std::make_shared<Fetch>(server_.io);
+    fetch->get.set(http::field::host, config.preview_address);
+    ++server_.pending_previews;
+    const auto done = [self = shared_from_this(), fetch, ticket = auth.substr(7)](boost::system::error_code ec) {
+        --self->server_.pending_previews;
+        if (!self->server_.service.PreviewAuthorized(ticket)) return self->ReplyPreview(http::status::forbidden);
+        if (!self->server_.service.PreviewActive()) return self->ReplyPreview(http::status::not_found);
+        auto &r = fetch->response.get();
+        if (ec || r.result() != http::status::ok || r[http::field::content_type] != "image/jpeg" || r.body().empty())
+            return self->ReplyPreview(http::status::service_unavailable);
+        self->ReplyPreview(http::status::ok, std::move(r.body()));
+    };
+    fetch->upstream.expires_after(std::chrono::milliseconds(1500));
+    fetch->upstream.async_connect(Tcp::endpoint(address, config.preview_port), [fetch, done](auto ec) {
+        if (ec) return done(ec);
+        http::async_write(fetch->upstream, fetch->get, [fetch, done](auto write_error, size_t) {
+            if (write_error) return done(write_error);
+            http::async_read(fetch->upstream, fetch->buffer, fetch->response,
+                [done](auto read_error, size_t) { done(read_error); });
+        });
     });
 }
 void Session::DownloadApk() {

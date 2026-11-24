@@ -36,6 +36,9 @@ struct Config {
     std::string credential_file;
     std::string qr_file;
     std::string web_root;
+    std::string preview_policy;
+    std::string preview_address;
+    uint16_t preview_port = 0;
     int voice_chat_port = 0;  // >0 时网页显示「语音对话」，链到同一主机这个端口的 http 入口
     double heartbeat_hz = 20;
     double status_timeout = 0.6;
@@ -63,7 +66,7 @@ std::string PairingUrl(const Config &config);
 class Service {
 public:
     explicit Service(Config config);
-    uint64_t Open();
+    uint64_t Open(std::string preview_ticket = {});
     void Disconnect(uint64_t session);
     Json Handle(uint64_t session, const Json &request);
     void Tick();
@@ -80,6 +83,8 @@ public:
     void MarkCommandSent() { command_sent_ = true; }
     uint64_t AcknowledgeSequence() const { return acknowledge_sequence_; }
     bool Authenticated(uint64_t session) const;
+    bool PreviewAuthorized(const std::string &ticket) const;
+    bool PreviewActive() const;
     const Config &Configuration() const { return config_; }
 
 private:
@@ -87,6 +92,7 @@ private:
         bool authenticated = false;
         bool admin = false;
         bool feedback_subscribed = false;
+        std::string preview_ticket;
         std::string login_error;
         std::string name;
         uint64_t last_id = 0;

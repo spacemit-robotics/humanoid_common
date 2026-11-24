@@ -226,7 +226,7 @@ void TestAdministrator() {
     config.admin_password_hash = "pbkdf2-sha256:100000:00112233445566778899aabbccddeeff:"
         "ce640bcfa4ac6c9479894ecb9990fe597e6f6e4f6878e84ebbcce384bbb4f7b2";
     Service service(config);
-    const auto browser = service.Open(), terminal = service.Open();
+    const auto browser = service.Open("preview-test-ticket"), terminal = service.Open();
     uint64_t request_id = 0;
     const auto call = [&](uint64_t session, const std::string &op, const Json &args = Json::object()) {
         return service.Handle(session, {{"v", 1}, {"id", ++request_id}, {"op", op}, {"args", args}});
@@ -238,6 +238,7 @@ void TestAdministrator() {
     assert(call(browser, "hello", {{"token", config.token}}).at("ok"));
     assert(call(terminal, "hello", {{"token", config.control_token}}).at("ok"));
     assert(!service.StatusMessage(browser).at("admin") && service.StatusMessage(terminal).at("admin"));
+    assert(!service.PreviewAuthorized("preview-test-ticket"));
     assert(service.Catalog().at("admin_required"));
     assert(service.Catalog().dump().find(config.admin_password_hash) == std::string::npos);
     assert(call(browser, "status").at("ok"));
@@ -263,9 +264,11 @@ void TestAdministrator() {
     assert(call(browser, "admin_login", {{"password", "test-admin-only"}}).at("ok"));
     await_login();
     assert(service.StatusMessage(browser).at("admin") && !service.Snapshot(browser).owns_control);
+    assert(service.PreviewAuthorized("preview-test-ticket") && !service.PreviewAuthorized(config.token));
     assert(call(terminal, "release").at("ok"));
     assert(call(browser, "acquire").at("ok"));
     assert(call(browser, "admin_logout").at("ok"));
+    assert(!service.PreviewAuthorized("preview-test-ticket"));
     assert(!service.StatusMessage(browser).at("admin") && !service.Snapshot(browser).owns_control);
     assert(service.Command().key == 0);
     assert(call(browser, "acquire").at("code") == "admin_required");

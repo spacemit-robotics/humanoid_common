@@ -434,6 +434,7 @@ target_compile_definitions(test_policy_command_limits PRIVATE
 target_link_libraries(test_policy_command_limits PRIVATE robot_base)
 enable_testing()
 install(PROGRAMS scripts/humanoid_logs.py DESTINATION bin)
+install(PROGRAMS scripts/sim_rgbd_frames.py DESTINATION bin)
 add_executable(test_runtime_logging example/runtime/test_runtime_logging.cpp)
 target_include_directories(test_runtime_logging PRIVATE src/logging)
 target_link_libraries(test_runtime_logging PRIVATE robot_base)

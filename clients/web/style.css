@@ -279,3 +279,6 @@ body[data-trajectory="true"] .status-band { grid-template-columns: repeat(3, min
   body[data-input-mode="sticks"] .input-modes button { min-height: 28px; padding: 4px; }
   body[data-input-mode="sticks"] .section-heading { flex-wrap: wrap; gap: 4px; }
 }
+#camera-preview { margin: .6rem 0; }
+#camera-preview small { display: block; color: var(--muted); }
+#camera-frame { max-width: 100%; height: auto; max-height: 24svh; object-fit: contain; }

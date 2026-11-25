@@ -5,6 +5,7 @@
  * @brief Bounded asynchronous server and internal transport bridge
  */
 #include "server.h"
+#include "whep_proxy.h"
 
 #include <fcntl.h>
 #include <sys/file.h>
@@ -169,6 +170,8 @@ public:
 private:
     void ReadHttp();
     void DownloadApk();
+    void Preview();
+    void ReplyPreview(http::status code, std::string sdp = {});
     void ReadWs();
     void Write();
     Server &server_;
@@ -193,7 +196,7 @@ public:
     explicit Server(Config config, const std::string &yaml)
         : service(std::move(config)), acceptor(io,
             Tcp::endpoint(net::ip::make_address(service.Configuration().bind_address), service.Configuration().port)),
-        timer(io), signals(io, SIGINT, SIGTERM) {
+        timer(io), signals(io, SIGINT, SIGTERM), preview(io, service.Configuration().preview_port) {
         transport = transport::CreateV2(yaml);
         if (!transport->Init(yaml, transport::Role::HMI))
             throw std::runtime_error("HMI transport initialization failed");
@@ -227,6 +230,7 @@ public:
         robot_base::RobotFeedback feedback;
         for (int i = 0; i < 32 && transport->RecvFeedback(feedback); ++i) service.UpdateFeedback(feedback);
         service.Tick();
+        preview.Sweep([this](const auto &ticket) { return service.PreviewActive() && service.PreviewAuthorized(ticket); });
         const bool sent = transport->SendCommandV2(service.Command(), service.AcknowledgeSequence());
         if (sent) service.MarkCommandSent();
         if (!sent && !send_failed)
@@ -276,6 +280,7 @@ public:
     std::unique_ptr<transport::TransportBaseV2> transport;
     std::vector<std::weak_ptr<Session>> sessions;
     int connections = 0;
+    WhepProxy preview;
     bool send_failed = false;
     std::chrono::steady_clock::time_point last_publish{};
     uint64_t catalog_revision = 0;
@@ -299,7 +304,7 @@ void Session::Stop() {
 void Session::Start() { ReadHttp(); }
 void Session::ReadHttp() {
     stream_.expires_after(std::chrono::seconds(5));
-    parser_.body_limit(0);
+    parser_.body_limit(64 * 1024);  // Bounded SDP offer for camera negotiation.
     parser_.header_limit(8192);
     http::async_read(stream_, buffer_, parser_, [self = shared_from_this()](boost::system::error_code ec, size_t) {
         if (ec) {
@@ -308,6 +313,11 @@ void Session::ReadHttp() {
         }
         self->request_ = self->parser_.release();
         const std::string target(self->request_.target());
+        if (target == "/api/v1/camera" &&
+            (self->request_.method() == http::verb::post || self->request_.method() == http::verb::delete_)) {
+            self->Preview();
+            return;
+        }
         if (!self->server_.service.Configuration().terminal_only &&
             target == "/downloads/SpacemiT-Operator.apk" &&
             (self->request_.method() == http::verb::get || self->request_.method() == http::verb::head)) {
@@ -322,7 +332,8 @@ void Session::ReadHttp() {
                 self->Stop();
                 return;
             }
-            self->id_ = self->server_.service.Open();
+            self->id_ = self->server_.service.Open(
+                self->server_.service.Configuration().preview_policy.empty() ? "" : Secret());
             if (!self->id_) {
                 self->Stop();
                 return;
@@ -348,7 +359,7 @@ void Session::ReadHttp() {
         response->set("Referrer-Policy", "no-referrer");
         response->set("Content-Security-Policy",
             "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'");
+            "connect-src 'self'; img-src 'self' data:; media-src 'self' blob:; frame-ancestors 'none'");
         std::string filename;
         if (target == "/") filename = "index.html";
         if (target == "/app.js") {
@@ -411,6 +422,34 @@ void Session::ReadHttp() {
         http::async_write(
             self->stream_, *response, [self, response](boost::system::error_code, size_t) { self->Stop(); });
     });
+}
+void Session::ReplyPreview(http::status code, std::string sdp) {
+    auto reply = std::make_shared<http::response<http::string_body>>(code, 11);
+    reply->set(http::field::cache_control, "no-store");
+    reply->set(http::field::content_type, sdp.empty() ? "text/plain" : "application/sdp");
+    reply->set("X-Content-Type-Options", "nosniff");
+    reply->body() = std::move(sdp);
+    reply->prepare_payload();
+    stream_.expires_after(std::chrono::seconds(1));
+    http::async_write(stream_, *reply, [self = shared_from_this(), reply](boost::system::error_code, size_t) {
+        self->Stop();
+    });
+}
+void Session::Preview() {
+    const std::string auth(request_[http::field::authorization]);
+    if (auth.rfind("Bearer ", 0) != 0 || !server_.service.PreviewAuthorized(auth.substr(7)))
+        return ReplyPreview(http::status::forbidden);
+    if (request_.method() == http::verb::delete_) {
+        server_.preview.Close(auth.substr(7));
+        return ReplyPreview(http::status::no_content);
+    }
+    if (!server_.service.PreviewActive()) return ReplyPreview(http::status::not_found);
+    if (request_[http::field::content_type] != "application/sdp" || request_.body().empty())
+        return ReplyPreview(http::status::bad_request);
+    server_.preview.Open(auth.substr(7), std::move(request_.body()),
+        [self = shared_from_this()](bool ok, std::string sdp) {
+            self->ReplyPreview(ok ? http::status::created : http::status::service_unavailable, std::move(sdp));
+        });
 }
 void Session::DownloadApk() {
     const auto path = server_.service.Configuration().web_root + "/downloads/SpacemiT-Operator.apk";

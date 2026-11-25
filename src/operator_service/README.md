@@ -30,6 +30,11 @@
 Android App 不是第二套控制实现：页面仍通过 WebSocket 调用操作服务。
 浏览器/Android 不直接读写 SHM，C++ 客户端也不链接 transport、RL 或电机库。
 
+机型可用 `operator_service.camera_preview: {policy: ..., port: ...}` 指定可预览的策略和本地 WebRTC 网关。
+HMI 将有权限的网页会话的 SDP 协商请求转给回环地址上的 `/preview/whep`，不转发视频数据。
+实机和仿真使用同一页面；切离该策略、故障、会话断开或退出管理时关闭对应视频会话。
+观看无需接管控制权。
+
 ## 启动与配对
 
 ```bash

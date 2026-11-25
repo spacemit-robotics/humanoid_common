@@ -103,7 +103,7 @@ class MujocoDepthPublisher::Impl {
         EGLDisplay display = EGL_NO_DISPLAY;
         EGLContext gl = EGL_NO_CONTEXT;
         EGLSurface surface = EGL_NO_SURFACE;
-        void *ctx = nullptr, *socket = nullptr;
+        void *ctx = nullptr, *socket = nullptr, *preview = nullptr;
         mjvScene scene;
         mjv_defaultScene(&scene);
         mjrContext render;
@@ -121,6 +121,19 @@ class MujocoDepthPublisher::Impl {
             zmq_setsockopt(socket, ZMQ_SNDHWM, &hwm, sizeof(hwm));
             if (zmq_bind(socket, endpoint.c_str()) != 0)
                 throw std::runtime_error("depth endpoint bind failed");
+            if (!config.preview_endpoint.empty()) {
+                preview = zmq_socket(ctx, ZMQ_XPUB);
+                if (preview) {
+                    zmq_setsockopt(preview, ZMQ_LINGER, &linger, sizeof(linger));
+                    zmq_setsockopt(preview, ZMQ_SNDHWM, &hwm, sizeof(hwm));
+                    if (zmq_bind(preview, config.preview_endpoint.c_str()) != 0) {
+                        runtime_logging::Log(runtime_logging::Level::kWarning, "RGB-D preview endpoint unavailable", false);
+                        zmq_close(preview);
+                        preview = nullptr;
+                    }
+                }
+            }
+            bool want_depth = false, want_preview = false;
             std::ostringstream id;
             id << std::chrono::steady_clock::now().time_since_epoch().count();
             uint64_t sequence = 0;
@@ -134,7 +147,10 @@ class MujocoDepthPublisher::Impl {
                 int size;
                 while ((size = zmq_recv(socket, &event, 1, ZMQ_DONTWAIT)) >= 0)
                     if (size == 1)
-                        subscribed = event != 0;
+                        want_depth = event != 0;
+                while (preview && (size = zmq_recv(preview, &event, 1, ZMQ_DONTWAIT)) >= 0)
+                    if (size == 1) want_preview = event != 0;
+                subscribed = want_depth || want_preview;
                 if (!subscribed) {
                     pending = false;
                     delayed.clear();
@@ -251,6 +267,20 @@ class MujocoDepthPublisher::Impl {
                     applied_epoch = epoch;
                 }
                 degrader.Apply(frame.pixels);
+                // Optional viewer packet: the same metric depth frame, then bottom-up RGB24.
+                // The existing depth-only endpoint and its packet layout stay unchanged.
+                if (want_preview) {
+                    constexpr int width = 320, height = 180;
+                    auto packet = Encode(frame);
+                    const auto offset = packet.size();
+                    packet.resize(offset + width * height * 3);
+                    if (render.offWidth < width || render.offHeight < height)
+                        mjr_resizeOffscreen(width, height, &render);
+                    const mjrRect rgb_view{0, 0, width, height};
+                    mjr_render(rgb_view, &scene, &render);
+                    mjr_readPixels(packet.data() + offset, nullptr, rgb_view, &render);
+                    zmq_send(preview, packet.data(), packet.size(), ZMQ_DONTWAIT);
+                }
                 if (last_report < 0 || frame.time - last_report >= 1) {
                     const auto holes = std::count(frame.pixels.begin(), frame.pixels.end(), 0.f);
                     runtime_logging::Log(runtime_logging::Level::kInfo,
@@ -261,7 +291,7 @@ class MujocoDepthPublisher::Impl {
                 // Simulation-time delivery preserves acquisition timestamps and
                 // never sleeps on the physics thread. <=120 FPS / 1 s is bounded.
                 if (delayed.size() >= 128) delayed.pop_front();
-                delayed.push_back(std::move(frame));
+                if (want_depth) delayed.push_back(std::move(frame));
                 pending = false;
             }
         } catch (const std::exception &e) {
@@ -270,6 +300,7 @@ class MujocoDepthPublisher::Impl {
         }
         mjr_freeContext(&render);
         mjv_freeScene(&scene);
+        if (preview) zmq_close(preview);
         if (socket)
             zmq_close(socket);
         if (ctx)

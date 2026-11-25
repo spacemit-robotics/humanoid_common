@@ -157,12 +157,20 @@ PreparedPolicyStates PreparePolicyStates(
         const std::string &config_path,
         const std::string &policy_name,
         const std::string &robot_dir,
+        robot_base::RuntimeEnvironment environment,
         const robot_base::ThreadLoop &infer_thread_cfg,
         const ZeroTransitionConfig &zero_transition_config,
         const std::vector<double> &zero_kp,
         const std::vector<double> &zero_kd,
         std::atomic<double> *rl_freq_hz) {
     RLConfig config = LoadRLStateConfig(config_path, policy_name, robot_dir);
+    if (config.policy_adapter.type == "hiking" && environment == robot_base::RuntimeEnvironment::SIMULATION) {
+        const auto endpoint = robot_base::YamlFile::Load(config_path).Read<std::string>("simulation.mujoco.depth_endpoint");
+        if (endpoint) {
+            config.policy_adapter.hiking.endpoint = *endpoint;
+            config.policy_adapter.hiking.clock = "sim";
+        }
+    }
     config.infer_thread_cfg = infer_thread_cfg;
     config.rl_freq_hz = rl_freq_hz;
 
@@ -448,11 +456,11 @@ public:
             "preparing RL policy runtime: " + policy_name, false);
         try {
             policy_prepare_future = std::async(std::launch::async,
-                [path, policy_name, directory, thread_config,
+                [path, policy_name, directory, environment = sensor.environment, thread_config,
                     transition_config, kp, kd, frequency] {
                     robot_base::ThreadLoop::Background("policy_prepare").Apply();
                     return PreparePolicyStates(path, policy_name, directory,
-                        thread_config, transition_config, kp, kd, frequency);
+                        environment, thread_config, transition_config, kp, kd, frequency);
                 });
         } catch (...) {
             policy_prepare_active = false;

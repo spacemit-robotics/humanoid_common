@@ -12,6 +12,7 @@ try {
 let lastActionCatalog = "", lastPolicyCatalog = "", lastPlannerCatalog = "";
 let lastVelocityCatalog = "";
 let requestedPreset = "";
+let previewTicket = "";
 const motion = new window.OperatorTeleop.Motion();
 const keys = new Set();
 const pointers = new Map();
@@ -52,6 +53,7 @@ window.addEventListener('hashchange', () => {
 function tell(text) { $("message").textContent = text; }
 function closeConnection() {
   const previous = socket;
+  previewTicket = "";
   socket = null;
   clearTimeout(connectTimer); connectTimer = null;
   authenticated = false; activeRequest = 0; requestedPreset = ''; endMotion(false);
@@ -105,6 +107,7 @@ function connect() {
       if (socket !== current) return;
       clearTimeout(connectTimer); connectTimer = null; reconnectDelay = 500;
       authenticated = true; catalog = r.data.catalog; status = r.data.status;
+      previewTicket = r.data.preview_ticket || "";
       lastStatusAt = performance.now();
       $("robot").textContent = catalog.robot;
       if ($("voice-robot")) $("voice-robot").textContent = catalog.robot;
@@ -192,6 +195,70 @@ function controlOwnerLabel(owner, owns) {
   const client = owner.replace(/#\d+$/, "");
   return Object.prototype.hasOwnProperty.call(names, client) ? `${names[client]}已接管控制权` : owner;
 }
+// Only WebRTC negotiation goes through HTTP. The receive-only video track is independent of teleop.
+let previewSession = null;
+function updatePreview(active) {
+  if (!!previewSession === !!active) return;
+  const panel = $("camera-preview"), video = $("camera-frame"), note = $("camera-note");
+  panel.hidden = !active;
+  if (!active) {
+    previewSession.abort(); previewSession = null;
+    video.srcObject = null; video.hidden = true;
+    return;
+  }
+  const session = new AbortController(), ticket = previewTicket;
+  previewSession = session;
+  const headers = {Authorization:'Bearer ' + ticket, 'Content-Type':'application/sdp'};
+  session.signal.addEventListener('abort', () => {
+    fetch('/api/v1/camera', {method:'DELETE', headers, keepalive:true}).catch(() => {});
+  }, {once:true});
+  const connectVideo = async () => {
+    if (session.signal.aborted) return;
+    let pc, timer, done = false, watchdog, lastFrame = 0, lastCount = -1;
+    const close = () => {
+      if (done) return;
+      done = true; clearTimeout(timer); clearInterval(watchdog);
+      session.signal.removeEventListener('abort', close);
+      pc?.close(); video.srcObject = null; video.hidden = true;
+      if (!session.signal.aborted) {
+        note.textContent = "相机画面暂不可用，正在重连"; setTimeout(connectVideo, 1200);
+      }
+    };
+    session.signal.addEventListener('abort', close, {once:true});
+    try {
+      note.textContent = "正在连接相机";
+      pc = new RTCPeerConnection({iceServers:[]});
+      pc.addTransceiver('video', {direction:'recvonly'});
+      pc.ontrack = e => { video.srcObject = new MediaStream([e.track]); video.play().catch(close); };
+      pc.onconnectionstatechange = () => {
+        if (['failed','disconnected'].includes(pc.connectionState)) close();
+      };
+      timer = setTimeout(close, 18000);
+      await pc.setLocalDescription(await pc.createOffer());
+      if (pc.iceGatheringState !== 'complete') await new Promise(resolve => {
+        const wait = setTimeout(resolve, 2000);
+        pc.onicegatheringstatechange = () => {
+          if (pc.iceGatheringState === 'complete') { clearTimeout(wait); resolve(); }
+        };
+      });
+      if (done) return;
+      const answer = await fetch('/api/v1/camera', {method:'POST', headers, signal:session.signal,
+        body:pc.localDescription.sdp});
+      if (!answer.ok) throw new Error();
+      await pc.setRemoteDescription({type:'answer', sdp:await answer.text()});
+      if (done) return;
+      clearTimeout(timer); lastFrame = performance.now();
+      watchdog = setInterval(() => {
+        const quality = video.getVideoPlaybackQuality();
+        const count = quality.totalVideoFrames - quality.droppedVideoFrames;
+        if (count > 0 && count !== lastCount) {
+          lastFrame = performance.now(); lastCount = count; video.hidden = false; note.textContent = '';
+        } else if (performance.now() - lastFrame > (lastCount < 0 ? 10000 : 2500)) close();
+      }, 250);
+    } catch (_) { close(); }
+  };
+  connectVideo();
+}
 function render() {
   const trajectory = status?.trajectory_enabled ?? catalog?.trajectory_enabled ?? false;
   document.body.dataset.trajectory = String(trajectory);
@@ -208,6 +275,9 @@ function render() {
   const online = authenticated && status?.online && fresh;
   const admin = authenticated && (status?.admin || !catalog?.admin_required);
   const owns = online && admin && status.owns_control;
+  updatePreview(online && admin && previewTicket && !suspended && !document.hidden &&
+    document.body.dataset.mode === 'control' && ['real','sim'].includes(status.environment) && status.state === 'RL' &&
+    !status.fault?.latched && catalog?.preview_policy && status.policy === catalog.preview_policy);
   const fault = status?.fault;
   const busy = status?.request.phase === "accepted";
   const environment = {sim:"仿真", real:"实机"}[status?.environment];
@@ -605,6 +675,7 @@ window.operatorReconnect = () => {
   if (token) connect();
 };
 function suspend(reason) {
+  updatePreview(false);
   clientEvent(reason);
   suspended = true; clearTimeout(reconnectTimer); reconnectTimer = null;
   endMotion(false);
@@ -675,6 +746,7 @@ function setMode(mode) {
   if (mode === 'control' && (!authenticated || (catalog?.admin_required && !status?.admin))) return;
   const voice = mode === "voice";
   document.body.dataset.mode = voice ? "voice" : "control";
+  if (voice) updatePreview(false);
   const hasPublicPage = Boolean(catalog?.admin_required || voicePort > 0);
   $("admin-entry").hidden = !voice || !hasPublicPage;
   $("admin-exit").hidden = voice || !hasPublicPage;

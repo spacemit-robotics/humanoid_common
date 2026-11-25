@@ -199,6 +199,13 @@ Config LoadConfig(const std::string &path) {
     if (port < 1 || port > 65535) throw std::runtime_error("invalid operator port");
     c.port = static_cast<uint16_t>(port);
     c.public_url = yaml.Read<std::string>("operator_service.public_url").value_or("");
+    c.preview_policy = yaml.Read<std::string>("operator_service.camera_preview.policy").value_or("");
+    if (!c.preview_policy.empty()) {
+        const int preview_port = yaml.Read<int>("operator_service.camera_preview.port").value_or(0);
+        if (preview_port <= 0 || preview_port > 65535)
+            throw std::runtime_error("camera_preview requires a valid local signaling port");
+        c.preview_port = static_cast<uint16_t>(preview_port);
+    }
     c.voice_chat_port = yaml.Read<int>("operator_service.voice_chat_port").value_or(0);
     c.admin_password_hash = yaml.Read<std::string>("operator_service.admin_password_hash").value_or("");
     if (c.voice_chat_port < 0 || c.voice_chat_port > 65535) throw std::runtime_error("invalid voice chat port");
@@ -355,10 +362,10 @@ Service::Service(Config config) : config_(std::move(config)) {
     }
     velocity_at_ = Now();
 }
-uint64_t Service::Open() {
+uint64_t Service::Open(std::string preview_ticket) {
     if (sessions_.size() >= 32) return 0;
     const auto id = ++next_session_;
-    sessions_.emplace(id, Session{});
+    sessions_[id].preview_ticket = std::move(preview_ticket);
     return id;
 }
 bool Service::Authenticated(uint64_t session) const {
@@ -669,6 +676,16 @@ bool Service::FeedbackSubscribed(uint64_t session) const {
     const auto it = sessions_.find(session);
     return it != sessions_.end() && it->second.authenticated && it->second.feedback_subscribed;
 }
+bool Service::PreviewAuthorized(const std::string &ticket) const {
+    return std::any_of(sessions_.begin(), sessions_.end(), [&](const auto &item) {
+        return item.second.authenticated && item.second.admin && TokenEqual(ticket, item.second.preview_ticket);
+    });
+}
+bool Service::PreviewActive() const {
+    return !config_.terminal_only && !config_.preview_policy.empty() && Online() && !fault_.latched &&
+        status_.environment != robot_base::RuntimeEnvironment::UNKNOWN && status_.mode == robot_base::ControlMode::RL &&
+        status_.active_policy == config_.preview_policy;
+}
 Status Service::Snapshot(uint64_t session) const {
     Status s;
     s.online = Online();
@@ -743,6 +760,7 @@ Json Service::Catalog() const {
         {"velocity_step", Encode(config_.velocity_step)}, {"trajectory_enabled", config_.trajectory_enabled},
         {"actions", actions}, {"teleop", teleop}, {"voice_chat_port", config_.voice_chat_port},
         {"admin_required", !config_.admin_password_hash.empty()},
+        {"preview_policy", config_.preview_policy},
         {"environment", robot_base::RuntimeEnvironmentName(status_.environment)}};
 }
 Json Service::ReplyTo(
@@ -780,8 +798,9 @@ Json Service::Handle(uint64_t session, const Json &request) {
             it->second.authenticated = true;
             it->second.admin = control || config_.admin_password_hash.empty();
             it->second.name = name;
-            return ReplyTo(
-                id, true, "ok", "authenticated", {{"catalog", Catalog()}, {"status", StatusMessage(session)}});
+            Json data = {{"catalog", Catalog()}, {"status", StatusMessage(session)}};
+            if (!it->second.preview_ticket.empty()) data["preview_ticket"] = it->second.preview_ticket;
+            return ReplyTo(id, true, "ok", "authenticated", data);
         }
         if (!it->second.authenticated) return fail("unauthorized", "authenticate first");
         if (op == "subscribe_robot_feedback") {

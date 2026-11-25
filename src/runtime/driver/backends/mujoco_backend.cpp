@@ -47,9 +47,11 @@ public:
             yaml_file.Read<std::vector<double>>("robot_base.kd").value_or(std::vector<double>{});
         simulator_ = std::make_unique<mujoco_sim::Simulator>(yaml_path, robot_name, num_dof,
             scene_path, default_joint_pos, kp, kd, true);
-        if (yaml_file.Read<bool>("perception.depth.publish_sim").value_or(false)) {
+        const auto sim_depth = yaml_file.Read<std::string>("simulation.mujoco.depth_endpoint");
+        if (sim_depth || yaml_file.Read<bool>("perception.depth.publish_sim").value_or(false)) {
 #ifdef HAS_HIKING_SIM_DEPTH
             perception::SimDepthConfig config;
+            config.preview_endpoint = yaml_file.Read<std::string>("simulation.mujoco.preview_endpoint").value_or("");
             const std::string base = "simulation.mujoco.depth.";
             config.fps = yaml_file.Read<double>(base + "fps").value_or(config.fps);
             config.latency_s = yaml_file.Read<double>(base + "latency_s").value_or(config.latency_s);
@@ -70,8 +72,8 @@ public:
             config.noise_std_m = yaml_file.Read<double>(defects + "noise_std_m").value_or(config.noise_std_m);
             config.Validate();
             depth_ = std::make_unique<perception::MujocoDepthPublisher>(
-                yaml_file.Read<std::string>("simulation.mujoco.depth_endpoint").value_or(
-                    yaml_file.Read<std::string>("perception.depth.endpoint").value_or("tcp://127.0.0.1:5560")), config);
+                sim_depth.value_or(yaml_file.Read<std::string>("perception.depth.endpoint")
+                    .value_or("tcp://127.0.0.1:5560")), config);
             simulator_->SetObserveCallback([this](const auto &state, const auto &frame) {
                 depth_->Observe(state.time, frame.model, frame.data);
             });

@@ -37,7 +37,6 @@ struct Config {
     std::string qr_file;
     std::string web_root;
     std::string preview_policy;
-    std::string preview_address;
     uint16_t preview_port = 0;
     int voice_chat_port = 0;  // >0 时网页显示「语音对话」，链到同一主机这个端口的 http 入口
     double heartbeat_hz = 20;

@@ -201,10 +201,9 @@ Config LoadConfig(const std::string &path) {
     c.public_url = yaml.Read<std::string>("operator_service.public_url").value_or("");
     c.preview_policy = yaml.Read<std::string>("operator_service.camera_preview.policy").value_or("");
     if (!c.preview_policy.empty()) {
-        c.preview_address = yaml.Read<std::string>("operator_service.camera_preview.address").value_or("");
         const int preview_port = yaml.Read<int>("operator_service.camera_preview.port").value_or(0);
-        if (c.preview_address.empty() || preview_port <= 0 || preview_port > 65535)
-            throw std::runtime_error("camera_preview requires an address and a valid port");
+        if (preview_port <= 0 || preview_port > 65535)
+            throw std::runtime_error("camera_preview requires a valid local signaling port");
         c.preview_port = static_cast<uint16_t>(preview_port);
     }
     c.voice_chat_port = yaml.Read<int>("operator_service.voice_chat_port").value_or(0);
@@ -684,7 +683,7 @@ bool Service::PreviewAuthorized(const std::string &ticket) const {
 }
 bool Service::PreviewActive() const {
     return !config_.terminal_only && !config_.preview_policy.empty() && Online() && !fault_.latched &&
-        status_.environment == robot_base::RuntimeEnvironment::REAL && status_.mode == robot_base::ControlMode::RL &&
+        status_.environment != robot_base::RuntimeEnvironment::UNKNOWN && status_.mode == robot_base::ControlMode::RL &&
         status_.active_policy == config_.preview_policy;
 }
 Status Service::Snapshot(uint64_t session) const {

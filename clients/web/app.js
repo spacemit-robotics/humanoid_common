@@ -195,41 +195,69 @@ function controlOwnerLabel(owner, owns) {
   const client = owner.replace(/#\d+$/, "");
   return Object.prototype.hasOwnProperty.call(names, client) ? `${names[client]}已接管控制权` : owner;
 }
-// A separate HTTP request carries each frame; delayed images cannot queue on the control socket.
+// Only WebRTC negotiation goes through HTTP. The receive-only video track is independent of teleop.
 let previewSession = null;
 function updatePreview(active) {
   if (!!previewSession === !!active) return;
-  const panel = $("camera-preview"), img = $("camera-frame"), note = $("camera-note");
+  const panel = $("camera-preview"), video = $("camera-frame"), note = $("camera-note");
   panel.hidden = !active;
-  const clearFrame = () => {
-    if (img.hasAttribute('src')) URL.revokeObjectURL(img.src);
-    img.removeAttribute('src'); img.hidden = true;
-  };
   if (!active) {
-    previewSession.abort(); previewSession = null; clearFrame();
+    previewSession.abort(); previewSession = null;
+    video.srcObject = null; video.hidden = true;
     return;
   }
-  const session = new AbortController();
-  previewSession = session; note.textContent = "等待相机画面";
-  const poll = async () => {
+  const session = new AbortController(), ticket = previewTicket;
+  previewSession = session;
+  const headers = {Authorization:'Bearer ' + ticket, 'Content-Type':'application/sdp'};
+  session.signal.addEventListener('abort', () => {
+    fetch('/api/v1/camera', {method:'DELETE', headers, keepalive:true}).catch(() => {});
+  }, {once:true});
+  const connectVideo = async () => {
     if (session.signal.aborted) return;
-    let delay = 200;
+    let pc, timer, done = false, watchdog, lastFrame = 0, lastCount = -1;
+    const close = () => {
+      if (done) return;
+      done = true; clearTimeout(timer); clearInterval(watchdog);
+      session.signal.removeEventListener('abort', close);
+      pc?.close(); video.srcObject = null; video.hidden = true;
+      if (!session.signal.aborted) {
+        note.textContent = "相机画面暂不可用，正在重连"; setTimeout(connectVideo, 1200);
+      }
+    };
+    session.signal.addEventListener('abort', close, {once:true});
     try {
-      const r = await fetch('/api/v1/camera.jpg', {headers:{Authorization:'Bearer ' + previewTicket},
-        cache:'no-store', signal:session.signal});
-      if (!r.ok) throw new Error();
-      const frame = await r.blob();
-      if (session.signal.aborted) return;
-      const previous = img.getAttribute('src');
-      img.src = URL.createObjectURL(frame); img.hidden = false; note.textContent = '';
-      if (previous) URL.revokeObjectURL(previous);
-    } catch (_) {
-      if (session.signal.aborted) return;
-      clearFrame(); note.textContent = "相机画面暂不可用"; delay = 1000;
-    }
-    setTimeout(poll, delay);
+      note.textContent = "正在连接相机";
+      pc = new RTCPeerConnection({iceServers:[]});
+      pc.addTransceiver('video', {direction:'recvonly'});
+      pc.ontrack = e => { video.srcObject = new MediaStream([e.track]); video.play().catch(close); };
+      pc.onconnectionstatechange = () => {
+        if (['failed','disconnected'].includes(pc.connectionState)) close();
+      };
+      timer = setTimeout(close, 18000);
+      await pc.setLocalDescription(await pc.createOffer());
+      if (pc.iceGatheringState !== 'complete') await new Promise(resolve => {
+        const wait = setTimeout(resolve, 2000);
+        pc.onicegatheringstatechange = () => {
+          if (pc.iceGatheringState === 'complete') { clearTimeout(wait); resolve(); }
+        };
+      });
+      if (done) return;
+      const answer = await fetch('/api/v1/camera', {method:'POST', headers, signal:session.signal,
+        body:pc.localDescription.sdp});
+      if (!answer.ok) throw new Error();
+      await pc.setRemoteDescription({type:'answer', sdp:await answer.text()});
+      if (done) return;
+      clearTimeout(timer); lastFrame = performance.now();
+      watchdog = setInterval(() => {
+        const quality = video.getVideoPlaybackQuality();
+        const count = quality.totalVideoFrames - quality.droppedVideoFrames;
+        if (count > 0 && count !== lastCount) {
+          lastFrame = performance.now(); lastCount = count; video.hidden = false; note.textContent = '';
+        } else if (performance.now() - lastFrame > (lastCount < 0 ? 10000 : 2500)) close();
+      }, 250);
+    } catch (_) { close(); }
   };
-  poll();
+  connectVideo();
 }
 function render() {
   const trajectory = status?.trajectory_enabled ?? catalog?.trajectory_enabled ?? false;
@@ -248,7 +276,7 @@ function render() {
   const admin = authenticated && (status?.admin || !catalog?.admin_required);
   const owns = online && admin && status.owns_control;
   updatePreview(online && admin && previewTicket && !suspended && !document.hidden &&
-    document.body.dataset.mode === 'control' && status.environment === 'real' && status.state === 'RL' &&
+    document.body.dataset.mode === 'control' && ['real','sim'].includes(status.environment) && status.state === 'RL' &&
     !status.fault?.latched && catalog?.preview_policy && status.policy === catalog.preview_policy);
   const fault = status?.fault;
   const busy = status?.request.phase === "accepted";

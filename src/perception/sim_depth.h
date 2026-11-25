@@ -5,10 +5,12 @@
 
 #include <cstdint>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace perception {
 struct SimDepthConfig {
+    std::string preview_endpoint;
     double fps = 30;
     double latency_s = 0;
     bool enabled = false;

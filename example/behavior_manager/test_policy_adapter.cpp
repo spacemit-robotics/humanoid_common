@@ -974,12 +974,12 @@ void TestSonicPlannerConfig() {
         thread.cpu_affinity == std::vector<int>({0, 3}) && thread.sched == "fifo" &&
         thread.priority == 40 && thread.lock_memory,
         "planner must use the shared YAML thread configuration");
-    Require(config.sonic_encoder.Enabled() && config.sonic_encoder.latent_dim == 64 &&
-        config.sonic_encoder.runtime.provider == "cpu" && config.sonic_encoder.runtime.threads == 2 &&
-        config.sonic_encoder.runtime.worker_sched == "fifo" &&
-        config.sonic_encoder.runtime.worker_priority == 55 &&
-        !config.sonic_encoder.runtime.ort_spinning &&
-        config.sonic_encoder.runtime.ep_options.at("SPACEMIT_EP_DENSE_ACCURACY_LEVEL") == "2",
+    Require(config.encoder.Enabled() && config.encoder.latent_dim == 64 &&
+        config.encoder.runtime.provider == "cpu" && config.encoder.runtime.threads == 2 &&
+        config.encoder.runtime.worker_sched == "fifo" &&
+        config.encoder.runtime.worker_priority == 55 &&
+        !config.encoder.runtime.ort_spinning &&
+        config.encoder.runtime.ep_options.at("SPACEMIT_EP_DENSE_ACCURACY_LEVEL") == "2",
         "encoder runtime must come from YAML");
 
     // Type-specific parameters are read by the planner type from its own node.
@@ -997,7 +997,7 @@ void TestSonicPlannerConfig() {
     const auto defaults = LoadConfig(default_yaml.Path().string(), "tracker", robot_dir);
     const auto default_sonic = LoadSonicPlannerConfig(robot_base::YamlFile::Load(default_yaml.Path().string()),
         "motion_planners.walker", robot_dir, 50.0);
-    Require(!defaults.sonic_encoder.Enabled() && default_sonic.lookahead == 0.04 &&
+    Require(!defaults.encoder.Enabled() && default_sonic.lookahead == 0.04 &&
         default_sonic.check_interval == 0.1 && default_sonic.replan_interval == 1.0 &&
         default_sonic.running_replan_interval == 0.1 && default_sonic.crawling_replan_interval == 0.2 &&
         default_sonic.allowed_pred_num_tokens == std::vector<int>({0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0}),
@@ -1450,7 +1450,7 @@ void TestSonicSplitInference() {
     config.reference_file = reference.Path().string();
     config.future_frames = 10;
     config.future_step = 5;
-    config.sonic_encoder.model_path = encoder.Path().string();
+    config.encoder.model_path = encoder.Path().string();
 
     auto policy_config = MakeSonicPolicyConfig(29);
     policy_config.model_path = decoder.Path().string();

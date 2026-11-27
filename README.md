@@ -632,7 +632,7 @@ policy_adapter:
   `rl_default_pos` 与必填的 `reference_height` 生成静止直立目标。
   多动作配置用 `catalog`，目录格式与 SONIC 相同，每个 `file` 指向一个 NPZ。
 
-SuperMimic 使用 `obs_hist` 和 `goal` 两个模型输入。观测为十帧 term-major 历史：
+SuperMimic 单模型使用 `obs_hist` 和 `goal` 两个输入。观测为十帧 term-major 历史：
 关节角减默认值、关节速度、机体角速度、机体重力、上一帧原始 action；首次观测填满历史。
 `goal` 按时间拼接当前及后九个目标，相邻目标间隔 20 ms。每个目标依次包含
 关节角减默认值、关节速度、参考机体重力、机体系角速度、航向系线速度和根部高度。
@@ -640,6 +640,10 @@ SuperMimic 使用 `obs_hist` 和 `goal` 两个模型输入。观测为十帧 ter
 模型输出为 `actions`。关节数为 N 时，两个输入维度分别为 `10*(3*N+6)` 和 `10*(2*N+10)`。
 模型关节顺序须与机器人一致，策略周期为 0.02 s、`infer_decimation: 1`，
 不额外裁剪或缩放观测，也不平滑模型 action。
+
+双模型时，`policy_adapter.encoder.model_path` 指定 encoder（`goal → z`，
+`latent_dim` 默认 32），策略的 `model_path` 指定 decoder。decoder 的 `obs_hist` 不变，
+另一个输入 `z` 绑定到 external 键 `supermimic_latent`。固定站姿只编码一次。
 
 参考 NPZ 使用 C-order float32 数组：`joint_pos`、`joint_vel` 为 `[T,N]`，
 `body_pos_w`、`body_lin_vel_w`、`body_ang_vel_w` 为 `[T,B,3]`，

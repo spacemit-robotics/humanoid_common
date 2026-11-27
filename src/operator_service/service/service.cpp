@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <charconv>  // NOLINT(build/c++17): this module requires C++17.
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -493,6 +494,7 @@ void Service::ClearInput(const std::string &reason, bool immediate) {
     if (result_.phase == "accepted") Finish("cancelled", reason);
     owner_ = 0;
     lease_until_ = 0;
+    command_.motion_rearm_sequence = 0;
     ClearVelocity(immediate);
     reference_until_ = 0;
     command_.key = 0;
@@ -564,6 +566,24 @@ void Service::UpdateStatus(const robot_base::ControlStatus &status, const robot_
     }
     if (status.environment != status_.environment) ++catalog_revision_;
     status_ = status;
+    auto &detail = status_.policy_switch.detail;
+    waiting_for_input_ = detail.rfind(robot_base::kWaitingForPolicyInput, 0) == 0;
+    if (waiting_for_input_) detail.erase(0, sizeof(robot_base::kWaitingForPolicyInput) - 1);
+    uint64_t rearm_sequence = 0;
+    if (detail.rfind(robot_base::kMotionRearmPrefix, 0) == 0) {
+        constexpr auto start = sizeof(robot_base::kMotionRearmPrefix) - 1;
+        const auto end = detail.find("] ", start);
+        if (end != std::string::npos) {
+            const auto parsed = std::from_chars(detail.data() + start, detail.data() + end, rearm_sequence);
+            if (parsed.ec == std::errc{} && parsed.ptr == detail.data() + end) detail.erase(0, end + 2);
+            else rearm_sequence = 0;
+        }
+    }
+    if (rearm_sequence != motion_rearm_sequence_) {
+        motion_rearm_sequence_ = rearm_sequence;
+        command_.motion_rearm_sequence = 0;
+        if (rearm_sequence != 0) ClearVelocity(true);
+    }
     fault_ = fault;
     status_at_ = Now();
     status_samples_ = std::min(2, status_samples_ + 1);
@@ -588,12 +608,12 @@ void Service::UpdateStatus(const robot_base::ControlStatus &status, const robot_
         if (status.policy_switch.phase == Phase::READY)
             Finish("completed", "control prepared requested policy");
         else if (status.policy_switch.phase == Phase::FAILED)
-            Finish("failed", status.policy_switch.detail);
+            Finish("failed", detail);
         else if (status.policy_switch.phase == Phase::REJECTED)
-            Finish("rejected", status.policy_switch.detail);
+            Finish("rejected", detail);
         else if (status.policy_switch.phase == Phase::PREPARING &&
-            !status.policy_switch.detail.empty())
-            result_.message = status.policy_switch.detail;
+            !detail.empty())
+            result_.message = detail;
     } else if ((result_.operation == "interaction" || result_.operation == "cancel") &&
         command_.interaction.sequence == status.interaction.sequence) {
         Finish(status.interaction.request_accepted ? "completed" : "rejected", "control handled action request");
@@ -689,6 +709,8 @@ bool Service::PreviewActive() const {
 Status Service::Snapshot(uint64_t session) const {
     Status s;
     s.online = Online();
+    s.waiting_for_input = waiting_for_input_;
+    s.motion_rearm_required = motion_rearm_sequence_ != 0;
     s.hmi_connected = status_.hmi_connected;
     s.zero_ready = status_.zero_ready;
     s.trajectory_enabled = config_.trajectory_enabled;
@@ -919,6 +941,14 @@ Json Service::Handle(uint64_t session, const Json &request) {
                 return fail("bad_request", "invalid velocity or validity period");
             if (result_.phase == "accepted" && result_.operation == "policy")
                 return ReplyTo(id, true, "ok", "stopping for policy switch");
+            if (motion_rearm_sequence_ != 0) {
+                // Only an explicit neutral input from the current owner confirms this episode.
+                // Neither automatic zeroing nor clamping a nonzero request to zero is a confirmation.
+                if (vx == 0 && vy == 0 && wz == 0)
+                    command_.motion_rearm_sequence = motion_rearm_sequence_;
+                return ReplyTo(id, true, "neutral_required", "waiting for neutral input confirmation",
+                    {{"target_velocity", Encode(Velocity{})}, {"velocity", Encode(Velocity{})}});
+            }
             normalized_input_ = op == "teleop";
             velocity_input_ = normalized_input_
                 ? Velocity{std::clamp(vx, -1.0, 1.0), std::clamp(vy, -1.0, 1.0), std::clamp(wz, -1.0, 1.0)}

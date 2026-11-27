@@ -218,6 +218,56 @@ void TestTeleop() {
     assert(delegated.Command().vx == 0);
 }
 
+void TestMotionRearm() {
+    using namespace operator_service;  // NOLINT(build/namespaces)
+    Config config;
+    config.token = "motion-rearm-test";
+    config.status_timeout = 5;
+    config.lease_ms = 5000;
+    config.policies.push_back({"stand", false, {-0.2, 0, -1}, {0.7, 0, 1}, {}});
+    Service service(config);
+    robot_base::ControlStatus status;
+    status.mode = robot_base::ControlMode::RL;
+    status.hmi_connected = true;
+    status.active_policy = "stand";
+    service.UpdateStatus(status, {});
+    service.UpdateStatus(status, {});
+    const auto owner = service.Open();
+    uint64_t id = 0;
+    const auto call = [&](const std::string &op, const Json &args = Json::object()) {
+        return service.Handle(owner, {{"v", 1}, {"id", ++id}, {"op", op}, {"args", args}});
+    };
+    assert(call("hello", {{"token", config.token}}).at("ok"));
+    assert(call("acquire").at("ok"));
+    const auto velocity = [&](double vx, double vy = 0) {
+        return call("velocity", {{"vx", vx}, {"vy", vy}, {"wz", 0}});
+    };
+    const auto lock = [&](uint64_t sequence) {
+        status.policy_switch = {0, robot_base::PolicySwitchStatus::Phase::READY, "stand",
+            robot_base::kMotionRearmPrefix + std::to_string(sequence) + "] "};
+        service.UpdateStatus(status, {});
+    };
+    assert(velocity(.5).at("ok"));
+    lock(10);
+    assert(DecodeStatus(Encode(service.Snapshot())).motion_rearm_required);
+    assert(service.Command().vx == 0 && service.Command().motion_rearm_sequence == 0);
+    assert(velocity(.5).at("code") == "neutral_required");
+    assert(velocity(0, .2).at("code") == "neutral_required");
+    assert(service.Command().motion_rearm_sequence == 0);
+    assert(velocity(0).at("ok"));
+    assert(service.Command().motion_rearm_sequence == 10);
+    lock(10);
+    assert(velocity(.5).at("code") == "neutral_required" && service.Command().motion_rearm_sequence == 10);
+    lock(11);
+    assert(service.Command().motion_rearm_sequence == 0);
+    assert(velocity(0).at("ok") && service.Command().motion_rearm_sequence == 11);
+    status.policy_switch = {};
+    service.UpdateStatus(status, {});
+    assert(!service.Snapshot().motion_rearm_required);
+    assert(service.Command().motion_rearm_sequence == 0 && service.Snapshot().target_velocity.vx == 0);
+    assert(velocity(.5).at("code") == "ok" && service.Snapshot().target_velocity.vx == .5);
+}
+
 void TestAdministrator() {
     using namespace operator_service;  // NOLINT(build/namespaces)
     Config config;
@@ -780,6 +830,7 @@ void TestPlanner() {
 int main(int argc, char **argv) {
     TestRobotFeedback();
     TestTeleop();
+    TestMotionRearm();
     TestAdministrator();
     TestTrajectory();
     TestEnvironment();

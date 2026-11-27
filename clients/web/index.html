@@ -46,6 +46,10 @@
     </section>
     <section id="fault" class="fault" hidden><i data-lucide="triangle-alert"></i>
       <div><strong id="fault-title"></strong><p id="fault-detail"></p></div><button id="ack">确认故障</button></section>
+    <section id="input-warning" class="fault" hidden role="status">深度图延迟，感知运控仍在运行。</section>
+    <section id="motion-rearm" class="fault" hidden>
+      <div>感知运控已超时回退，移动输入已暂停。</div><button id="rearm-velocity">恢复移动</button>
+    </section>
     <section id="voice-panel" class="voice-panel" aria-label="语音对话">
       <div id="voice-placeholder"><img src="/assets/spacemit-logo.svg" alt="SpacemiT 进迭时空">
           <h1 id="voice-robot">机器人</h1><p id="voice-message">语音服务连接中</p>

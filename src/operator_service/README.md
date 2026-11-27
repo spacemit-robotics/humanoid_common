@@ -254,6 +254,8 @@ WebSocket 路径 `/api/v1/ws`；JSON UTF-8 文本，版本 `v: 1`。建立连接
 和 `auto_planner`；目录的 `environment` 与状态一致。旧客户端忽略这些字段。
 `target_velocity` 是限幅后的目标，`command_velocity` 是服务端平滑输出，`velocity` 是 control 的实际回报。
 `velocity` 操作使用 m/s、rad/s，不套用遥控档位；`teleop` 操作使用归一化输入，两者共用服务端平滑。
+感知超时回退后，`motion_rearm_required` 为 true。此时非零速度请求返回 `neutral_required`，不执行或排队。
+持有控制权的客户端显式发送三轴全零，再等此状态解除后才能发送新的移动指令。网页用“恢复移动”确认，TUI 按空格，手柄回中。
 网页状态额外包含 `admin/admin_login_pending/admin_login_error`；`admin_login` 返回 `pending` 后
 通过这些字段确认验证结果。C++ 客户端结构和接口保持不变。
 `request.phase` 区分 `accepted/completed/rejected/expired/cancelled`。`completed` 表示

@@ -113,10 +113,12 @@ void Run(operator_service::Client *client) {
         view.last_action = label + "：" + ReplyMessage(r);
         if (r.ok && r.request.phase == "accepted") pending = r.request.sequence;
     };
-    const auto clear = [&] {
+    const auto clear = [&](bool confirm_neutral = false) {
         view.target_command = {};
         input = {};
-        if (view.status.owns_control && view.status.state == "RL") client->PostTeleopInput({});
+        if (view.status.owns_control && view.status.state == "RL" &&
+            (confirm_neutral || !view.status.motion_rearm_required))
+            client->PostTeleopInput({});
     };
     const auto transition = [&](const std::string &s) {
         clear();
@@ -170,7 +172,7 @@ void Run(operator_service::Client *client) {
             clear();
             reply(client->ReleaseControl(), "释放控制权");
         } else if (key == ' ') {
-            clear();
+            clear(true);
             view.last_action = "目标速度归零，减速停车";
         } else if (key == 'x') reply(client->AcknowledgeFault(), "确认故障");
         else if (key == 'c') {
@@ -263,7 +265,9 @@ void Run(operator_service::Client *client) {
             if (key == 'z') transition("ZERO");
             if (key == 'r') transition(s.trajectory_enabled ? "TRAJECTORY" : "RL");
         }
-        if (s.owns_control && s.state == "RL" && now - last_velocity >= std::chrono::milliseconds(50)) {
+        if (s.motion_rearm_required) input = {};
+        if (s.owns_control && s.state == "RL" && !s.motion_rearm_required &&
+            now - last_velocity >= std::chrono::milliseconds(50)) {
             auto r = client->LatestVelocityReply();
             if (r.ok) r = client->PostTeleopInput(input);
             if (!r.ok) {

@@ -165,7 +165,7 @@ void FSM::SwitchTo(StateName target) {
         return;
     }
 
-    const auto entry_error = sensor_ ? it->second->EntryError(*sensor_) : std::string{};
+    const auto entry_error = sensor_ ? it->second->PrepareEntry(*sensor_) : std::string{};
     if (!entry_error.empty()) {
         runtime_logging::Log(runtime_logging::Level::kWarning, "state entry refused: " + entry_error, false);
         if (command_) command_->key = 0;

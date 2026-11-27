@@ -306,6 +306,9 @@ function render() {
   $("disconnect").disabled = !authenticated;
   $("disconnect").hidden = !authenticated;
   $("reconnect").hidden = authenticated || !token;
+  $("input-warning").hidden = !online || !status?.waiting_for_input || !!fault?.latched;
+  $("motion-rearm").hidden = !online || !status?.motion_rearm_required || !!fault?.latched;
+  $("rearm-velocity").disabled = !owns || status?.state !== 'RL' || !!fault?.active;
   $("fault").hidden = !fault?.latched;
   $("fault-title").textContent = fault ? `${fault.source}/${fault.code}${fault.active ? " · 活动" : " · 锁存"}` : "";
   $("fault-detail").textContent = fault?.detail || "";
@@ -459,7 +462,7 @@ function releaseControl() {
 }
 function motionAllowed() {
   return authenticated && status?.owns_control && status.online && status.state === 'RL' &&
-    !status.fault?.latched && !suspended && !document.hidden &&
+    !status.motion_rearm_required && !status.fault?.latched && !suspended && !document.hidden &&
     performance.now() - lastStatusAt < STATUS_PAUSE_MS;
 }
 function motionInput() {
@@ -532,10 +535,14 @@ function endMotion(send = true) {
     if (element.hasPointerCapture(pointer)) element.releasePointerCapture(pointer);
   }
   motion.reset();
-  if (send && wasMoving && authenticated && status?.owns_control)
+  if (send && wasMoving && authenticated && status?.owns_control && !status.motion_rearm_required)
     call('teleop', {vx:0,vy:0,wz:0,valid_for_ms:300}).catch(() => {});
   renderMotion();
 }
+$("rearm-velocity").onclick = () => {
+  endMotion(false);
+  call('teleop', {vx:0,vy:0,wz:0,valid_for_ms:300}).catch(e => tell(e.message));
+};
 document.querySelectorAll('[data-input-mode]').forEach(button => {
   if (button.tagName !== 'BUTTON') return;
   button.onclick = () => {

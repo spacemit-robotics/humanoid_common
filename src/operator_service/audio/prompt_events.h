@@ -53,6 +53,8 @@ public:
             if (status.state == "RL" && !status.fault.latched &&
                 (previous_.state != "RL" || status.policy != previous_.policy))
                 cues.push_back("policy." + status.policy);
+            if (status.waiting_for_input && !previous_.waiting_for_input && !status.fault.latched)
+                cues.emplace_back("perception.wait");
             if (status.teleop_preset_sequence != previous_.teleop_preset_sequence &&
                 !status.teleop_preset.empty())
                 cues.push_back("preset." + status.teleop_preset);

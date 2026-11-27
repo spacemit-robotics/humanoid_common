@@ -25,6 +25,7 @@ public:
     // 进入状态
     virtual void OnEnter() = 0;
     virtual std::string EntryError(const robot_base::RobotData &) const { return {}; }
+    virtual std::string PrepareEntry(const robot_base::RobotData &sensor) { return EntryError(sensor); }
     // 状态执行（每控制周期调用）
     virtual void Run(float control_dt, float rl_dt) = 0;
     // 检查状态切换条件
@@ -38,6 +39,8 @@ public:
         (void)requested;
         (void)cancel_playback;
     }
+    virtual void EnableInputFallback() {}
+    virtual robot_base::PolicyInputStatus InputStatus() const { return {}; }
     virtual bool PolicyFinished() const { return false; }
     virtual void OnPolicyHandoff() { OnEnter(); }
     // 当前状态是否已满足进入 RL 的前置条件（仅 ZERO 覆盖）

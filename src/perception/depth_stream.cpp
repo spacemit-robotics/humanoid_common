@@ -149,10 +149,9 @@ void Receiver::Loop(std::string endpoint) {
                     else if (f.sequence <= last.sequence || f.time <= last.time)
                         throw std::runtime_error("out-of-order depth");
                 }
-                frames_.push_back({std::move(f), std::move(processed)});
+                frames_.push_back({std::move(f), std::move(processed), Clock::now()});
                 while (frames_.size() > 128)
                     frames_.pop_front();
-                received_ = std::chrono::steady_clock::now();
                 error_.clear();
             } catch (const std::exception &e) {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -163,57 +162,101 @@ void Receiver::Loop(std::string endpoint) {
     zmq_close(socket);
     zmq_ctx_term(ctx);
 }
-std::string Receiver::Error(double time, const std::string &clock) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return ErrorLocked(time, clock);
-}
-std::string Receiver::ErrorLocked(double time, const std::string &clock) const {
+std::string Receiver::LatestError(double time, const std::string &clock, Clock::time_point now,
+        Clock::time_point &capture_at) const {
     if (frames_.empty())
         return error_.empty() ? "depth history empty" : error_;
     if (!error_.empty())
         return error_;
-    if (std::chrono::duration<double>(std::chrono::steady_clock::now() - received_).count() >
-        timeout_)
-        return "depth stream stale";
     if (frames_.back().frame.clock != clock)
         return "depth/state clock domains differ";
-    if (!std::isfinite(time) || time - frames_.back().frame.time > timeout_ ||
-        frames_.back().frame.time - time > .1)
+    if (!std::isfinite(time) || frames_.back().frame.time - time > .1)
         return "depth/state timestamps differ";
-    if (frames_.front().frame.time > time - .7 + 1e-8)
+    const auto chosen = std::find_if(frames_.rbegin(), frames_.rend(), [time](const auto &sample) {
+        return sample.frame.time <= time + 1e-8;
+    });
+    if (chosen == frames_.rend() || time - chosen->frame.time > timeout_)
+        return "depth/state timestamps differ";
+    if (std::chrono::duration<double>(now - chosen->received_at).count() > timeout_)
+        return "depth stream stale";
+    // An arrived frame newer than robot state is not yet usable and cannot renew this timestamp.
+    capture_at = std::min(chosen->received_at, now - std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(std::max(0.0, time - chosen->frame.time))));
+    return {};
+}
+
+std::string Receiver::SelectHistory(double time, History &history) const {
+    const double oldest = time - .7;
+    if (frames_.front().frame.time > oldest + 1e-8)
         return "depth warming up (need 0.7 s history)";
-    for (int i = 0; i < 8; ++i) {
+    auto chosen = frames_.rbegin();
+    for (int i = 7; i >= 0; --i) {
         const double target = time - (7 - i) * .1;
-        const Sample *chosen = nullptr;
-        for (const auto &sample : frames_)
-            if (sample.frame.time <= target + 1e-8)
-                chosen = &sample;
-            else
-                break;
-        if (!chosen || target - chosen->frame.time > timeout_)
+        while (chosen != frames_.rend() && chosen->frame.time > target + 1e-8) ++chosen;
+        if (chosen == frames_.rend() || target - chosen->frame.time > timeout_)
             return "depth history gap";
+        history[i] = &*chosen;
     }
     return {};
 }
+
+void Receiver::CopyStack(const History &history, std::vector<float> &stack) {
+    stack.resize(kStack);
+    for (std::size_t i = 0; i < history.size(); ++i)
+        std::copy(history[i]->image.begin(), history[i]->image.end(), stack.begin() + i * kFrame);
+}
+
+std::string Receiver::Error(double time, const std::string &clock) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    History history;
+    Clock::time_point capture_at;
+    auto error = LatestError(time, clock, Clock::now(), capture_at);
+    return error.empty() ? SelectHistory(time, history) : error;
+}
+
 std::vector<float> Receiver::Stack(double time, const std::string &clock) const {
     std::lock_guard<std::mutex> lock(mutex_);
-    auto error = ErrorLocked(time, clock);
-    if (!error.empty())
-        throw std::runtime_error(error);
-    std::vector<float> out(kStack);
-    for (int i = 0; i < 8; ++i) {
-        const double target = time - (7 - i) * .1;
-        const Sample *chosen = nullptr;
-        for (const auto &s : frames_)
-            if (s.frame.time <= target + 1e-8)
-                chosen = &s;
-            else
-                break;
-        if (!chosen || target - chosen->frame.time > timeout_)
-            throw std::runtime_error("depth history gap");
-        std::copy(chosen->image.begin(), chosen->image.end(), out.begin() + i * kFrame);
+    History history;
+    Clock::time_point capture_at;
+    auto error = LatestError(time, clock, Clock::now(), capture_at);
+    if (error.empty()) error = SelectHistory(time, history);
+    if (!error.empty()) throw std::runtime_error(error);
+    std::vector<float> stack;
+    CopyStack(history, stack);
+    return stack;
+}
+
+std::string Receiver::PrimeHeldInput(double time, const std::string &clock) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    History history;
+    Clock::time_point capture_at;
+    auto error = LatestError(time, clock, Clock::now(), capture_at);
+    if (error.empty()) error = SelectHistory(time, history);
+    if (error.empty()) {
+        CopyStack(history, held_);
+        last_frame_at_ = last_history_at_ = capture_at;
     }
-    return out;
+    return error;
+}
+
+DepthObservation Receiver::HeldStack(double time, const std::string &clock) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto now = Clock::now();
+    History history;
+    Clock::time_point capture_at;
+    bool history_ready = false;
+    if (LatestError(time, clock, now, capture_at).empty()) {
+        // A usable frame can reset the no-frame timer but cannot fill a gap in the observation.
+        last_frame_at_ = std::max(last_frame_at_, capture_at);
+        history_ready = SelectHistory(time, history).empty();
+        if (history_ready) {
+            CopyStack(history, held_);
+            last_history_at_ = capture_at;
+        }
+    }
+    if (held_.empty()) throw std::runtime_error("depth has no valid observation to hold");
+    return {held_, std::chrono::duration<float>(now - last_frame_at_).count(),
+        history_ready ? 0.f : std::chrono::duration<float>(now - last_history_at_).count()};
 }
 nlohmann::json Receiver::Status() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -224,7 +267,7 @@ nlohmann::json Receiver::Status() const {
         {"age_s",
             frames_.empty()
                 ? -1
-                : std::chrono::duration<double>(std::chrono::steady_clock::now() - received_).count()},
+                : std::chrono::duration<double>(Clock::now() - frames_.back().received_at).count()},
         {"fps", frames_.size() < 2 ? 0
                                     : (frames_.size() - 1) /
                                         (frames_.back().frame.time - frames_.front().frame.time)},

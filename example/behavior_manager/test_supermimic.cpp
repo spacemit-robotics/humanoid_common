@@ -414,21 +414,12 @@ void TestSplitEncoder(const Fixture &fixture) {
         fixture.WriteConfig(moving ? "" : "0.95", "0.02", 1, options);
         auto adapter = Create(LoadConfig(fixture.yaml, "probe", dir), policy);
         adapter->Reset(robot);
-        auto tick = [&](double t) {
+        for (const double t : {0.0, 0.02}) {
             adapter->PrepareInputs(robot, t, executor);
-            Eigen::VectorXf obs;
             std::vector<double> action;
-            executor.AssembleObs(robot.gyro, robot.rpy, 0, 0, 0, robot.joint_pos, robot.joint_vel,
-                robot.base_quat, {}, 0.02, obs);
-            executor.Infer(obs, action);
-            return action.at(0);
-        };
-        const double first = tick(0);
-        const double second = tick(0.02);
-        if (moving) Require(second > first, "moving reference must be re-encoded");
-        else {
-            Near(first, 0.95, "static height reaches the decoder");
-            Near(second, first, "static latent persists");
+            executor.Infer(Eigen::VectorXf::Zero(executor.ObsDim()), action);
+            // At 50 Hz the first goal frame is one step ahead; height increases by 0.02 per frame.
+            Near(action.at(0), moving ? 1.02 + t : 0.95, "encoded height at decoder");
         }
     }
 }

@@ -251,17 +251,9 @@ public:
         enc.action_scale = {1.0};
         enc.strict_obs_dim_check = true;
         enc.custom_array_dims[input_name] = static_cast<int>(width);
-        rl_policy::ObsSegmentConfig segment;
-        segment.terms = {input_name};
-        enc.obs_segments.push_back(std::move(segment));
-        rl_policy::ModelInputBindingConfig in;
-        in.name = input_name;
-        in.source = rl_policy::ModelInputSource::OBSERVATION;
-        enc.model_io.inputs.push_back(std::move(in));
-        rl_policy::ModelOutputBindingConfig out;
-        out.name = output_name;
-        out.target = rl_policy::ModelOutputTarget::ACTION;
-        enc.model_io.outputs.push_back(std::move(out));
+        enc.obs_segments = {{{input_name}}};
+        enc.model_io.inputs = {{input_name, rl_policy::ModelInputSource::OBSERVATION}};
+        enc.model_io.outputs = {{output_name, rl_policy::ModelOutputTarget::ACTION}};
         executor_.Init(enc);
         if (executor_.ActionDim() != settings.latent_dim || executor_.ObsDim() != observation_.size())
             throw std::runtime_error("incompatible encoder dimensions: " + settings.model_path);
@@ -506,13 +498,9 @@ public:
         }
         PrepareGoal(elapsed_s);
         // Model bindings validate the goal size before history is mutated.
-        if (encoder_) {
-            if (interactive_ || !reference_.empty()) encoder_->Encode(goal_);
-            const auto &z = encoder_->Latent();
-            policy.SetModelInput("supermimic_latent", z.data(), z.size());
-        } else {
-            policy.SetModelInput("supermimic_goal", goal_.data(), static_cast<int>(goal_.size()));
-        }
+        if (encoder_ && (interactive_ || !reference_.empty())) encoder_->Encode(goal_);
+        const auto &input = encoder_ ? encoder_->Latent() : goal_;
+        policy.SetModelInput(encoder_ ? "supermimic_latent" : "supermimic_goal", input.data(), input.size());
         const std::array<std::size_t, 5> widths = {joints_, joints_, 3, 3, joints_};
         std::size_t offset = 0;
         for (const std::size_t width : widths) {

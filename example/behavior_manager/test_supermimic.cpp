@@ -71,6 +71,15 @@ const char kProbe[] =
     "b2FsEg8KDQgBEgkKAggBCgMIlAViIwoQc2Vlbl9vYnNlcnZhdGlvbhIPCg0IARIJCgIIAQoD"
     "CIQHQgQKABAN";
 
+// Gather goal height into z, then broadcast z into the 28 decoder actions.
+const char kHeightEncoder[] =
+    "CAg6aQojCgRnb2FsCgNpZHgSAXoiBkdhdGhlcioLCgRheGlzGAGgAQISBmhlaWdodCoMCAEQBzoBQUID"
+    "aWR4WhcKBGdvYWwSDwoNCAESCQoCCAEKAwiUBWITCgF6Eg4KDAgBEggKAggBCgIIAUIECgAQDQ";
+const char kHeightDecoder[] =
+    "CAg6hgEKGwoBegoFc2hhcGUSB2FjdGlvbnMiBkV4cGFuZBIJYnJvYWRjYXN0Kg8IAhAHOgIBHEIFc2hh"
+    "cGVaGwoIb2JzX2hpc3QSDwoNCAESCQoCCAEKAwiEB1oTCgF6Eg4KDAgBEggKAggBCgIIAWIZCgdhY3Rp"
+    "b25zEg4KDAgBEggKAggBCgIIHEIECgAQDQ";
+
 class Fixture {
 public:
     Fixture() {
@@ -80,12 +89,16 @@ public:
         directory_ = directory;
         model = (directory_ / "probe.onnx").string();
         yaml = (directory_ / "config.yaml").string();
-        std::ofstream output(model, std::ios::binary);
+        WriteProbe(model, kProbe);
+    }
+
+    static void WriteProbe(const std::string &path, const char *contents) {
+        std::ofstream output(path, std::ios::binary);
         const std::string alphabet =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         unsigned int value = 0;
         int bits = -8;
-        for (char character : std::string(kProbe)) {
+        for (char character : std::string(contents)) {
             const auto code = alphabet.find(character);
             Require(code != std::string::npos, "invalid embedded probe");
             value = (value << 6) | static_cast<unsigned int>(code);
@@ -379,6 +392,36 @@ void TestInvalidConfiguration(const Fixture &fixture) {
     bad = valid;
     bad.model_io.inputs[1].key = "wrong_goal";
     Reject([&] { Create(config, bad); }, "wrong external goal key must fail");
+}
+
+void TestSplitEncoder(const Fixture &fixture) {
+    const auto dir = std::filesystem::path(fixture.yaml).parent_path();
+    fixture.WriteProbe((dir / "height.onnx").string(), kHeightEncoder);
+    const auto decoder = (dir / "decoder.onnx").string();
+    fixture.WriteProbe(decoder, kHeightDecoder);
+    auto policy = Policy(decoder);
+    policy.model_io.inputs[1].name = "z";
+    policy.model_io.inputs[1].key = "supermimic_latent";
+    policy.model_io.outputs.resize(1);
+    rl_policy::PolicyExecutor executor;
+    executor.Init(policy);
+    auto robot = robot_base::RobotData::Create(28);
+    robot.base_quat = {1, 0, 0, 0};
+    fixture.WriteMotion();
+    for (bool moving : {false, true}) {
+        std::string options = "          encoder: {model_path: height.onnx, latent_dim: 1}\n";
+        if (moving) options += "          reference_file: motion.npz\n          anchor_body_index: 1\n";
+        fixture.WriteConfig(moving ? "" : "0.95", "0.02", 1, options);
+        auto adapter = Create(LoadConfig(fixture.yaml, "probe", dir), policy);
+        adapter->Reset(robot);
+        for (const double t : {0.0, 0.02}) {
+            adapter->PrepareInputs(robot, t, executor);
+            std::vector<double> action;
+            executor.Infer(Eigen::VectorXf::Zero(executor.ObsDim()), action);
+            // At 50 Hz the first goal frame is one step ahead; height increases by 0.02 per frame.
+            Near(action.at(0), moving ? 1.02 + t : 0.95, "encoded height at decoder");
+        }
+    }
 }
 
 void TestReferencePlayback(const Fixture &fixture) {
@@ -1028,6 +1071,7 @@ int main() {
     try {
         const Fixture fixture;
         TestContract(fixture);
+        TestSplitEncoder(fixture);
         TestInvalidConfiguration(fixture);
         TestReferencePlayback(fixture);
         TestCatalog(fixture);

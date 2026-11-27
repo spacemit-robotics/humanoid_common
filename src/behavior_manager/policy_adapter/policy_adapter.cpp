@@ -237,6 +237,56 @@ YAML::Node AtPath(YAML::Node node, const std::string &path) {
     return node;
 }
 
+// Both trackers encode a reference tensor; the decoder bindings belong to each adapter.
+class ReferenceEncoder {
+public:
+    ReferenceEncoder(const Config::EncoderConfig &settings, std::size_t width,
+        const char *input_name, const char *output_name, const char *artifact)
+        : observation_(width) {
+        if (settings.latent_dim <= 0) throw std::runtime_error("invalid encoder latent dimension");
+        rl_policy::PolicyExecutorConfig enc;
+        enc.model_path = settings.model_path;
+        enc.runtime = settings.runtime;
+        enc.rl_default_pos.assign(settings.latent_dim, 0.0);
+        enc.action_scale = {1.0};
+        enc.strict_obs_dim_check = true;
+        enc.custom_array_dims[input_name] = static_cast<int>(width);
+        enc.obs_segments = {{{input_name}}};
+        enc.model_io.inputs = {{input_name, rl_policy::ModelInputSource::OBSERVATION}};
+        enc.model_io.outputs = {{output_name, rl_policy::ModelOutputTarget::ACTION}};
+        executor_.Init(enc);
+        if (executor_.ActionDim() != settings.latent_dim || executor_.ObsDim() != observation_.size())
+            throw std::runtime_error("incompatible encoder dimensions: " + settings.model_path);
+        latent_.resize(settings.latent_dim);
+        action_.reserve(settings.latent_dim);
+        runtime_logging::RecordArtifact("policy_aux_model", artifact, settings.model_path);
+        const auto runtime = executor_.GetRuntimeInfo();
+        runtime_logging::Log(runtime_logging::Level::kInfo, std::string(artifact) +
+            " ready: provider=" + runtime.initialized_provider + ", workers=" + runtime.worker_threads, false);
+    }
+
+    void Encode(const std::vector<float> &values) {
+        if (values.size() != static_cast<std::size_t>(observation_.size()))
+            throw std::runtime_error("incorrect encoder input width");
+        std::copy(values.begin(), values.end(), observation_.data());
+        executor_.Infer(observation_, action_);
+        for (std::size_t i = 0; i < latent_.size(); ++i) {
+            latent_[i] = static_cast<float>(action_[i]);
+            if (!std::isfinite(latent_[i])) throw std::runtime_error("non-finite encoder output");
+        }
+    }
+
+    const std::vector<float> &Latent() const { return latent_; }
+    void RequestInferenceTermination() { executor_.RequestInferenceTermination(); }
+    void ClearInferenceTermination() { executor_.ClearInferenceTermination(); }
+
+private:
+    rl_policy::PolicyExecutor executor_;
+    Eigen::VectorXf observation_;
+    std::vector<double> action_;
+    std::vector<float> latent_;
+};
+
 class SupermimicPolicyAdapter final : public PolicyAdapter, private motion_planner::ReferenceSink {
 public:
     SupermimicPolicyAdapter(const Config &config,
@@ -260,7 +310,7 @@ public:
         Require(dimension != policy.custom_array_dims.end() &&
             dimension->second == static_cast<int>((3 * joints_ + 6) * kFrames) &&
             policy.strict_obs_dim_check, "invalid observation history dimensions");
-        Require(policy.model_io.inputs.size() == 2, "expected obs_hist and goal model inputs");
+        Require(policy.model_io.inputs.size() == 2, "expected two decoder inputs");
         bool observation = false;
         bool goal = false;
         for (const auto &input : policy.model_io.inputs) {
@@ -268,9 +318,9 @@ public:
                 input.source == rl_policy::ModelInputSource::OBSERVATION &&
                 input.observation_offset <= 0) {
                 observation = true;
-            } else if (input.name == "goal" &&
+            } else if (input.name == (config.encoder.Enabled() ? "z" : "goal") &&
                 input.source == rl_policy::ModelInputSource::EXTERNAL &&
-                input.key == "supermimic_goal") {
+                input.key == (config.encoder.Enabled() ? "supermimic_latent" : "supermimic_goal")) {
                 goal = true;
             }
         }
@@ -288,6 +338,10 @@ public:
         sample_.resize(3 * joints_ + 6, 0.0F);
         history_.resize(sample_.size() * kFrames, 0.0F);
         goal_.resize((2 * joints_ + 10) * kFrames, 0.0F);
+        if (config.encoder.Enabled()) {
+            encoder_ = std::make_unique<ReferenceEncoder>(config.encoder, goal_.size(),
+                "goal", "z", "supermimic_encoder");
+        }
         for (auto *frame : {&frame_, &target_, &transition_source_, &cancel_frame_}) {
             frame->joint_pos.resize(joints_);
             frame->joint_vel.resize(joints_);
@@ -303,6 +357,8 @@ public:
                 goal_[start + 2 * joints_ + 2] = -1.0F;
                 goal_[start + 2 * joints_ + 9] = height;
             }
+            // A static standing reference never changes, including across RL re-entry.
+            if (encoder_) encoder_->Encode(goal_);
         } else {
             ReferenceMotionConfig reference;
             reference.file = config_.reference_file;
@@ -332,6 +388,10 @@ public:
     }
 
     const char *Type() const override { return "supermimic"; }
+
+    void RequestInferenceTermination() override {
+        if (encoder_) encoder_->RequestInferenceTermination();
+    }
 
     rl_policy::PolicyExecutor &SelectExecutor(const std::array<double, 3> &command,
         rl_policy::PolicyExecutor &primary) override {
@@ -385,6 +445,7 @@ public:
     void Reset(const robot_base::RobotData &robot) override {
         (void)robot;
         seeded_ = false;
+        if (encoder_) encoder_->ClearInferenceTermination();
         std::fill(previous_action_.begin(), previous_action_.end(), 0.0F);
         handoff_.Reset();
         playback_started_ = !config_.manual_start;
@@ -437,7 +498,9 @@ public:
         }
         PrepareGoal(elapsed_s);
         // Model bindings validate the goal size before history is mutated.
-        policy.SetModelInput("supermimic_goal", goal_.data(), static_cast<int>(goal_.size()));
+        if (encoder_ && (interactive_ || !reference_.empty())) encoder_->Encode(goal_);
+        const auto &input = encoder_ ? encoder_->Latent() : goal_;
+        policy.SetModelInput(encoder_ ? "supermimic_latent" : "supermimic_goal", input.data(), input.size());
         const std::array<std::size_t, 5> widths = {joints_, joints_, 3, 3, joints_};
         std::size_t offset = 0;
         for (const std::size_t width : widths) {
@@ -930,6 +993,7 @@ private:
     std::vector<float> sample_;
     std::vector<float> history_;
     std::vector<float> goal_;
+    std::unique_ptr<ReferenceEncoder> encoder_;
     bool seeded_ = false;
     std::vector<ReferenceFrame> reference_;
     ReferenceHandoff handoff_;
@@ -1629,44 +1693,15 @@ public:
             ? static_cast<int>(policy_config.rl_default_pos.size())
             : static_cast<int>(policy_config.action_joint_index.size());
         ValidateConfig();
-        if (config_.sonic_encoder.Enabled()) {
-            const auto &settings = config_.sonic_encoder;
+        if (config_.encoder.Enabled()) {
+            const auto &settings = config_.encoder;
             const auto term = policy_config.custom_array_dims.find(settings.observation_term);
             if (settings.latent_dim <= 0 || term == policy_config.custom_array_dims.end() ||
                 term->second != settings.latent_dim) {
                 throw std::runtime_error("[sonic] encoder latent dimension must match decoder observation term");
             }
-            rl_policy::PolicyExecutorConfig encoder_config;
-            encoder_config.model_path = settings.model_path;
-            encoder_config.runtime = settings.runtime;
-            encoder_config.action_scale = {1.0};
-            encoder_config.rl_default_pos.assign(settings.latent_dim, 0.0);
-            encoder_config.strict_obs_dim_check = true;
-            encoder_config.custom_array_dims["reference_obs"] = static_cast<int>(ReferenceObsDim());
-            rl_policy::ObsSegmentConfig segment;
-            segment.terms = {"reference_obs"};
-            encoder_config.obs_segments.push_back(std::move(segment));
-            rl_policy::ModelInputBindingConfig input;
-            input.name = "obs_dict";
-            input.source = rl_policy::ModelInputSource::OBSERVATION;
-            encoder_config.model_io.inputs.push_back(std::move(input));
-            rl_policy::ModelOutputBindingConfig output;
-            output.name = "encoded_tokens";
-            output.target = rl_policy::ModelOutputTarget::ACTION;
-            encoder_config.model_io.outputs.push_back(std::move(output));
-            encoder_ = std::make_unique<rl_policy::PolicyExecutor>();
-            encoder_->Init(encoder_config);
-            if (encoder_->ActionDim() != settings.latent_dim) {
-                throw std::runtime_error("[sonic] encoder output does not match latent dimension");
-            }
-            encoder_observation_.resize(static_cast<int>(ReferenceObsDim()));
-            latent_.resize(settings.latent_dim);
-            latent_action_.reserve(settings.latent_dim);
-            runtime_logging::RecordArtifact("policy_aux_model", "sonic_encoder", settings.model_path);
-            const auto runtime = encoder_->GetRuntimeInfo();
-            runtime_logging::Log(runtime_logging::Level::kInfo,
-                "SONIC encoder ready: provider=" + runtime.initialized_provider +
-                ", workers=" + runtime.worker_threads, false);
+            encoder_ = std::make_unique<ReferenceEncoder>(settings, ReferenceObsDim(),
+                "obs_dict", "encoded_tokens", "sonic_encoder");
         }
         LoadReferences();
         if (config_.planners.Enabled()) SetupPlanners(policy_config);
@@ -1789,13 +1824,9 @@ public:
                 std::to_string(reference_obs_dim));
         }
         if (encoder_) {
-            std::copy(values.begin(), values.end(), encoder_observation_.data());
-            encoder_->Infer(encoder_observation_, latent_action_);
-            for (std::size_t i = 0; i < latent_.size(); ++i) {
-                latent_[i] = static_cast<float>(latent_action_[i]);
-            }
-            policy.SetCustomArray(config_.sonic_encoder.observation_term,
-                latent_.data(), static_cast<int>(latent_.size()));
+            encoder_->Encode(values);
+            const auto &z = encoder_->Latent();
+            policy.SetCustomArray(config_.encoder.observation_term, z.data(), z.size());
         } else {
             policy.SetModelInput("reference_obs", values.data(), values.size());
         }
@@ -2440,10 +2471,7 @@ private:
 
     Config config_;
     int model_dof_count_ = 0;
-    std::unique_ptr<rl_policy::PolicyExecutor> encoder_;
-    Eigen::VectorXf encoder_observation_;
-    std::vector<double> latent_action_;
-    std::vector<float> latent_;
+    std::unique_ptr<ReferenceEncoder> encoder_;
     std::vector<SonicClip> clips_;
     std::unordered_map<std::string, std::size_t> clips_by_name_;
     std::size_t default_clip_index_ = 0;
@@ -2608,14 +2636,15 @@ Config LoadConfig(const std::string &yaml_path,
         const std::string encoder_base = adapter_base + ".encoder";
         const auto encoder_model = yaml.Read<std::string>(encoder_base + ".model_path");
         if (encoder_model && !encoder_model->empty()) {
-            if (config.type != "sonic") {
-                throw std::runtime_error("[policy_adapter] encoder is only supported by SONIC");
+            if (config.type != "sonic" && config.type != "supermimic") {
+                throw std::runtime_error("[policy_adapter] encoder requires sonic or supermimic");
             }
-            auto &encoder = config.sonic_encoder;
+            auto &encoder = config.encoder;
             encoder.model_path = ResolvePath(robot_dir, *encoder_model).string();
             encoder.observation_term = yaml.Read<std::string>(
                 encoder_base + ".observation_term").value_or("sonic_latent");
-            encoder.latent_dim = yaml.Read<int>(encoder_base + ".latent_dim").value_or(64);
+            encoder.latent_dim = yaml.Read<int>(encoder_base + ".latent_dim").value_or(
+                config.type == "supermimic" ? 32 : 64);
             encoder.runtime.provider = yaml.Read<std::string>(
                 encoder_base + ".runtime.provider").value_or("cpu");
             encoder.runtime.threads = yaml.Read<int>(encoder_base + ".runtime.threads").value_or(1);

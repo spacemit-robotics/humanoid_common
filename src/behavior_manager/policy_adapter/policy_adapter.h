@@ -113,14 +113,14 @@ struct Config {
     // policy_adapter.planners：跟踪策略可选用的参考动作规划器，待命参考由 catalog 提供。
     motion_planner::HostConfig planners;
 
-    struct SonicEncoderConfig {
+    struct EncoderConfig {
         std::string model_path;
         std::string observation_term = "sonic_latent";
         int latent_dim = 64;
         rl_policy::InferenceRuntimeConfig runtime;
 
         bool Enabled() const { return !model_path.empty(); }
-    } sonic_encoder;
+    } encoder;
 
     // Used for a stationary goal when reference_file is not configured.
     struct SupermimicConfig {

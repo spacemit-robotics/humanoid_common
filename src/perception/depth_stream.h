@@ -14,6 +14,7 @@
 #include <deque>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -40,6 +41,8 @@ class Receiver {
     // Returns only frames at or before the robot state time in the same clock domain.
     std::string Error(double time, const std::string &clock) const;
     std::vector<float> Stack(double time, const std::string &clock) const;
+    std::string PrimeHeldInput(double time, const std::string &clock) const;
+    std::vector<float> HeldStack(double time, const std::string &clock, double &delay) const;
     nlohmann::json Status() const;
 
     private:
@@ -47,6 +50,9 @@ class Receiver {
         Frame frame;
         std::vector<float> image;
     };
+    std::vector<float> SampleStack(double time) const;  // mutex_ held by caller
+    mutable std::vector<float> held_;
+    mutable std::chrono::steady_clock::time_point valid_at_{};
     void Loop(std::string endpoint);
     std::string ErrorLocked(double time, const std::string &clock) const;
     double timeout_;

@@ -306,6 +306,7 @@ function render() {
   $("disconnect").disabled = !authenticated;
   $("disconnect").hidden = !authenticated;
   $("reconnect").hidden = authenticated || !token;
+  $("input-warning").hidden = !online || !status?.waiting_for_input || !!fault?.latched;
   $("fault").hidden = !fault?.latched;
   $("fault-title").textContent = fault ? `${fault.source}/${fault.code}${fault.active ? " · 活动" : " · 锁存"}` : "";
   $("fault-detail").textContent = fault?.detail || "";

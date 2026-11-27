@@ -5,6 +5,7 @@
 #include "runtime_logger.h"
 #include <Eigen/Geometry>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -114,8 +115,10 @@ class Hiking final : public PolicyAdapter {
         runtime_logging::RecordArtifact("policy_aux_model", "hiking_encoder", cfg_.encoder);
     }
     const char *Type() const override { return "hiking"; }
+    void EnableHeldInput() override { hold_input_ = true; }
+    double InputDelay() const override { return delay_.load(std::memory_order_relaxed); }
     std::string EntryError(const robot_base::RobotData &robot) const override {
-        return receiver_.Error(robot.time, cfg_.clock);
+        return hold_input_ ? receiver_.PrimeHeldInput(robot.time, cfg_.clock) : receiver_.Error(robot.time, cfg_.clock);
     }
     void Reset(const robot_base::RobotData &) override {
         std::fill(previous_.begin(), previous_.end(), 0);
@@ -148,7 +151,9 @@ class Hiking final : public PolicyAdapter {
         if (last_time_ >= 0 && r.time < last_time_)
             throw std::runtime_error("Hiking state time reset; re-enter policy");
         last_time_ = r.time;
-        const auto stack = receiver_.Stack(r.time, cfg_.clock);
+        double delay = 0;
+        const auto stack = hold_input_ ? receiver_.HeldStack(r.time, cfg_.clock, delay) : receiver_.Stack(r.time, cfg_.clock);
+        delay_.store(delay, std::memory_order_relaxed);
         // SDK base IMU is pelvis-local. Compose the physical yaw-roll-pitch waist chain.
         const double yaw = r.joint_pos[12], roll = r.joint_pos[13], pitch = r.joint_pos[14];
         Eigen::Matrix3d rz = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
@@ -220,6 +225,8 @@ class Hiking final : public PolicyAdapter {
     void RequestInferenceTermination() override { encoder_.RequestInferenceTermination(); }
 
     private:
+    bool hold_input_ = false;
+    std::atomic<double> delay_{0};
     Config::HikingConfig cfg_;
     perception::Receiver receiver_;
     rl_policy::PolicyExecutor encoder_;

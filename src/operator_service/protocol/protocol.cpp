@@ -53,6 +53,7 @@ Json Encode(const Status &s) {
     return {{"online", s.online}, {"hmi_connected", s.hmi_connected}, {"zero_ready", s.zero_ready}, {"state", s.state},
         {"trajectory_enabled", s.trajectory_enabled}, {"environment", s.environment},
         {"policy", s.policy}, {"age_ms", s.age_ms}, {"rl_hz", s.rl_hz}, {"velocity", Encode(s.velocity)},
+        {"waiting_for_input", s.waiting_for_input},
         {"target_velocity", Encode(s.target_velocity)}, {"command_velocity", Encode(s.command_velocity)},
         {"owner", s.owner}, {"owns_control", s.owns_control}, {"lease_remaining_ms", s.lease_remaining_ms},
         {"interaction",
@@ -124,6 +125,7 @@ Status DecodeStatus(const Json &v) {
     s.environment = v.value("environment", "unknown");
     s.state = v.at("state");
     s.policy = v.at("policy");
+    s.waiting_for_input = v.value("waiting_for_input", false);
     s.age_ms = v.at("age_ms");
     s.rl_hz = v.at("rl_hz");
     s.velocity = ReadVelocity(v.at("velocity"));

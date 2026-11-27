@@ -415,6 +415,7 @@ enum class ControlMode : int8_t {
 };
 
 /** @brief 策略切换请求的结果；失败不作为整机故障锁存。 */
+constexpr char kWaitingForPolicyInput[] = "[input delayed] ";
 struct PolicySwitchStatus {
     enum class Phase : uint8_t {
         IDLE = 0,

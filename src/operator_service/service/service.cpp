@@ -564,6 +564,9 @@ void Service::UpdateStatus(const robot_base::ControlStatus &status, const robot_
     }
     if (status.environment != status_.environment) ++catalog_revision_;
     status_ = status;
+    auto &detail = status_.policy_switch.detail;
+    waiting_for_input_ = detail.rfind(robot_base::kWaitingForPolicyInput, 0) == 0;
+    if (waiting_for_input_) detail.erase(0, sizeof(robot_base::kWaitingForPolicyInput) - 1);
     fault_ = fault;
     status_at_ = Now();
     status_samples_ = std::min(2, status_samples_ + 1);
@@ -588,12 +591,12 @@ void Service::UpdateStatus(const robot_base::ControlStatus &status, const robot_
         if (status.policy_switch.phase == Phase::READY)
             Finish("completed", "control prepared requested policy");
         else if (status.policy_switch.phase == Phase::FAILED)
-            Finish("failed", status.policy_switch.detail);
+            Finish("failed", detail);
         else if (status.policy_switch.phase == Phase::REJECTED)
-            Finish("rejected", status.policy_switch.detail);
+            Finish("rejected", detail);
         else if (status.policy_switch.phase == Phase::PREPARING &&
-            !status.policy_switch.detail.empty())
-            result_.message = status.policy_switch.detail;
+            !detail.empty())
+            result_.message = detail;
     } else if ((result_.operation == "interaction" || result_.operation == "cancel") &&
         command_.interaction.sequence == status.interaction.sequence) {
         Finish(status.interaction.request_accepted ? "completed" : "rejected", "control handled action request");
@@ -689,6 +692,7 @@ bool Service::PreviewActive() const {
 Status Service::Snapshot(uint64_t session) const {
     Status s;
     s.online = Online();
+    s.waiting_for_input = waiting_for_input_;
     s.hmi_connected = status_.hmi_connected;
     s.zero_ready = status_.zero_ready;
     s.trajectory_enabled = config_.trajectory_enabled;

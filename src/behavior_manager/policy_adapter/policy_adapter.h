@@ -214,6 +214,8 @@ public:
         Reset(robot);
     }
     virtual std::string EntryError(const robot_base::RobotData &) const { return {}; }
+    virtual void EnableHeldInput() {}
+    virtual double InputDelay() const { return 0; }
 
     /** @brief Select a preloaded executor without leaving RL or resetting history. */
     virtual rl_policy::PolicyExecutor &SelectExecutor(

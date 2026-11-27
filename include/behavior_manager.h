@@ -123,6 +123,7 @@ public:
      * @brief 获取当前生效策略名
      */
     std::string CurrentPolicyName() const;
+    std::array<float, 3> CurrentVelocity() const;
 
     /** @brief 当前用户选择的策略入口；执行目录内动作时保持入口名称。 */
     std::string CurrentPolicySelectionName() const;

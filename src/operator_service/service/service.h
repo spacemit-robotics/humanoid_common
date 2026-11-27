@@ -131,6 +131,7 @@ private:
     double request_until_ = 0;
     double reference_until_ = 0;
     robot_base::ControlStatus status_;
+    bool waiting_for_input_ = false;
     robot_base::RobotFeedback feedback_;
     double feedback_at_ = 0;
     robot_base::FaultStatus fault_;

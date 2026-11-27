@@ -151,6 +151,7 @@ struct PreparedPolicyStates {
     std::string model_path;
     std::unique_ptr<State> zero;
     std::unique_ptr<State> rl;
+    std::unique_ptr<PreparedPolicyStates> reserve;
 };
 
 PreparedPolicyStates PreparePolicyStates(
@@ -230,6 +231,12 @@ public:
     bool hot_switch_requested = false;
     double switch_timeout_s = 30.0;
     double switch_started_s = 0.0;
+    struct RecoveryConfig { std::string balance; double timeout_s, slow_after_s, ramp_s; };
+    std::unordered_map<std::string, RecoveryConfig> input_recovery;
+    std::unique_ptr<PreparedPolicyStates> reserve;
+    bool input_warning = false;
+    double input_speed_scale = 1;
+    bool need_neutral = false;
     bool return_attempted = false;
     bool has_rl = false;                      // 是否配置了 RL 状态
     bool fixed_base = false;
@@ -270,7 +277,7 @@ public:
 
     std::future<PreparedPolicyStates> policy_prepare_future;
     std::optional<PreparedPolicyStates> prepared_policy;
-    std::future<void> retired_policy;
+    std::vector<std::future<void>> retired_policies;
     std::string preparing_policy;
     bool policy_prepare_active = false;
     bool policy_prepare_failed = false;
@@ -447,6 +454,8 @@ public:
         const std::vector<double> kd = zero_kd;
         std::atomic<double> *frequency = &rl_freq_hz;
 
+        const auto entry = input_recovery.find(policy_name);
+        const std::string balance = entry == input_recovery.end() ? "" : entry->second.balance;
         preparing_policy = policy_name;
         policy_prepare_failed = false;
         policy_prepare_active = true;
@@ -457,10 +466,16 @@ public:
         try {
             policy_prepare_future = std::async(std::launch::async,
                 [path, policy_name, directory, environment = sensor.environment, thread_config,
-                    transition_config, kp, kd, frequency] {
+                    transition_config, kp, kd, frequency, balance] {
                     robot_base::ThreadLoop::Background("policy_prepare").Apply();
-                    return PreparePolicyStates(path, policy_name, directory,
+                    auto states = PreparePolicyStates(path, policy_name, directory,
                         environment, thread_config, transition_config, kp, kd, frequency);
+                    if (!balance.empty()) {
+                        states.reserve = std::make_unique<PreparedPolicyStates>(PreparePolicyStates(
+                            path, balance, directory, environment, thread_config, transition_config, kp, kd, frequency));
+                        states.rl->EnableInputFallback();
+                    }
+                    return states;
                 });
         } catch (...) {
             policy_prepare_active = false;
@@ -468,16 +483,22 @@ public:
         }
     }
 
-    void RetirePolicy(std::unique_ptr<State> retired) {
-        retired_policy = std::async(std::launch::async, [state = std::move(retired)]() mutable {
+    void RetirePolicy(std::unique_ptr<State> retired, std::unique_ptr<PreparedPolicyStates> unused = {}) {
+        retired_policies.emplace_back(std::async(std::launch::async,
+            [state = std::move(retired), backup = std::move(unused)]() mutable {
             robot_base::ThreadLoop::Background("policy_retire").Apply();
             state.reset();
-        });
+            backup.reset();
+        }));
     }
 
     void InstallPreparedPolicy(PreparedPolicyStates states) {
         fsm.ReplaceState(StateName::ZERO, std::move(states.zero));
-        RetirePolicy(fsm.ReplaceStateDeferred(StateName::RL, std::move(states.rl)));
+        auto old = fsm.ReplaceStateDeferred(StateName::RL, std::move(states.rl));
+        RetirePolicy(std::move(old), std::move(reserve));
+        reserve = std::move(states.reserve);
+        input_warning = false;
+        input_speed_scale = 1;
         active_policy = states.policy_name;
         if (active_policy == action_owner) {
             if (!action_target.empty() || action_returning) FinishPolicyAction(true);
@@ -505,12 +526,48 @@ public:
             false);
     }
 
+    void HandleInputRecovery(double dt) {
+        if (reserve && fsm.CurrentState() == StateName::RL && !fault.latched && command.key == 0) {
+            const double age = fsm.InputDelay();
+            const auto &cfg = input_recovery.at(active_policy);
+            if ((age > 0) != input_warning) {
+                input_warning = age > 0;
+                runtime_logging::Log(input_warning ? runtime_logging::Level::kWarning : runtime_logging::Level::kInfo,
+                    input_warning ? "policy input delayed; keeping " + active_policy :
+                                    "policy input restored; continuing " + active_policy, false);
+            }
+            // Apply to the live command, never replay a released joystick or an expired lease.
+            const double desired = std::clamp(1.0 - (age - cfg.slow_after_s) / cfg.ramp_s, 0.0, 1.0);
+            input_speed_scale = std::min(desired, input_speed_scale + std::max(0.0, dt) / cfg.ramp_s);
+            command.vx *= input_speed_scale;
+            command.vy *= input_speed_scale;
+            command.wz *= input_speed_scale;
+            if (age >= cfg.timeout_s) {
+                auto ready = std::move(reserve);
+                const auto target = pending_policy;
+                const auto source = active_policy;
+                InstallPreparedPolicy(std::move(*ready));
+                pending_policy = active_policy;
+                hot_switch_requested = false;
+                if (target != source && target != active_policy) StartActionHandoff(target);
+                need_neutral = true;
+                runtime_logging::Log(runtime_logging::Level::kWarning, "policy input timeout; switched to " + active_policy, false);
+            }
+        } else {
+            input_warning = false;
+            input_speed_scale = 1;
+        }
+        if (need_neutral) command.vx = command.vy = command.wz = 0;
+    }
+
     void PollPolicyPreparation() {
-        if (retired_policy.valid() && retired_policy.wait_for(std::chrono::seconds(0)) !=
-                std::future_status::ready) return;
+        retired_policies.erase(std::remove_if(retired_policies.begin(), retired_policies.end(), [](auto &job) {
+            return job.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+        }), retired_policies.end());
+        if (!retired_policies.empty()) return;
         if (prepared_policy) {
             if (prepared_policy->policy_name != pending_policy) {
-                RetirePolicy(std::move(prepared_policy->rl));
+                RetirePolicy(std::move(prepared_policy->rl), std::move(prepared_policy->reserve));
                 prepared_policy.reset();
                 return;
             }
@@ -555,13 +612,13 @@ public:
                     policy_switch_status.phase = robot_base::PolicySwitchStatus::Phase::REJECTED;
                     policy_switch_status.detail = "running policy switch cancelled by state/fault change";
                 }
-                RetirePolicy(std::move(states.rl));
+                RetirePolicy(std::move(states.rl), std::move(states.reserve));
                 return;
             }
             if (states.policy_name != pending_policy) {
                 std::cout << "[BehaviorManager] 丢弃已过期的策略准备结果: "
                     << states.policy_name << std::endl;
-                RetirePolicy(std::move(states.rl));
+                RetirePolicy(std::move(states.rl), std::move(states.reserve));
                 return;
             }
             prepared_policy.emplace(std::move(states));
@@ -975,6 +1032,11 @@ public:
             const auto policy_nodes = YAML::LoadFile(path)["rl_policy"]["onnx_infer"]["policies"];
             for (const auto &node : policy_nodes) {
                 const auto pname = node.first.as<std::string>();
+                if (const auto recovery = node.second["input_recovery"]) {
+                    input_recovery[pname] = {recovery["balance_policy"].as<std::string>(),
+                        recovery["timeout_s"].as<double>(), recovery["slow_after_s"].as<double>(),
+                        recovery["ramp_s"].as<double>()};
+                }
                 switch_groups[pname] = yaml_file.Read<std::string>(
                     "rl_policy.onnx_infer.policies." + pname + ".switch_group").value_or("");
                 policy_environments[pname] = runtime_config::LoadPolicyEnvironments(yaml_file, pname);
@@ -1048,6 +1110,20 @@ public:
                     throw std::runtime_error("enabled_in of policy " + target +
                         " must cover " + what);
             };
+            for (const auto &[name, cfg] : input_recovery) {
+                if (cfg.balance == name || !selectable_policies.count(cfg.balance) ||
+                    switch_groups[name].empty() || switch_groups[name] != switch_groups[cfg.balance] ||
+                    input_recovery.count(cfg.balance) || !std::isfinite(cfg.timeout_s) ||
+                    !std::isfinite(cfg.slow_after_s) || !std::isfinite(cfg.ramp_s) || cfg.slow_after_s <= 0 ||
+                    cfg.ramp_s <= 0 || cfg.slow_after_s + cfg.ramp_s > cfg.timeout_s)
+                    throw std::runtime_error("input_recovery needs an independent balance policy and positive timeout");
+                require_enabled(cfg.balance, policy_environments[name], "input recovery for " + name);
+                if (name == active_policy) {
+                    reserve = std::make_unique<PreparedPolicyStates>(PreparePolicyStates(path, cfg.balance, robot_dir,
+                        sensor.environment, infer_thread_cfg, zero_transition_config, zero_kp, zero_kd, &rl_freq_hz));
+                    fsm.EnableInputFallback();
+                }
+            }
             for (const auto &[name, target] : return_policies) {
                 if (!target.empty())
                     require_enabled(target, policy_environments[name], "return_policy source " + name);
@@ -1121,6 +1197,7 @@ void BehaviorManagerClass::Step(float control_dt, float rl_dt) {
         impl_->ObserveFault(state_fault_before_step);
     }
     impl_->ResolveObservedFaults();
+    impl_->HandleInputRecovery(control_dt);
     const bool running_switch = impl_->hot_switch_requested &&
         impl_->fsm.CurrentState() == StateName::RL;
     const bool switch_timed_out = running_switch &&
@@ -1355,6 +1432,8 @@ void BehaviorManagerClass::SetSensorFault(const robot_base::FaultStatus &fault) 
 
 void BehaviorManagerClass::SetCommand(const robot_base::Command &cmd) {
     impl_->command = cmd;
+    if (cmd.vx == 0 && cmd.vy == 0 && cmd.wz == 0)
+        impl_->need_neutral = false;
     impl_->BlockUnavailableAction();
     impl_->BlockUnhandledPlannerRequest();
     impl_->HandlePolicyAction(cmd.interaction);
@@ -1461,7 +1540,22 @@ std::string BehaviorManagerClass::CurrentPolicySelectionName() const {
 }
 
 robot_base::PolicySwitchStatus BehaviorManagerClass::CurrentPolicySwitchStatus() const {
-    return impl_->policy_switch_status;
+    auto status = impl_->policy_switch_status;
+    if (impl_->input_warning) {
+        // Reuse the existing detail field without losing an outstanding request's result.
+        using Phase = robot_base::PolicySwitchStatus::Phase;
+        if (status.phase == Phase::IDLE) {
+            status.phase = Phase::READY;
+            status.policy = impl_->active_policy;
+        }
+        status.detail.insert(0, robot_base::kWaitingForPolicyInput);
+    }
+    return status;
+}
+
+std::array<float, 3> BehaviorManagerClass::CurrentVelocity() const {
+    if (impl_->fsm.CurrentState() != StateName::RL) return {};
+    return {impl_->command.vx, impl_->command.vy, impl_->command.wz};
 }
 
 double BehaviorManagerClass::GetRlFreq() const {

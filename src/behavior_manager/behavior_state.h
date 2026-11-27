@@ -38,6 +38,8 @@ public:
         (void)requested;
         (void)cancel_playback;
     }
+    virtual void EnableInputFallback() {}
+    virtual double InputDelay() const { return 0; }
     virtual bool PolicyFinished() const { return false; }
     virtual void OnPolicyHandoff() { OnEnter(); }
     // 当前状态是否已满足进入 RL 的前置条件（仅 ZERO 覆盖）

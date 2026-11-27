@@ -706,7 +706,8 @@ int main(int argc, char *argv[]) {
             std::copy_n(policy.data(), std::min(policy.size(), sample.policy.size() - 1), sample.policy.data());
             sample.wall_time = WallTimeSeconds(); sample.device_time = latest_state.time;
             sample.mode = bm.CurrentState(); sample.hmi_connected = hmi_connected;
-            sample.vx = cmd.vx; sample.vy = cmd.vy; sample.wz = cmd.wz;
+            const auto velocity = bm.CurrentVelocity();
+            sample.vx = velocity[0]; sample.vy = velocity[1]; sample.wz = velocity[2];
             sample.control_hz = latest_control_hz; sample.rl_hz = bm.GetRlFreq();
             sample.age = latest_state_age_s; sample.progress_age = latest_state_progress_age_s;
             sample.enable = latest_control.enable; sample.active = reported_fault.active;
@@ -735,9 +736,8 @@ int main(int argc, char *argv[]) {
             status.mode = ToControlMode(bm.CurrentState());
             status.zero_ready = bm.IsZeroReady();
             status.hmi_connected = hmi_connected;
-            status.vx = cmd.vx;
-            status.vy = cmd.vy;
-            status.wz = cmd.wz;
+            const auto velocity = bm.CurrentVelocity();
+            status.vx = velocity[0]; status.vy = velocity[1]; status.wz = velocity[2];
             status.rl_frequency_hz = static_cast<float>(bm.GetRlFreq());
             status.active_policy = bm.CurrentPolicySelectionName();
             status.policy_switch = bm.CurrentPolicySwitchStatus();
@@ -791,9 +791,8 @@ int main(int argc, char *argv[]) {
                 std::copy_n(policy.c_str(), std::min(policy.size(), sample.policy.size() - 1),
                     sample.policy.begin());
                 sample.hmi_connected = hmi_connected;
-                sample.vx = cmd.vx;
-                sample.vy = cmd.vy;
-                sample.wz = cmd.wz;
+                const auto velocity = bm.CurrentVelocity();
+                sample.vx = velocity[0]; sample.vy = velocity[1]; sample.wz = velocity[2];
                 sample.fault_latched = reported_fault.latched;
                 sample.fault_active = reported_fault.active;
                 sample.fault_source = reported_fault.source;

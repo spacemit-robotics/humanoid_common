@@ -200,6 +200,42 @@ std::vector<float> Receiver::Stack(double time, const std::string &clock) const 
     auto error = ErrorLocked(time, clock);
     if (!error.empty())
         throw std::runtime_error(error);
+    return SampleStack(time);
+}
+
+std::string Receiver::PrimeHeldInput(double time, const std::string &clock) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto error = ErrorLocked(time, clock);
+    if (error.empty() && held_.empty()) {
+        held_ = SampleStack(time);
+        const auto now = std::chrono::steady_clock::now();
+        valid_at_ = std::min(received_, now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(std::max(0.0, time - frames_.back().frame.time))));
+    }
+    return error;
+}
+
+std::vector<float> Receiver::HeldStack(double time, const std::string &clock, double &delay) const {
+    using Clock = std::chrono::steady_clock;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto now = Clock::now();
+    if (!frames_.empty() && error_.empty() && frames_.back().frame.clock == clock &&
+        std::isfinite(time) && frames_.back().frame.time <= time + .1) {
+        // Capture/arrival age prevents delayed packets or repeated reads resetting the outage timer.
+        const double age = std::max(time - frames_.back().frame.time,
+            std::chrono::duration<double>(now - received_).count());
+        if (age <= timeout_ && frames_.front().frame.time <= time) {
+            valid_at_ = now - std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(age));
+            held_ = SampleStack(time);
+        }
+    }
+    if (held_.empty()) throw std::runtime_error("depth has no valid observation to hold");
+    delay = std::chrono::duration<double>(now - valid_at_).count();
+    if (delay <= timeout_) delay = 0;
+    return held_;
+}
+
+std::vector<float> Receiver::SampleStack(double time) const {
     std::vector<float> out(kStack);
     for (int i = 0; i < 8; ++i) {
         const double target = time - (7 - i) * .1;
@@ -209,8 +245,8 @@ std::vector<float> Receiver::Stack(double time, const std::string &clock) const 
                 chosen = &s;
             else
                 break;
-        if (!chosen || target - chosen->frame.time > timeout_)
-            throw std::runtime_error("depth history gap");
+        // After a camera restart, pad missing early history with its first real frame.
+        if (!chosen) chosen = &frames_.front();
         std::copy(chosen->image.begin(), chosen->image.end(), out.begin() + i * kFrame);
     }
     return out;

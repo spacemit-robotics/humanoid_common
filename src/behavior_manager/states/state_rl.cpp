@@ -68,6 +68,7 @@ public:
         if (config_.policy_adapter.Enabled()) {
             policy_adapter_ = policy_adapter::Create(
                 config_.policy_adapter, config_.policy);
+            if (has_input_fallback_) policy_adapter_->EnableHeldInput();
         }
         runtime_prepared_ = true;
     }
@@ -430,6 +431,11 @@ public:
             switch_ready_.store(false, std::memory_order_release);
     }
 
+    void EnableInputFallback() override {
+        has_input_fallback_ = true;
+        if (policy_adapter_) policy_adapter_->EnableHeldInput();
+    }
+    double InputDelay() const override { return policy_adapter_ ? policy_adapter_->InputDelay() : 0; }
     bool PolicyFinished() const override {
         return motion_finished_.load(std::memory_order_acquire);
     }
@@ -455,6 +461,7 @@ public:
     }
 
 private:
+    bool has_input_fallback_ = false;
     bool runtime_prepared_ = false;
     std::atomic<bool> switch_ready_{false};
     std::atomic<bool> switch_requested_{false};

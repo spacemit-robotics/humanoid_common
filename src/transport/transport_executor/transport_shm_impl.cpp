@@ -333,7 +333,8 @@ bool TransportShmImpl::SendCommandV2(const robot_base::Command &cmd,
     p.acknowledge_fault_sequence = acknowledge_fault_sequence;
     std::strncpy(p.switch_policy, cmd.switch_policy.c_str(), 63);
     p.switch_policy[63] = '\0';
-    p.policy_request_sequence = cmd.policy_request_sequence;
+    // An empty switch_policy uses the v8 sequence slot for a motion re-arm acknowledgement.
+    p.policy_request_sequence = cmd.switch_policy.empty() ? cmd.motion_rearm_sequence : cmd.policy_request_sequence;
     p.interaction_sequence = cmd.interaction.sequence;
     p.interaction_operation = static_cast<uint8_t>(cmd.interaction.operation);
     std::strncpy(p.interaction_action, cmd.interaction.action.c_str(),
@@ -369,7 +370,8 @@ bool TransportShmImpl::RecvCommandV2(robot_base::Command &cmd,
     cmd.wz = p.wz;
     acknowledge_fault_sequence = p.acknowledge_fault_sequence;
     cmd.switch_policy = DecodeText(p.switch_policy);
-    cmd.policy_request_sequence = p.policy_request_sequence;
+    cmd.policy_request_sequence = cmd.switch_policy.empty() ? 0 : p.policy_request_sequence;
+    cmd.motion_rearm_sequence = cmd.switch_policy.empty() ? p.policy_request_sequence : 0;
     cmd.interaction.sequence = p.interaction_sequence;
     cmd.interaction.operation =
         static_cast<robot_base::InteractionRequest::Operation>(

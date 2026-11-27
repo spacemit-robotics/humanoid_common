@@ -49,7 +49,7 @@ public:
     std::unique_ptr<State> ReplaceStateDeferred(StateName name, std::unique_ptr<State> state);
     bool ReadyForPolicySwitch() const;
     void RequestPolicySwitch(bool requested, bool cancel_playback = false);
-    double InputDelay() const { return current_ ? current_->InputDelay() : 0; }
+    robot_base::PolicyInputStatus InputStatus() const { return current_ ? current_->InputStatus() : robot_base::PolicyInputStatus{}; }
     void EnableInputFallback() { states_.at(StateName::RL)->EnableInputFallback(); }
     bool PolicyFinished() const;
 

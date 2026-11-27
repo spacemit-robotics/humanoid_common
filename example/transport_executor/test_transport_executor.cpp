@@ -636,7 +636,7 @@ int main(int argc, char *argv[]) {
         bool ok = (recv_hmi.key == 3) &&
             (std::abs(recv_hmi.vx - 0.5f) < 1e-4f) &&
             recv_hmi.switch_policy == "missing" &&
-            recv_hmi.policy_request_sequence == 41 &&
+            recv_hmi.policy_request_sequence == 41 && recv_hmi.motion_rearm_sequence == 0 &&
             recv_hmi.interaction.sequence == 7 &&
             recv_hmi.interaction.operation ==
                 robot_base::InteractionRequest::Operation::START &&
@@ -653,6 +653,16 @@ int main(int argc, char *argv[]) {
         std::cerr << "[test] 命令接收失败\n";
         all_ok = false;
     }
+
+    robot_base::Command neutral_cmd;
+    neutral_cmd.motion_rearm_sequence = 0x123456789abcdef0ULL;
+    bool neutral_ok = hmi->SendCommandV2(neutral_cmd, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    neutral_ok = neutral_ok && control->RecvCommandV2(recv_hmi, recv_fault_ack_sequence) &&
+        recv_hmi.switch_policy.empty() && recv_hmi.policy_request_sequence == 0 &&
+        recv_hmi.motion_rearm_sequence == neutral_cmd.motion_rearm_sequence;
+    all_ok = all_ok && neutral_ok;
+    std::cout << "[test] 中立速度确认序号: " << (neutral_ok ? "通过" : "失败") << "\n";
 
     robot_base::Command invalid_hmi_cmd = hmi_cmd;
     invalid_hmi_cmd.vx = std::numeric_limits<float>::quiet_NaN();

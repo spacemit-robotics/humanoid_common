@@ -236,7 +236,7 @@ public:
     std::unique_ptr<PreparedPolicyStates> reserve;
     bool input_warning = false;
     double input_speed_scale = 1;
-    bool need_neutral = false;
+    uint64_t motion_rearm_sequence = 0;
     bool return_attempted = false;
     bool has_rl = false;                      // 是否配置了 RL 状态
     bool fixed_base = false;
@@ -528,21 +528,25 @@ public:
 
     void HandleInputRecovery(double dt) {
         if (reserve && fsm.CurrentState() == StateName::RL && !fault.latched && command.key == 0) {
-            const double age = fsm.InputDelay();
+            const auto input = fsm.InputStatus();
             const auto &cfg = input_recovery.at(active_policy);
-            if ((age > 0) != input_warning) {
-                input_warning = age > 0;
+            if ((input.history_delay_s > 0) != input_warning) {
+                input_warning = input.history_delay_s > 0;
                 runtime_logging::Log(input_warning ? runtime_logging::Level::kWarning : runtime_logging::Level::kInfo,
                     input_warning ? "policy input delayed; keeping " + active_policy :
                                     "policy input restored; continuing " + active_policy, false);
             }
             // Apply to the live command, never replay a released joystick or an expired lease.
-            const double desired = std::clamp(1.0 - (age - cfg.slow_after_s) / cfg.ramp_s, 0.0, 1.0);
-            input_speed_scale = std::min(desired, input_speed_scale + std::max(0.0, dt) / cfg.ramp_s);
+            if (input_warning) {
+                const double desired = std::clamp(1.0 - (input.history_delay_s - cfg.slow_after_s) / cfg.ramp_s, 0.0, 1.0);
+                input_speed_scale = std::min(desired, input_speed_scale);
+            } else {
+                input_speed_scale = std::min(1.0, input_speed_scale + std::max(0.0, dt) / cfg.ramp_s);
+            }
             command.vx *= input_speed_scale;
             command.vy *= input_speed_scale;
             command.wz *= input_speed_scale;
-            if (age >= cfg.timeout_s) {
+            if (input.frame_age_s >= cfg.timeout_s) {
                 auto ready = std::move(reserve);
                 const auto target = pending_policy;
                 const auto source = active_policy;
@@ -550,14 +554,15 @@ public:
                 pending_policy = active_policy;
                 hot_switch_requested = false;
                 if (target != source && target != active_policy) StartActionHandoff(target);
-                need_neutral = true;
+                motion_rearm_sequence = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
                 runtime_logging::Log(runtime_logging::Level::kWarning, "policy input timeout; switched to " + active_policy, false);
             }
         } else {
             input_warning = false;
             input_speed_scale = 1;
         }
-        if (need_neutral) command.vx = command.vy = command.wz = 0;
+        if (motion_rearm_sequence != 0) command.vx = command.vy = command.wz = 0;
     }
 
     void PollPolicyPreparation() {
@@ -573,17 +578,16 @@ public:
             }
             if (hot_switch_requested && fsm.CurrentState() == StateName::RL &&
                 !fault.latched) {
-                // Prepared states have no FSM sensor pointer yet. Check the target
-                // against the live sensor clock before releasing the current RL.
-                const auto entry_error = prepared_policy->rl->EntryError(sensor);
-                if (!entry_error.empty()) {
-                    if (policy_switch_status.phase == robot_base::PolicySwitchStatus::Phase::PREPARING)
-                        policy_switch_status.detail = "waiting for target policy: " + entry_error;
-                    return;
-                }
                 if (!fsm.ReadyForPolicySwitch()) {
                     if (policy_switch_status.phase == robot_base::PolicySwitchStatus::Phase::PREPARING)
                         policy_switch_status.detail = "waiting for current policy to finish its handoff";
+                    return;
+                }
+                // Validate and capture the target's entry observation just before handoff.
+                const auto entry_error = prepared_policy->rl->PrepareEntry(sensor);
+                if (!entry_error.empty()) {
+                    if (policy_switch_status.phase == robot_base::PolicySwitchStatus::Phase::PREPARING)
+                        policy_switch_status.detail = "waiting for target policy: " + entry_error;
                     return;
                 }
             }
@@ -1432,8 +1436,10 @@ void BehaviorManagerClass::SetSensorFault(const robot_base::FaultStatus &fault) 
 
 void BehaviorManagerClass::SetCommand(const robot_base::Command &cmd) {
     impl_->command = cmd;
-    if (cmd.vx == 0 && cmd.vy == 0 && cmd.wz == 0)
-        impl_->need_neutral = false;
+    if (impl_->motion_rearm_sequence != 0 && cmd.motion_rearm_sequence == impl_->motion_rearm_sequence &&
+        cmd.key == 0 && cmd.switch_policy.empty() && cmd.vx == 0 && cmd.vy == 0 && cmd.wz == 0 &&
+        impl_->fsm.CurrentState() == StateName::RL && !impl_->fault.latched)
+        impl_->motion_rearm_sequence = 0;
     impl_->BlockUnavailableAction();
     impl_->BlockUnhandledPlannerRequest();
     impl_->HandlePolicyAction(cmd.interaction);
@@ -1541,14 +1547,16 @@ std::string BehaviorManagerClass::CurrentPolicySelectionName() const {
 
 robot_base::PolicySwitchStatus BehaviorManagerClass::CurrentPolicySwitchStatus() const {
     auto status = impl_->policy_switch_status;
-    if (impl_->input_warning) {
-        // Reuse the existing detail field without losing an outstanding request's result.
+    if (impl_->input_warning || impl_->motion_rearm_sequence != 0) {
+        // Preserve the result of any concurrent explicit policy request.
         using Phase = robot_base::PolicySwitchStatus::Phase;
         if (status.phase == Phase::IDLE) {
             status.phase = Phase::READY;
             status.policy = impl_->active_policy;
         }
-        status.detail.insert(0, robot_base::kWaitingForPolicyInput);
+        if (impl_->motion_rearm_sequence != 0)
+            status.detail.insert(0, robot_base::kMotionRearmPrefix + std::to_string(impl_->motion_rearm_sequence) + "] ");
+        if (impl_->input_warning) status.detail.insert(0, robot_base::kWaitingForPolicyInput);
     }
     return status;
 }

@@ -344,6 +344,7 @@ struct Command {
     uint64_t policy_request_sequence = 0;       ///< 策略请求序号；零保留旧调用方式
     InteractionRequest interaction;
     PlannerRequest planner;
+    uint64_t motion_rearm_sequence = 0;  ///< Confirms neutral input for the reported velocity interlock.
 };
 
 /**
@@ -414,8 +415,16 @@ enum class ControlMode : int8_t {
     TRAJECTORY = 6  ///< 独立关节轨迹动作控制
 };
 
-/** @brief 策略切换请求的结果；失败不作为整机故障锁存。 */
+// Advisory prefixes in the existing v8 policy status detail field.
 constexpr char kWaitingForPolicyInput[] = "[input delayed] ";
+constexpr char kMotionRearmPrefix[] = "[motion rearm=";
+
+struct PolicyInputStatus {
+    float frame_age_s = 0;
+    float history_delay_s = 0;  ///< Zero while all temporal samples are usable.
+};
+
+/** @brief 策略切换请求的结果；失败不作为整机故障锁存。 */
 struct PolicySwitchStatus {
     enum class Phase : uint8_t {
         IDLE = 0,

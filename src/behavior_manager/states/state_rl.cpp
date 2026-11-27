@@ -76,6 +76,9 @@ public:
     std::string EntryError(const robot_base::RobotData &sensor) const override {
         return policy_adapter_ ? policy_adapter_->EntryError(sensor) : std::string{};
     }
+    std::string PrepareEntry(const robot_base::RobotData &sensor) override {
+        return policy_adapter_ ? policy_adapter_->PrepareEntry(sensor) : std::string{};
+    }
     void OnEnter() override {
         entry_kp_ = output_ ? output_->kp : std::vector<double>{};
         entry_kd_ = output_ ? output_->kd : std::vector<double>{};
@@ -435,7 +438,9 @@ public:
         has_input_fallback_ = true;
         if (policy_adapter_) policy_adapter_->EnableHeldInput();
     }
-    double InputDelay() const override { return policy_adapter_ ? policy_adapter_->InputDelay() : 0; }
+    robot_base::PolicyInputStatus InputStatus() const override {
+        return policy_adapter_ ? policy_adapter_->InputStatus() : robot_base::PolicyInputStatus{};
+    }
     bool PolicyFinished() const override {
         return motion_finished_.load(std::memory_order_acquire);
     }

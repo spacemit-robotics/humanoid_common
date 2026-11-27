@@ -117,6 +117,7 @@ struct Status {
     bool hmi_connected = false;
     bool zero_ready = false;
     bool waiting_for_input = false;
+    bool motion_rearm_required = false;
     std::string state = "POWER_OFF";
     std::string policy;
     double age_ms = 0;

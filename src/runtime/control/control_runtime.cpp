@@ -554,6 +554,7 @@ int main(int argc, char *argv[]) {
             cmd.wz = 0.0f;
             cmd.switch_policy.clear();
             cmd.policy_request_sequence = 0;
+            cmd.motion_rearm_sequence = 0;
             if (hmi_just_disconnected) {
                 const auto planner = bm.CurrentPlannerStatus();
                 using Phase = robot_base::PlannerStatus::Phase;

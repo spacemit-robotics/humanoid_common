@@ -116,11 +116,15 @@ class Hiking final : public PolicyAdapter {
     }
     const char *Type() const override { return "hiking"; }
     void EnableHeldInput() override { hold_input_ = true; }
-    double InputDelay() const override { return delay_.load(std::memory_order_relaxed); }
+    robot_base::PolicyInputStatus InputStatus() const override { return input_status_.load(std::memory_order_relaxed); }
     std::string EntryError(const robot_base::RobotData &robot) const override {
-        return hold_input_ ? receiver_.PrimeHeldInput(robot.time, cfg_.clock) : receiver_.Error(robot.time, cfg_.clock);
+        return receiver_.Error(robot.time, cfg_.clock);
+    }
+    std::string PrepareEntry(const robot_base::RobotData &robot) override {
+        return hold_input_ ? receiver_.PrimeHeldInput(robot.time, cfg_.clock) : EntryError(robot);
     }
     void Reset(const robot_base::RobotData &) override {
+        input_status_.store({}, std::memory_order_relaxed);
         std::fill(previous_.begin(), previous_.end(), 0);
         first_ = true;
         last_time_ = -1;
@@ -151,9 +155,9 @@ class Hiking final : public PolicyAdapter {
         if (last_time_ >= 0 && r.time < last_time_)
             throw std::runtime_error("Hiking state time reset; re-enter policy");
         last_time_ = r.time;
-        double delay = 0;
-        const auto stack = hold_input_ ? receiver_.HeldStack(r.time, cfg_.clock, delay) : receiver_.Stack(r.time, cfg_.clock);
-        delay_.store(delay, std::memory_order_relaxed);
+        auto observation = hold_input_ ? receiver_.HeldStack(r.time, cfg_.clock) :
+            perception::DepthObservation{receiver_.Stack(r.time, cfg_.clock)};
+        input_status_.store({observation.frame_age_s, observation.history_delay_s}, std::memory_order_relaxed);
         // SDK base IMU is pelvis-local. Compose the physical yaw-roll-pitch waist chain.
         const double yaw = r.joint_pos[12], roll = r.joint_pos[13], pitch = r.joint_pos[14];
         Eigen::Matrix3d rz = Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
@@ -197,7 +201,7 @@ class Hiking final : public PolicyAdapter {
             dest += 8 * size;
         }
         first_ = false;
-        encoder_.SetCustomArray("depth", stack.data(), stack.size());
+        encoder_.SetCustomArray("depth", observation.stack.data(), observation.stack.size());
         const std::array<double, 3> zero = {};
         const std::array<double, 4> identity = {1, 0, 0, 0};
         encoder_.AssembleObs(zero, zero, 0, 0, 0, std::vector<double>(128),
@@ -226,7 +230,7 @@ class Hiking final : public PolicyAdapter {
 
     private:
     bool hold_input_ = false;
-    std::atomic<double> delay_{0};
+    std::atomic<robot_base::PolicyInputStatus> input_status_{};
     Config::HikingConfig cfg_;
     perception::Receiver receiver_;
     rl_policy::PolicyExecutor encoder_;

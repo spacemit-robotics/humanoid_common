@@ -60,7 +60,8 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
     auto last_send = next_device;
     const auto clear = [&] {
         armed = false;
-        if (!dry_run && client.Connected() && owned) client.PostTeleopInput({});
+        if (!dry_run && client.Connected() && owned && !client.LatestStatus().motion_rearm_required)
+            client.PostTeleopInput({});
     };
     const auto release = [&] {
         feedback.Clear();
@@ -245,10 +246,12 @@ void Run(const Config &config, const std::string &connection_path, bool dry_run,
                 !status.fault.latched && status.request.phase != "accepted" &&
                 (status.interaction_phase == "IDLE" || status.interaction_phase == "FINISHED" ||
                 status.interaction_phase == "REJECTED");
-            if (!ready) {
+            const bool neutral = operator_gamepad::Neutral(input);
+            if (!ready || status.motion_rearm_required) {
                 armed = false;
-            } else if (operator_gamepad::Neutral(input)) armed = true;
+            } else if (neutral) armed = true;
             if (owned && status.online && status.state == "RL" &&
+                (!status.motion_rearm_required || neutral) &&
                 now - last_send >= std::chrono::milliseconds(20)) {
                 Velocity target{};
                 if (ready && armed) target = input;
